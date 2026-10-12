@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize a project
     let project_path = PathBuf::from("./");
     let project = cogito.init_project(project_path)?;
-    
+
     println!("Project: {} ({})", project.name, project.language);
 
     // Generate fingerprint
@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let result = cogito.compress_context(large_code, options).await?;
-    
+
     println!("  Original tokens: {}", result.original_tokens);
     println!("  Compressed tokens: {}", result.compressed_tokens);
     println!("  Savings: {:.1}%", result.savings_percent);
@@ -57,8 +57,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Add a semantic tag
     println!("\nAdding semantic tag...");
-    use cogito_core::types::SemanticTag;
     use chrono::Utc;
+    use cogito_core::types::SemanticTag;
     use uuid::Uuid;
 
     let tag = SemanticTag {

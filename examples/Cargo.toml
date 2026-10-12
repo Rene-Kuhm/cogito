@@ -1,0 +1,22 @@
+[package]
+name = "cogito-examples"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[[example]]
+name = "basic"
+path = "basic.rs"
+
+[[example]]
+name = "scan_repo"
+path = "scan_repo.rs"
+
+[dependencies]
+cogito-core.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+uuid.workspace = true
