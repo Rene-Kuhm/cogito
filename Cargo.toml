@@ -38,6 +38,7 @@ once_cell = "1"
 parking_lot = "0.12"
 git2 = "0.20"
 criterion = { version = "0.5", features = ["html_reports"] }
+rusqlite = { version = "0.32", features = ["bundled", "modern_sqlite", "blob"] }
 whoami = "1"
 clap = { version = "4", features = ["derive", "env"] }
 colored = "2"
