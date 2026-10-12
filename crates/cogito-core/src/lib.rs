@@ -11,12 +11,16 @@
 //!
 //! ## Usage
 //!
-//! ```rust
-//! use cogito_core::{Project, Cogito};
+//! ```rust,no_run
+//! use cogito_core::Cogito;
 //!
+//! # #[tokio::main]
+//! # async fn main() -> anyhow::Result<()> {
 //! let cogito = Cogito::new();
-//! let project = cogito.init_project("/path/to/project")?;
+//! let project = cogito.init_project("/path/to/project".into())?;
 //! let fingerprint = cogito.generate_fingerprint(&project).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 pub mod fingerprint;

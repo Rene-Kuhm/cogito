@@ -190,6 +190,9 @@ mod tests {
 
     #[test]
     fn test_is_code_file() {
-        assert!(is_code_file(&std::path::PathBuf::from("rs".as_bytes())[..1].as_ref().into(), &Language::Rust));
+        use std::ffi::OsStr;
+        assert!(is_code_file(OsStr::new("rs"), &Language::Rust));
+        assert!(is_code_file(OsStr::new("RS"), &Language::Rust));
+        assert!(!is_code_file(OsStr::new("py"), &Language::Rust));
     }
 }
