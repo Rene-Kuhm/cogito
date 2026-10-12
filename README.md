@@ -19,6 +19,25 @@ cogito compress context.txt      # Compress context
 
 ---
 
+## Works with everything
+
+Cogito is **editor- and agent-agnostic**. It speaks CLI, MCP, and REST. Pick what fits your tool:
+
+| Tool | Integration |
+|---|---|
+| **Gentle Shell (pi)** | First-class skill — see [`skills/cogito/SKILL.md`](skills/cogito/SKILL.md) |
+| **Claude Code** | MCP server (one config block) |
+| **Cursor** | MCP server |
+| **Continue (VSCode)** | MCP server |
+| **Neovim** | CLI + [`mcphub.nvim`](https://github.com/ravitemer/mcphub.nvim) |
+| **Aider** | Shell hook |
+| **Zed** | MCP server |
+| **Any agent** | REST API on `localhost:8080` |
+
+Full setup instructions for every tool: [`docs/integrations.md`](docs/integrations.md).
+
+---
+
 ## What is Cogito?
 
 AI coding agents suffer from **context inflation**. Large codebases exceed context windows, agents fetch irrelevant code, and every conversation starts from scratch.

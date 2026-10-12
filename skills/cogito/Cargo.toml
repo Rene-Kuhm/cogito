@@ -1,0 +1,12 @@
+[package]
+name = "cogito-skills"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Gentle-shell skills for Cogito"
+
+[[test]]
+name = "skill_test"
+path = "tests/skill_test.rs"
