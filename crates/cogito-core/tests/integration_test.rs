@@ -57,12 +57,12 @@ mod billing {
         .output()
         .expect("git init failed");
     std::process::Command::new("git")
-        .args(["config", "user.email=test@test.com"])
+        .args(["config", "user.email", "test@test.com"])
         .current_dir(&project_path)
         .output()
         .ok();
     std::process::Command::new("git")
-        .args(["config", "user.name=Test"])
+        .args(["config", "user.name", "Test"])
         .current_dir(&project_path)
         .output()
         .ok();
