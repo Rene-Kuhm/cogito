@@ -8,6 +8,7 @@
 //! declarations, field declarations, property declarations, method signatures.
 //! Collapses: method bodies, constructor bodies.
 
+use super::ast_common::apply_replacements;
 use crate::types::CompressionOptions;
 use anyhow::{Result, anyhow};
 use std::sync::OnceLock;
@@ -41,11 +42,9 @@ pub fn compress_csharp(
     let mut replacements: Vec<(usize, usize)> = Vec::new();
 
     collect_replacements(tree.root_node(), &mut replacements, &mut stats);
-
-    // Sort by start byte
     replacements.sort_by_key(|(s, _)| *s);
 
-    let compressed = apply_replacements(content, &replacements);
+    let (compressed, _applied) = apply_replacements(content, &replacements);
 
     Ok(CSharpCompressResult {
         content: compressed,
@@ -99,24 +98,6 @@ fn collect_replacements(
     for child in node.children(&mut cursor) {
         collect_replacements(child, replacements, stats);
     }
-}
-
-/// Apply byte-range replacements to the source.
-/// Ranges must be sorted by start byte and non-overlapping.
-fn apply_replacements(source: &str, ranges: &[(usize, usize)]) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut cursor = 0usize;
-    for (start, end) in ranges {
-        if *start < cursor {
-            // Overlapping range — skip
-            continue;
-        }
-        out.push_str(&source[cursor..*start]);
-        out.push_str("{ /* ... */ }");
-        cursor = *end;
-    }
-    out.push_str(&source[cursor..]);
-    out
 }
 
 #[cfg(test)]

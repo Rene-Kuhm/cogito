@@ -1,13 +1,19 @@
 //! AST-aware Python compressor
 //!
-//! Uses `tree-sitter-python` to parse the source into an AST, then walks
-//! the tree collapsing function/method bodies while preserving signatures,
-//! type hints, and declarations.
+//! Uses `tree-sitter-python` + **byte-range replacement**: find the byte
+//! range of every function/method body and replace it with a placeholder,
+//! leaving everything else verbatim.
+//!
+//! Note: Python uses indentation-based blocks, so the "body" is a `block`
+//! node whose range includes the indented statements. Replacing it with
+//! `{ /* ... */ }` would break Python's indentation rules, so we replace
+//! with a single-line `...` placeholder instead (valid Python).
 
+use super::ast_common::collect_body_ranges;
 use crate::types::CompressionOptions;
 use anyhow::{Result, anyhow};
 use std::sync::OnceLock;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Parser;
 
 /// Result of Python AST compression
 #[derive(Debug, Clone)]
@@ -23,21 +29,21 @@ pub fn compress_python(content: &str, _options: &CompressionOptions) -> Result<P
     let mut parser = Parser::new();
     parser
         .set_language(&get_language())
-        .map_err(|e| anyhow!("Failed to set tree-sitter language: {e}"))?;
+        .map_err(|e| anyhow!("Failed to set tree-sitter Python language: {e}"))?;
 
     let tree = parser
         .parse(content, None)
         .ok_or_else(|| anyhow!("Failed to parse Python"))?;
 
-    let mut stats = PyStats::default();
-    let mut out = String::with_capacity(content.len() / 2);
+    let ranges = collect_python_bodies(tree.root_node(), content);
+    let (compressed, applied) = apply_python_replacements(content, &ranges);
 
-    let root = tree.root_node();
-    walk(root, content, &mut out, &mut stats);
+    let mut stats = PyStats::default();
+    count_declarations(tree.root_node(), &mut stats);
 
     Ok(PyCompressResult {
-        content: out,
-        functions_collapsed: stats.functions,
+        content: compressed,
+        functions_collapsed: applied,
         classes_preserved: stats.classes,
         decorators_preserved: stats.decorators,
     })
@@ -45,12 +51,10 @@ pub fn compress_python(content: &str, _options: &CompressionOptions) -> Result<P
 
 #[derive(Default)]
 struct PyStats {
-    functions: usize,
     classes: usize,
     decorators: usize,
 }
 
-/// Cached tree-sitter language
 static LANGUAGE: OnceLock<tree_sitter::Language> = OnceLock::new();
 
 fn get_language() -> tree_sitter::Language {
@@ -59,191 +63,57 @@ fn get_language() -> tree_sitter::Language {
         .clone()
 }
 
-fn walk(node: Node, source: &str, out: &mut String, stats: &mut PyStats) {
-    let mut cursor = node.walk();
-    let mut last_newline = true;
-    for child in node.children(&mut cursor) {
-        if render_node(child, source, out, stats, 0) {
-            if !last_newline {
-                out.push('\n');
-            }
-            last_newline = false;
-        }
-    }
-    while out.ends_with("\n\n") {
-        out.pop();
-    }
+/// Collect body ranges for Python functions. `class_definition` bodies are
+/// intentionally excluded — we want to descend into them and collapse each
+/// method separately.
+fn collect_python_bodies(root: tree_sitter::Node, _source: &str) -> Vec<(usize, usize)> {
+    collect_body_ranges(root, |kind| kind == "function_definition")
 }
 
-fn render_node(
-    node: Node,
-    source: &str,
-    out: &mut String,
-    stats: &mut PyStats,
-    indent: usize,
-) -> bool {
-    let text = node_text(node, source);
-    let pad = "    ".repeat(indent);
+/// Python-specific: replace the body with a single-line ellipsis, preserving
+/// the indentation of the first line so the result stays syntactically valid.
+fn apply_python_replacements(source: &str, ranges: &[(usize, usize)]) -> (String, usize) {
+    let mut out = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    let mut applied = 0usize;
 
+    for (start, end) in ranges {
+        if *start < cursor || *end > source.len() {
+            continue;
+        }
+        out.push_str(&source[cursor..*start]);
+        // Match the leading indentation of the body's first line so the
+        // placeholder is a valid Python statement.
+        let indent = leading_indent(source, *start);
+        out.push_str(&indent);
+        out.push_str("...");
+        cursor = *end;
+        applied += 1;
+    }
+
+    out.push_str(&source[cursor..]);
+    (out, applied)
+}
+
+fn leading_indent(source: &str, pos: usize) -> String {
+    // Walk to the start of the line containing `pos`
+    let line_start = source[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &source[line_start..pos];
+    line.chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect()
+}
+
+fn count_declarations(node: tree_sitter::Node, stats: &mut PyStats) {
     match node.kind() {
-        // Imports
-        "import_statement" | "import_from_statement" | "future_import_statement" => {
-            out.push_str(&pad);
-            out.push_str(&text);
-            true
-        }
-        // Function definitions
-        "function_definition" => {
-            stats.functions += 1;
-            render_function(node, source, out, stats, indent);
-            true
-        }
-        // Class definitions
-        "class_definition" => {
-            stats.classes += 1;
-            render_class(node, source, out, stats, indent);
-            true
-        }
-        // Decorators
-        "decorator" => {
-            stats.decorators += 1;
-            out.push_str(&pad);
-            out.push_str(&text);
-            true
-        }
-        // Decorated definitions: pass through decorator + collapse body
-        "decorated_definition" => {
-            render_decorated(node, source, out, stats, indent);
-            true
-        }
-        // Statements
-        "expression_statement"
-        | "if_statement"
-        | "for_statement"
-        | "while_statement"
-        | "try_statement"
-        | "with_statement"
-        | "assert_statement"
-        | "raise_statement"
-        | "return_statement"
-        | "pass_statement"
-        | "break_statement"
-        | "continue_statement" => {
-            out.push_str(&pad);
-            out.push_str(&text);
-            true
-        }
-        // Assignments
-        "assignment" | "augmented_assignment" | "expression_list" => {
-            out.push_str(&pad);
-            out.push_str(&text);
-            true
-        }
-        // Type definitions
-        "type_alias" => {
-            out.push_str(&pad);
-            out.push_str(&text);
-            true
-        }
-        // Skip standalone punctuation
-        "comment" => {
-            // Keep docstrings as comments? Strip for now.
-            false
-        }
-        _ => {
-            out.push_str(&pad);
-            out.push_str(&text);
-            true
-        }
+        "class_definition" => stats.classes += 1,
+        "decorator" => stats.decorators += 1,
+        _ => {}
     }
-}
-
-fn render_function(node: Node, source: &str, out: &mut String, stats: &mut PyStats, indent: usize) {
-    stats.functions += 1;
-    let pad = "    ".repeat(indent);
-
-    // `def name(params) -> ReturnType:`
-    if let Some(name_node) = node.child_by_field_name("name") {
-        out.push_str(&pad);
-        out.push_str("def ");
-        out.push_str(&node_text(name_node, source));
-    } else {
-        out.push_str(&pad);
-        out.push_str("def ");
-    }
-
-    if let Some(params) = node.child_by_field_name("parameters") {
-        out.push_str(&node_text(params, source));
-    } else {
-        out.push_str("()");
-    }
-
-    if let Some(ret) = node.child_by_field_name("return_type") {
-        out.push_str(" -> ");
-        out.push_str(&node_text(ret, source));
-    }
-
-    out.push_str(": /* ... */\n");
-}
-
-fn render_class(node: Node, source: &str, out: &mut String, stats: &mut PyStats, indent: usize) {
-    let pad = "    ".repeat(indent);
-
-    // `class Name(Base):`
-    if let Some(name_node) = node.child_by_field_name("name") {
-        out.push_str(&pad);
-        out.push_str("class ");
-        out.push_str(&node_text(name_node, source));
-    } else {
-        out.push_str(&pad);
-        out.push_str("class ");
-    }
-
-    if let Some(supers) = node.child_by_field_name("superclasses") {
-        out.push_str(&node_text(supers, source));
-    }
-
-    out.push_str(":\n");
-
-    // Body
-    if let Some(body) = node.child_by_field_name("body") {
-        let mut cursor = body.walk();
-        for child in body.children(&mut cursor) {
-            render_node(child, source, out, stats, indent + 1);
-            out.push('\n');
-        }
-    }
-}
-
-fn render_decorated(
-    node: Node,
-    source: &str,
-    out: &mut String,
-    stats: &mut PyStats,
-    indent: usize,
-) {
-    let pad = "    ".repeat(indent);
-
-    // Render decorators + definition
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "decorator" {
-            stats.decorators += 1;
-            out.push_str(&pad);
-            out.push_str(&node_text(child, source));
-            out.push('\n');
-        } else if child.kind() == "function_definition" {
-            render_function(child, source, out, stats, indent);
-        } else if child.kind() == "class_definition" {
-            render_class(child, source, out, stats, indent);
-        }
+        count_declarations(child, stats);
     }
-}
-
-fn node_text(node: Node, source: &str) -> String {
-    let start = node.start_byte();
-    let end = node.end_byte();
-    source[start..end].to_string()
 }
 
 #[cfg(test)]
@@ -267,7 +137,6 @@ def add(a: int, b: int) -> int:
         assert!(result.content.contains("a: int"));
         assert!(result.content.contains("b: int"));
         assert!(result.content.contains("-> int"));
-        assert!(result.content.contains("/* ... */"));
         // Body should NOT be in output
         assert!(!result.content.contains("result = a + b"));
         assert!(!result.content.contains("print(f"));
@@ -296,8 +165,10 @@ class User:
         assert!(result.content.contains("class User"));
         assert!(result.content.contains("def __init__"));
         assert!(result.content.contains("def validate"));
+        assert!(result.content.contains("def get_id"));
         // Method bodies should NOT be in output
         assert!(!result.content.contains("self.id = id"));
+        assert!(!result.content.contains("return self.id"));
     }
 
     #[test]
@@ -384,10 +255,8 @@ class UserRepository:
             orig, comp, savings
         );
 
-        // Should be at least 30% smaller
         assert!(savings > 30.0, "Expected >30% savings, got {savings:.1}%");
 
-        // All public APIs preserved
         assert!(result.content.contains("class User"));
         assert!(result.content.contains("class UserRepository"));
         assert!(result.content.contains("def find_by_id"));
