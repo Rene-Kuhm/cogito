@@ -89,7 +89,7 @@ steps are read-only and cheap; only the last is a write.
 ## MCP Integration
 
 When running inside an MCP-compatible host (Claude Code, Cursor, etc.) and
-the cogito-mcp server is configured, prefer the MCP tools over the CLI:
+the `cogito mcp` server is configured, prefer the MCP tools over the CLI:
 
 | Tool | Purpose |
 |---|---|
@@ -99,8 +99,9 @@ the cogito-mcp server is configured, prefer the MCP tools over the CLI:
 | `add_decision` | Record a decision |
 | `add_tag` | Tag code paths |
 
-The MCP server is `cogito-mcp` in this repo. It uses the same
-`.cogito/` storage as the CLI, so both stay in sync.
+The MCP server is `cogito mcp` (same binary, `mcp` subcommand). It uses the
+same `.cogito/state.db` as the CLI, so both stay in sync. `cogito setup` writes
+the MCP configuration for every agent it supports.
 
 ## Integration with Pi (gentle-shell)
 

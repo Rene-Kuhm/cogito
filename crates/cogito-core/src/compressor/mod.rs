@@ -17,6 +17,28 @@ pub mod ast_ruby;
 pub mod ast_swift;
 pub mod ast_ts;
 
+/// Parse a language name (as accepted from CLI flags, MCP tool arguments or
+/// config files) into a [`Language`].
+///
+/// Returns `None` for unknown names, which callers treat as "use the
+/// structural compressor".
+pub fn parse_language(name: &str) -> Option<Language> {
+    match name.trim().to_lowercase().as_str() {
+        "rust" | "rs" => Some(Language::Rust),
+        "typescript" | "ts" => Some(Language::TypeScript),
+        "javascript" | "js" => Some(Language::JavaScript),
+        "python" | "py" => Some(Language::Python),
+        "go" | "golang" => Some(Language::Go),
+        "csharp" | "c#" | "cs" => Some(Language::CSharp),
+        "java" => Some(Language::Java),
+        "ruby" | "rb" => Some(Language::Ruby),
+        "php" => Some(Language::Php),
+        "kotlin" | "kt" => Some(Language::Kotlin),
+        "swift" => Some(Language::Swift),
+        _ => None,
+    }
+}
+
 /// Compress context while preserving meaning
 pub fn compress(content: &str, options: CompressionOptions) -> Result<CompressedContext> {
     compress_with_language(content, options, None)

@@ -1,72 +1,56 @@
 //! Semantic Memory Tags
 //!
-//! Index knowledge without reading code. Backed by SQLite (with FTS5) when
-//! available, falls back to legacy JSON files otherwise.
+//! Index knowledge without reading code. Backed by SQLite (with FTS5) when a
+//! connection is provided, falls back to legacy JSON files otherwise.
+//!
+//! ## Why the connection is a parameter
+//!
+//! Earlier versions kept the SQLite connection in a process-global `OnceCell`.
+//! That is wrong when one process serves several projects (for example the
+//! MCP server): the first project would win and every later call would read
+//! and write the wrong database. The connection and the project's `.cogito`
+//! directory are therefore passed explicitly by [`crate::Cogito`].
 
 use crate::types::SemanticTag;
 use anyhow::Result;
 use chrono::Utc;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
+use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use uuid::Uuid;
 
-/// Legacy in-memory storage for semantic tags (used when SQLite is not open).
+/// Legacy in-memory storage (used only when no SQLite connection is provided,
+/// e.g. in unit tests that exercise the pure logic).
 static LEGACY_TAGS: Lazy<RwLock<HashMap<Uuid, Vec<SemanticTag>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-fn legacy_cogito_dir() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".cogito")
+/// Read the legacy store.
+fn legacy_read() -> HashMap<Uuid, Vec<SemanticTag>> {
+    LEGACY_TAGS.read().clone()
 }
 
-fn legacy_persist() {
-    let map = LEGACY_TAGS.read().clone();
-    let all: Vec<SemanticTag> = map.into_values().flatten().collect();
-    let _ = crate::persistence::save_tags(&legacy_cogito_dir(), &all);
+/// Write the legacy store to `cogito_dir/tags.json`.
+fn legacy_persist(cogito_dir: &Path) {
+    let all: Vec<SemanticTag> = legacy_read().into_values().flatten().collect();
+    let _ = crate::persistence::save_tags(cogito_dir, &all);
 }
 
-fn legacy_hydrate() {
-    let dir = legacy_cogito_dir();
-    if let Ok(loaded) = crate::persistence::load_tags(&dir) {
-        let mut map = LEGACY_TAGS.write();
-        for tag in loaded {
-            map.entry(tag.project_id).or_default().push(tag);
-        }
-    }
-}
-
-fn ensure_legacy_loaded() {
-    static LOADED: once_cell::sync::Lazy<parking_lot::Once> =
-        once_cell::sync::Lazy::new(parking_lot::Once::new);
-    LOADED.call_once(legacy_hydrate);
-}
-
-/// Optional SQLite connection (set by Cogito before calling these fns).
-static SQLITE: once_cell::sync::OnceCell<Arc<parking_lot::Mutex<rusqlite::Connection>>> =
-    once_cell::sync::OnceCell::new();
-
-pub(crate) fn set_sqlite(conn: Arc<parking_lot::Mutex<rusqlite::Connection>>) {
-    let _ = SQLITE.set(conn);
-}
-
-/// Search semantic tags by query
-pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<SemanticTag>> {
-    if let Some(conn) = SQLITE.get() {
-        let guard = conn.lock();
-        return crate::storage::sqlite::search_tags(&guard, project_id, query);
+/// Search semantic tags by query.
+pub fn search(
+    conn: Option<&Connection>,
+    project_id: Uuid,
+    query: &str,
+) -> Result<Vec<SemanticTag>> {
+    if let Some(conn) = conn {
+        return crate::storage::sqlite::search_tags(conn, project_id, query);
     }
 
-    ensure_legacy_loaded();
     let query_lower = query.to_lowercase();
-    let tags = LEGACY_TAGS.read();
+    let project_tags = legacy_read().get(&project_id).cloned().unwrap_or_default();
 
-    let project_tags = tags.get(&project_id).cloned().unwrap_or_default();
-
-    let results: Vec<SemanticTag> = project_tags
+    Ok(project_tags
         .into_iter()
         .filter(|tag| {
             if query.is_empty() {
@@ -79,67 +63,100 @@ pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<SemanticTag>> {
                     .iter()
                     .any(|p| p.to_string_lossy().to_lowercase().contains(&query_lower))
         })
-        .collect();
-
-    Ok(results)
+        .collect())
 }
 
-/// Add a semantic tag
-pub async fn add(tag: SemanticTag) -> Result<SemanticTag> {
-    if let Some(conn) = SQLITE.get() {
-        let guard = conn.lock();
-        crate::storage::sqlite::insert_tag(&guard, &tag)?;
+/// Add a semantic tag.
+pub fn add(conn: Option<&Connection>, cogito_dir: &Path, tag: SemanticTag) -> Result<SemanticTag> {
+    if let Some(conn) = conn {
+        crate::storage::sqlite::insert_tag(conn, &tag)?;
         return Ok(tag);
     }
 
-    ensure_legacy_loaded();
-    let mut tags = LEGACY_TAGS.write();
-    let project_tags = tags.entry(tag.project_id).or_default();
-    project_tags.push(tag.clone());
-    drop(tags);
-    legacy_persist();
+    {
+        let mut tags = LEGACY_TAGS.write();
+        tags.entry(tag.project_id).or_default().push(tag.clone());
+    }
+    legacy_persist(cogito_dir);
     Ok(tag)
 }
 
-/// Create a semantic tag from file paths
-pub async fn auto_tag(project_id: Uuid, paths: Vec<PathBuf>) -> Result<Vec<SemanticTag>> {
+/// Create semantic tags from file paths, inferring the tag name from the path.
+pub fn auto_tag(
+    conn: Option<&Connection>,
+    cogito_dir: &Path,
+    project_id: Uuid,
+    paths: Vec<PathBuf>,
+) -> Result<Vec<SemanticTag>> {
     let mut tags = Vec::new();
 
     for path in paths {
-        if let Some(tag) = infer_tag_from_path(&path) {
+        if let Some(inferred) = infer_tag_from_path(&path) {
             tags.push(SemanticTag {
                 id: Uuid::new_v4(),
                 project_id,
-                tag: tag.name,
-                domain: tag.domain,
+                tag: inferred.name,
+                domain: inferred.domain,
                 paths: vec![path],
-                confidence: tag.confidence,
+                confidence: inferred.confidence,
                 created_at: Utc::now(),
             });
         }
     }
 
-    // Insert all tags
     for tag in &tags {
-        add(tag.clone()).await?;
+        add(conn, cogito_dir, tag.clone())?;
     }
 
     Ok(tags)
 }
 
-/// Inferred tag from file path
+/// Delete a tag by id.
+pub fn delete(
+    conn: Option<&Connection>,
+    cogito_dir: &Path,
+    project_id: Uuid,
+    tag_id: Uuid,
+) -> Result<bool> {
+    if let Some(conn) = conn {
+        let deleted = conn.execute(
+            "DELETE FROM tags WHERE id = ?1 AND project_id = ?2",
+            rusqlite::params![tag_id.to_string(), project_id.to_string()],
+        )?;
+        return Ok(deleted > 0);
+    }
+
+    let mut tags = LEGACY_TAGS.write();
+    if let Some(project_tags) = tags.get_mut(&project_id) {
+        let before = project_tags.len();
+        project_tags.retain(|t| t.id != tag_id);
+        let deleted = project_tags.len() < before;
+        drop(tags);
+        if deleted {
+            legacy_persist(cogito_dir);
+        }
+        return Ok(deleted);
+    }
+    Ok(false)
+}
+
+/// Get all tags for a project.
+pub fn get_all(conn: Option<&Connection>, project_id: Uuid) -> Result<Vec<SemanticTag>> {
+    search(conn, project_id, "")
+}
+
+/// Inferred tag from a file path.
 struct InferredTag {
     name: String,
     domain: String,
     confidence: f32,
 }
 
-/// Infer tag from file path patterns
+/// Infer a tag from file path patterns.
 fn infer_tag_from_path(path: &Path) -> Option<InferredTag> {
     let path_str = path.to_string_lossy().to_lowercase();
     let segments: Vec<&str> = path_str.split('/').collect();
 
-    // Common naming patterns
     let tag_patterns: HashMap<&str, (&str, &str, f32)> = HashMap::from([
         ("auth", ("auth", "security", 0.9)),
         ("login", ("auth", "security", 0.8)),
@@ -188,37 +205,6 @@ fn infer_tag_from_path(path: &Path) -> Option<InferredTag> {
     None
 }
 
-/// Get all tags for a project
-pub async fn get_all(project_id: Uuid) -> Result<Vec<SemanticTag>> {
-    search(project_id, "").await
-}
-
-/// Delete a tag
-pub async fn delete(project_id: Uuid, tag_id: Uuid) -> Result<bool> {
-    if let Some(conn) = SQLITE.get() {
-        let guard = conn.lock();
-        let deleted = guard.execute(
-            "DELETE FROM tags WHERE id = ?1 AND project_id = ?2",
-            rusqlite::params![tag_id.to_string(), project_id.to_string()],
-        )?;
-        return Ok(deleted > 0);
-    }
-
-    ensure_legacy_loaded();
-    let mut tags = LEGACY_TAGS.write();
-    if let Some(project_tags) = tags.get_mut(&project_id) {
-        let len_before = project_tags.len();
-        project_tags.retain(|t| t.id != tag_id);
-        let deleted = project_tags.len() < len_before;
-        drop(tags);
-        if deleted {
-            legacy_persist();
-        }
-        return Ok(deleted);
-    }
-    Ok(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,12 +218,9 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_search_returns_empty() {
-        // When SQLite is not set, legacy storage should work
-        ensure_legacy_loaded();
+    fn test_search_without_connection_uses_legacy_store() {
         let project_id = Uuid::new_v4();
-        // No tags added, should return empty
-        let result = futures::executor::block_on(search(project_id, ""));
+        let result = search(None, project_id, "");
         assert!(result.is_ok());
     }
 }

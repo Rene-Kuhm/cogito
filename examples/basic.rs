@@ -71,12 +71,12 @@ async fn main() -> anyhow::Result<()> {
         created_at: Utc::now(),
     };
 
-    let added = cogito.add_tag(tag).await?;
+    let added = cogito.add_tag(tag)?;
     println!("  Added tag: {}", added.tag);
 
     // Search tags
     println!("\nSearching tags for 'example'...");
-    let tags = cogito.search_tags(project.id, "example").await?;
+    let tags = cogito.search_tags(project.id, "example")?;
     for tag in tags {
         println!("  - {} ({})", tag.tag, tag.domain);
     }
@@ -92,12 +92,12 @@ async fn main() -> anyhow::Result<()> {
         .tag("example")
         .build();
 
-    let added = cogito.add_decision(decision).await?;
+    let added = cogito.add_decision(decision)?;
     println!("  Added: {}", added.title);
 
     // Search decisions
     println!("\nSearching decisions for 'example'...");
-    let decisions = cogito.search_decisions(project.id, "example").await?;
+    let decisions = cogito.search_decisions(project.id, "example")?;
     for decision in decisions {
         println!("  - {}: {}", decision.title, decision.why);
     }

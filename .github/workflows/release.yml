@@ -1,16 +1,40 @@
+# Release
+#
+# Builds prebuilt binaries for Linux, macOS and Windows and attaches them to a
+# GitHub Release. Nothing is published to crates.io or npm here; those are
+# separate, deliberate steps.
+#
+# Triggered only by pushing a tag matching `v*`, or manually.
+#
+# Artifacts per release:
+#
+#   cogito-<version>-x86_64-unknown-linux-gnu.tar.gz    Linux x86_64 (glibc)
+#   cogito-<version>-aarch64-unknown-linux-gnu.tar.gz   Linux arm64 (glibc)
+#   cogito-<version>-x86_64-apple-darwin.tar.gz         macOS Intel
+#   cogito-<version>-aarch64-apple-darwin.tar.gz        macOS Apple Silicon
+#   cogito-<version>-x86_64-pc-windows-msvc.zip         Windows x86_64
+#   cogito-checksums.txt                              SHA-256 of every artifact
+#
+# install.sh consumes these names.
+
 name: Release
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  BINARY_NAME: cogito
 
 jobs:
-  release:
-    name: Release ${{ matrix.target }}
+  build:
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -18,138 +42,107 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: windows-latest
-            target: x86_64-pc-windows-gnu
+            target: x86_64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install cross
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        uses: taiki-e/install-action@cross
-
-      - name: Install Rust stable
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      # Only musl needs cross; every other target builds natively on its runner, and
-      # cross cannot build Apple targets anyway. Both write to target/<triple>/release.
-      - name: Build release
+      - name: Build release binary
+        run: cargo build --release --locked -p cogito-cli --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
-          if [ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]; then
-            cross build --release --all --target ${{ matrix.target }}
-          else
-            cargo build --release --all --target ${{ matrix.target }}
-          fi
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="${BINARY_NAME}-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "dist/${name}/"
+          cp README.md LICENSE "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          rm -rf "dist/${name}"
 
-      - name: Package
+      - name: Package (windows)
+        if: runner.os == 'Windows'
         shell: bash
         run: |
-          mkdir -p release
-          if [ "$RUNNER_OS" == "Windows" ]; then
-            tar -czf release/cogito-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release cogito.exe
-          else
-            tar -czf release/cogito-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release cogito
-          fi
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="${BINARY_NAME}-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/${BINARY_NAME}.exe" "dist/${name}/"
+          cp README.md LICENSE "dist/${name}/"
+          cd dist && 7z a "${name}.zip" "${name}" >/dev/null
+          rm -rf "${name}"
 
-      - name: Upload artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cogito-${{ matrix.target }}
-          path: release/*.tar.gz
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
 
-  create-release:
-    name: Create Release
-    needs: [release]
+  release:
+    name: Publish GitHub Release
+    needs: [build]
     runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
-      - name: Create checksums
+      - name: Generate checksums
+        shell: bash
         run: |
-          cd cogito-*
-          sha256sum * > checksums.txt
-          cd ..
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz *.zip > cogito-checksums.txt
+          cat cogito-checksums.txt
 
-      - name: Create Release
-        id: create_release
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            cogito-*/checksums.txt
-            cogito-*/*.tar.gz
+            dist/*.tar.gz
+            dist/*.zip
+            dist/cogito-checksums.txt
           generate_release_notes: true
+          draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  publish-crates:
-    name: Publish to crates.io
-    needs: [release]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      # cargo publish has no --release flag; it reads CARGO_REGISTRY_TOKEN from env.
-      - name: Publish
-        run: |
-          cargo publish --package cogito-core
-          cargo publish --package cogito-cli
-          cargo publish --package cogito-api
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-
-  publish-docker:
-    name: Publish Docker
-    needs: [release]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # The repo has no Dockerfile yet: skip the image instead of failing the release.
-      - name: Check for a Dockerfile
-        id: docker
-        run: echo "present=$([ -f Dockerfile ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Docker Buildx
-        if: steps.docker.outputs.present == 'true'
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        if: steps.docker.outputs.present == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract metadata
-        if: steps.docker.outputs.present == 'true'
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: cogitoai/cogito
-          tags: type=semver,pattern={{version}}
-
-      - name: Build and push
-        if: steps.docker.outputs.present == 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+  # Disabled until the user explicitly decides to publish.
+  #
+  # publish-crates:
+  #   name: Publish to crates.io
+  #   needs: [release]
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - name: Publish
+  #       run: |
+  #         cargo publish -p cogito-core
+  #         cargo publish -p cogito-cli
+  #         cargo publish -p cogito-api
+  #       env:
+  #         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -2,7 +2,9 @@
 //!
 //! Intelligent context harness for AI coding agents.
 
+mod agents;
 mod commands;
+mod mcp;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -94,6 +96,34 @@ enum Commands {
     Project {
         #[command(subcommand)]
         subcommand: Option<ProjectCommands>,
+    },
+
+    /// Run the MCP server over stdio (for AI agents)
+    Mcp,
+
+    /// Install Cogito into one or more AI agents
+    Setup {
+        /// Agents to configure (omit for an interactive menu)
+        agents: Vec<String>,
+        /// Configure every detected agent without asking
+        #[arg(long)]
+        all: bool,
+        /// Assume yes: configure every detected agent without prompting
+        /// (same as --all; accepted so `setup -y` behaves as expected)
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Show what would change without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Remove Cogito from one or more AI agents
+    Uninstall {
+        /// Agents to clean up (omit to remove from every configured agent)
+        agents: Vec<String>,
+        /// Skip the confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
     /// Start server mode
@@ -248,6 +278,14 @@ async fn main() -> Result<()> {
         Some(Commands::Project { subcommand }) => {
             commands::project(subcommand).await?;
         }
+        Some(Commands::Mcp) => mcp::serve_stdio().await?,
+        Some(Commands::Setup {
+            agents,
+            all,
+            yes,
+            dry_run,
+        }) => commands::setup(agents, all || yes, dry_run)?,
+        Some(Commands::Uninstall { agents, yes }) => commands::uninstall(agents, yes)?,
         Some(Commands::Serve { port, mcp }) => commands::serve(port, mcp).await?,
         Some(Commands::Stats) => commands::stats(args.json).await?,
         Some(Commands::Doctor) => commands::doctor().await?,

@@ -206,14 +206,11 @@ pub async fn query(query_str: &str, json: bool) -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
     let tags = cogito
         .search_tags(project.id, query_str)
-        .await
         .context("Failed to search tags")?;
     let decisions = cogito
         .search_decisions(project.id, query_str)
-        .await
         .context("Failed to search decisions")?;
 
     if json {
@@ -283,8 +280,6 @@ async fn add_decision(
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
-
     // Build the decision with all options
     let mut builder = cogito_core::decision::builder(project.id)
         .title(&title_str)
@@ -303,7 +298,6 @@ async fn add_decision(
 
     let added = cogito
         .add_decision(decision)
-        .await
         .context("Failed to add decision")?;
 
     println!("✓ Decision added");
@@ -328,11 +322,9 @@ async fn list_decisions() -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
     // For now, return all by searching empty
     let decisions = cogito
         .search_decisions(project.id, "")
-        .await
         .context("Failed to list decisions")?;
 
     if decisions.is_empty() {
@@ -353,10 +345,8 @@ async fn search_decisions(query_str: &str) -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
     let decisions = cogito
         .search_decisions(project.id, query_str)
-        .await
         .context("Failed to search decisions")?;
 
     if decisions.is_empty() {
@@ -404,7 +394,6 @@ async fn add_tag(tag: &str, paths: Vec<String>) -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
     let semantic_tag = cogito_core::types::SemanticTag {
         id: Uuid::new_v4(),
         project_id: project.id,
@@ -415,10 +404,7 @@ async fn add_tag(tag: &str, paths: Vec<String>) -> Result<()> {
         created_at: chrono::Utc::now(),
     };
 
-    let added = cogito
-        .add_tag(semantic_tag)
-        .await
-        .context("Failed to add tag")?;
+    let added = cogito.add_tag(semantic_tag).context("Failed to add tag")?;
 
     println!("✓ Tag added");
     println!("  Tag:  {}", added.tag);
@@ -432,10 +418,8 @@ async fn list_tags() -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
     let tags = cogito
         .search_tags(project.id, "")
-        .await
         .context("Failed to list tags")?;
 
     if tags.is_empty() {
@@ -461,10 +445,8 @@ async fn search_tags(query_str: &str) -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
     let tags = cogito
         .search_tags(project.id, query_str)
-        .await
         .context("Failed to search tags")?;
 
     if tags.is_empty() {
@@ -543,12 +525,8 @@ pub async fn stats(json: bool) -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
-    let tags = cogito.search_tags(project.id, "").await.unwrap_or_default();
-    let decisions = cogito
-        .search_decisions(project.id, "")
-        .await
-        .unwrap_or_default();
+    let tags = cogito.search_tags(project.id, "").unwrap_or_default();
+    let decisions = cogito.search_decisions(project.id, "").unwrap_or_default();
 
     if json {
         let stats = serde_json::json!({
@@ -570,46 +548,378 @@ pub async fn stats(json: bool) -> Result<()> {
 pub async fn doctor() -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
 
-    println!("Running diagnostics...");
+    println!("Cogito diagnostics");
     println!();
+    println!("Binary");
+    println!("  cogito    {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  path      {}",
+        std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "(unknown)".into())
+    );
 
-    // Check project directory
-    println!("  Project: {}", cwd.display());
+    println!();
+    println!("Project");
+    println!("  path      {}", cwd.display());
 
-    // Check git
     let has_git = std::process::Command::new("git")
-        .arg("rev-parse")
-        .arg("--git-dir")
+        .args(["rev-parse", "--git-dir"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
     println!(
-        "  Git:     {}",
+        "  git       {}",
         if has_git {
-            "✓ found"
+            "found"
         } else {
-            "○ not a git repo (zone detection will be limited)"
+            "not a repository (zone detection limited to filesystem)"
         }
     );
 
-    // Check for common project files
+    let state_db = cwd.join(".cogito/state.db");
+    println!(
+        "  storage   {}",
+        if state_db.exists() {
+            format!("SQLite at {}", state_db.display())
+        } else {
+            "no .cogito/state.db yet (run `cogito scan` or `cogito init`)".to_string()
+        }
+    );
+
     let project_files = [
-        ("Cargo.toml", "Rust project"),
-        ("package.json", "Node.js project"),
-        ("go.mod", "Go project"),
-        ("pyproject.toml", "Python project"),
-        ("Gemfile", "Ruby project"),
-        ("composer.json", "PHP project"),
+        ("Cargo.toml", "Rust"),
+        ("package.json", "Node.js"),
+        ("go.mod", "Go"),
+        ("pyproject.toml", "Python"),
+        ("Gemfile", "Ruby"),
+        ("composer.json", "PHP"),
+        ("build.gradle.kts", "Kotlin"),
+        ("Package.swift", "Swift"),
     ];
-    for (file, desc) in project_files {
-        if cwd.join(file).exists() {
-            println!("  Project file: ✓ {} ({})", file, desc);
+    let detected: Vec<&str> = project_files
+        .iter()
+        .filter(|(f, _)| cwd.join(f).exists())
+        .map(|(_, d)| *d)
+        .collect();
+    println!(
+        "  language  {}",
+        if detected.is_empty() {
+            "unknown".to_string()
+        } else {
+            detected.join(", ")
+        }
+    );
+
+    // -- Agent integrations --
+    println!();
+    println!("Agent integrations");
+    let home = crate::agents::home_dir()?;
+    let binary = std::env::current_exe().context("Cannot locate the cogito binary")?;
+    let mut outdated = 0usize;
+    for agent in crate::agents::ALL {
+        let status = crate::agents::status(*agent, &home, &binary)?;
+        let mark = match status {
+            crate::agents::Status::Configured => "✓",
+            crate::agents::Status::Outdated => "!",
+            crate::agents::Status::NotConfigured => "○",
+            crate::agents::Status::AgentMissing => "·",
+        };
+        if status == crate::agents::Status::Outdated {
+            outdated += 1;
+        }
+        println!("  {mark} {:<20} {}", agent.display(), status.label());
+    }
+
+    println!();
+    if outdated > 0 {
+        println!(
+            "{outdated} agent(s) hold a stale entry (a different binary path, or older fields)."
+        );
+        println!("Re-run `cogito setup` to bring them up to date.");
+    } else {
+        println!("✓ Diagnostics complete");
+    }
+    Ok(())
+}
+
+// ============================================================
+// Agent setup / uninstall
+// ============================================================
+
+/// Resolve the list of agents to act on from CLI arguments.
+fn resolve_agents(agents: &[String]) -> Result<Vec<crate::agents::Agent>> {
+    let mut selected = Vec::new();
+    for name in agents {
+        match crate::agents::Agent::parse(name) {
+            Some(agent) => {
+                if !selected.contains(&agent) {
+                    selected.push(agent);
+                }
+            }
+            None => {
+                eprintln!("Unknown agent: {name}");
+                eprintln!(
+                    "Known agents: {}",
+                    crate::agents::ALL
+                        .iter()
+                        .map(|a| a.id())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                anyhow::bail!("unknown agent `{name}`");
+            }
+        }
+    }
+    Ok(selected)
+}
+
+/// Heuristic: does this binary path look like a real install rather than a
+/// build artifact?
+///
+/// `target/debug/cogito` or `target/release/cogito` will move or vanish, which
+/// would leave every agent pointing at a broken command.
+fn looks_installed(binary: &Path) -> bool {
+    let path = binary.to_string_lossy();
+    !path.contains("/target/debug/") && !path.contains("/target/release/")
+}
+
+/// Install Cogito into the requested (or all detected) agents.
+pub fn setup(agents: Vec<String>, all: bool, dry_run: bool) -> Result<()> {
+    let home = crate::agents::home_dir()?;
+    let binary = std::env::current_exe().context("Cannot locate the cogito binary")?;
+
+    let mut selected = resolve_agents(&agents)?;
+    if selected.is_empty() {
+        if all {
+            selected = crate::agents::ALL
+                .iter()
+                .copied()
+                .filter(|a| a.agent_present(&home))
+                .collect();
+        } else {
+            selected = pick_interactively(&home, &binary)?;
+        }
+    }
+
+    if selected.is_empty() {
+        println!("Nothing selected. Use `cogito setup <agent>` or `cogito setup --all`.");
+        return Ok(());
+    }
+
+    let mut configured: Vec<crate::agents::Agent> = Vec::new();
+    let mut failed: Vec<crate::agents::Agent> = Vec::new();
+
+    println!("Home:   {}", home.display());
+    println!("Binary: {}", binary.display());
+    if dry_run {
+        println!("Mode:   dry run (nothing will be written)");
+    }
+    if !looks_installed(&binary) {
+        println!();
+        println!("Warning: this binary is not in a normal install location.");
+        println!("         The agents will be configured with the path above, which");
+        println!("         may be a build artifact that later disappears or changes.");
+        println!("         Install first (`cargo install --path crates/cogito-cli` or");
+        println!("         install.sh) and re-run setup from the installed binary.");
+    }
+    println!();
+
+    for agent in selected {
+        if agent.uses_pi_package() {
+            println!("  {}:", agent.display());
+            println!(
+                "    registers the npm package `{}` in {}",
+                crate::agents::PI_PACKAGE,
+                agent.config_path(&home).display()
+            );
+            println!(
+                "    note: that package is not published yet — the agent will skip it until it is"
+            );
+        }
+
+        if dry_run {
+            let status = crate::agents::status(agent, &home, &binary)?;
+            println!(
+                "  {} [{}] -> would {}",
+                agent.display(),
+                status.label(),
+                match status {
+                    crate::agents::Status::Configured => "stay as is",
+                    crate::agents::Status::Outdated => "update the entry",
+                    _ => "write",
+                }
+            );
+            continue;
+        }
+
+        match crate::agents::install(agent, &home, &binary) {
+            Ok(crate::agents::Change::AlreadyCorrect) => {
+                println!("  {} — already up to date", agent.display());
+                configured.push(agent);
+            }
+            Ok(crate::agents::Change::Written { backup }) => {
+                println!("  {} — configured", agent.display());
+                println!("    file:   {}", agent.config_path(&home).display());
+                if let Some(b) = backup {
+                    println!("    backup: {}", b.display());
+                }
+                configured.push(agent);
+            }
+            Err(e) => {
+                failed.push(agent);
+                println!("  {} — failed", agent.display());
+                println!("    file:   {}", agent.config_path(&home).display());
+                // Print the full cause chain: "Is a directory" alone does not
+                // say which file or which step went wrong.
+                for (i, cause) in e.chain().enumerate() {
+                    println!("    {}{cause}", if i == 0 { "error: " } else { "cause: " });
+                }
+            }
         }
     }
 
     println!();
-    println!("✓ Diagnostics complete");
+    if failed.is_empty() {
+        println!("Restart the agent(s) for the MCP server to load.");
+    } else if configured.is_empty() {
+        println!(
+            "Nothing was configured: all {} selected agent(s) failed.",
+            failed.len()
+        );
+    } else {
+        println!(
+            "Configured: {}. Failed: {} — see the errors above.",
+            configured
+                .iter()
+                .map(|a| a.display())
+                .collect::<Vec<_>>()
+                .join(", "),
+            failed
+                .iter()
+                .map(|a| a.display())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!("Restart the configured agent(s) for the MCP server to load.");
+    }
     Ok(())
+}
+
+/// Remove Cogito from the requested (or every configured) agents.
+pub fn uninstall(agents: Vec<String>, yes: bool) -> Result<()> {
+    let home = crate::agents::home_dir()?;
+    let binary = std::env::current_exe().context("Cannot locate the cogito binary")?;
+
+    let mut selected = resolve_agents(&agents)?;
+    if selected.is_empty() {
+        selected = crate::agents::ALL
+            .iter()
+            .copied()
+            .filter(|a| {
+                // Include outdated entries: they are Cogito's and must go too.
+                crate::agents::status(*a, &home, &binary)
+                    .map(|s| s.is_present())
+                    .unwrap_or(false)
+            })
+            .collect();
+    }
+
+    if selected.is_empty() {
+        println!("Cogito is not configured in any agent.");
+        return Ok(());
+    }
+
+    if !yes {
+        println!("Cogito will be removed from:");
+        for agent in &selected {
+            println!(
+                "  • {} ({})",
+                agent.display(),
+                agent.config_path(&home).display()
+            );
+        }
+        print!("\nContinue? [y/N] ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    println!();
+    for agent in selected {
+        match crate::agents::uninstall(agent, &home) {
+            Ok(crate::agents::Change::AlreadyCorrect) => {
+                println!("  {} — nothing to do", agent.display());
+            }
+            Ok(crate::agents::Change::Written { backup }) => {
+                println!("  {} — removed", agent.display());
+                if let Some(b) = backup {
+                    println!("    backup: {}", b.display());
+                }
+            }
+            Err(e) => println!("  {} — failed: {e}", agent.display()),
+        }
+    }
+    Ok(())
+}
+
+/// Ask which detected agents to configure.
+fn pick_interactively(home: &Path, binary: &Path) -> Result<Vec<crate::agents::Agent>> {
+    let available: Vec<crate::agents::Agent> = crate::agents::ALL
+        .iter()
+        .copied()
+        .filter(|a| a.agent_present(home))
+        .collect();
+
+    if available.is_empty() {
+        println!("No supported agents detected in {}.\n", home.display());
+        println!(
+            "Supported agents: {}",
+            crate::agents::ALL
+                .iter()
+                .map(|a| a.id())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return Ok(Vec::new());
+    }
+
+    println!("Detected agents:");
+    for (i, agent) in available.iter().enumerate() {
+        let status = crate::agents::status(*agent, home, binary)?;
+        println!("  {}) {:<20} {}", i + 1, agent.display(), status.label());
+    }
+    println!("  a) all of them");
+    print!("\nSelect (comma-separated numbers, or `a`): ");
+    use std::io::Write;
+    std::io::stdout().flush()?;
+
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim().to_lowercase();
+
+    if answer == "a" || answer == "all" {
+        return Ok(available);
+    }
+
+    let mut chosen = Vec::new();
+    for part in answer.split(',') {
+        if let Ok(n) = part.trim().parse::<usize>()
+            && n >= 1
+            && n <= available.len()
+        {
+            let agent = available[n - 1];
+            if !chosen.contains(&agent) {
+                chosen.push(agent);
+            }
+        }
+    }
+    Ok(chosen)
 }
 
 /// Export project data
@@ -618,10 +928,9 @@ pub async fn export(output: Option<&str>, format: &str) -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
     let fingerprint = cogito.generate_fingerprint(&project).await?;
-    let tags = cogito.search_tags(project.id, "").await?;
-    let decisions = cogito.search_decisions(project.id, "").await?;
+    let tags = cogito.search_tags(project.id, "")?;
+    let decisions = cogito.search_decisions(project.id, "")?;
 
     let export_data = serde_json::json!({
         "version": "0.1.0",

@@ -4,7 +4,7 @@ members = [
     "crates/cogito-core",
     "crates/cogito-cli",
     "crates/cogito-api",
-    "crates/cogito-mcp",
+
     "examples",
     "skills/cogito",
 ]
@@ -23,7 +23,7 @@ categories = ["development-tools", "artificial-intelligence"]
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
@@ -39,6 +39,9 @@ parking_lot = "0.12"
 git2 = "0.20"
 criterion = { version = "0.5", features = ["html_reports"] }
 rusqlite = { version = "0.32", features = ["bundled", "modern_sqlite", "blob"] }
+rmcp = { version = "1.8", features = ["server", "transport-io", "macros", "schemars"] }
+schemars = "1"
+toml_edit = "0.22"
 syn = { version = "2", features = ["full", "extra-traits", "parsing"] }
 quote = "1"
 proc-macro2 = "1"

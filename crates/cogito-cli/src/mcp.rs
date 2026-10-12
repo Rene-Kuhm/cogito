@@ -1,23 +1,29 @@
-//! Cogito MCP (Model Context Protocol) Server
+//! MCP (Model Context Protocol) server for Cogito.
 //!
-//! Exposes cogito's context optimization capabilities as MCP tools
-//! so any MCP-compatible agent (Claude Code, Cursor, etc.) can use them.
+//! Runs over stdio so any MCP-capable agent (Claude Code, Cursor, Codex,
+//! opencode, Gemini CLI, …) can use Cogito as a tool provider.
+//!
+//! Each tool takes an explicit `path` argument. The server opens that
+//! project's `.cogito/state.db` per call, so one process can serve several
+//! projects without mixing their data.
 
 use anyhow::Result;
-use cogito_core::{Cogito, CompressionOptions};
+use cogito_core::{Cogito, CompressionOptions, Project};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::ServerCapabilities,
+    model::{Implementation, ServerCapabilities},
     schemars, tool, tool_handler, tool_router,
     transport::stdio,
 };
 use std::path::PathBuf;
-use tracing_subscriber::{self, EnvFilter};
 use uuid::Uuid;
 
+/// Server name advertised to MCP clients.
+pub const SERVER_NAME: &str = "cogito";
+
 // ============================================================
-// Request/Response Types
+// Requests
 // ============================================================
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -33,19 +39,13 @@ pub struct CompressContextRequest {
     /// Maximum tokens in the compressed output
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
-    /// Preserve import statements
-    #[serde(default = "default_true")]
-    pub preserve_imports: bool,
-    /// Preserve type definitions
-    #[serde(default = "default_true")]
-    pub preserve_types: bool,
+    /// Language hint for AST-aware compression (e.g. "rust", "typescript", "go")
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 fn default_max_tokens() -> usize {
     8000
-}
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -86,14 +86,12 @@ pub struct AddTagRequest {
 }
 
 // ============================================================
-// Cogito Server
+// Server
 // ============================================================
 
 #[derive(Clone)]
 pub struct CogitoServer {
-    #[allow(dead_code)]
-    cogito: Cogito,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // read by the #[tool_handler] macro expansion
     tool_router: ToolRouter<CogitoServer>,
 }
 
@@ -103,16 +101,29 @@ impl Default for CogitoServer {
     }
 }
 
+/// Open the project rooted at `path` and make sure it is registered.
+///
+/// This is the fix for the multi-project bug: the connection is derived from
+/// the caller-supplied path, never from the process working directory.
+fn open_project(path: &str) -> Result<(Cogito, Project), String> {
+    let root = PathBuf::from(path);
+    let cogito = Cogito::for_project(&root)
+        .map_err(|e| format!("Failed to open project at {}: {e}", root.display()))?;
+    let project = cogito
+        .load_project(root.clone())
+        .map_err(|e| format!("Failed to load project at {}: {e}", root.display()))?;
+    Ok((cogito, project))
+}
+
 #[tool_router]
 impl CogitoServer {
     pub fn new() -> Self {
         Self {
-            cogito: Cogito::new(),
             tool_router: Self::tool_router(),
         }
     }
 
-    /// Generate a code fingerprint for a project
+    /// Generate a code fingerprint for a project.
     #[tool(
         description = "Generate a code fingerprint (entry points, data flows, hot/cold zones) for a project. Returns a summary of the project structure and zone analysis based on git history."
     )]
@@ -120,18 +131,14 @@ impl CogitoServer {
         &self,
         Parameters(req): Parameters<ScanProjectRequest>,
     ) -> Result<String, String> {
-        let project = self
-            .cogito
-            .init_project(PathBuf::from(&req.path))
-            .map_err(|e| format!("Failed to init project: {e}"))?;
+        let (cogito, project) = open_project(&req.path)?;
 
-        let fingerprint = self
-            .cogito
+        let fingerprint = cogito
             .generate_fingerprint(&project)
             .await
             .map_err(|e| format!("Failed to generate fingerprint: {e}"))?;
 
-        Ok(format!(
+        let mut out = format!(
             "Project: {} ({})\n\
              Entry points: {}\n\
              Data flows: {}\n\
@@ -147,12 +154,26 @@ impl CogitoServer {
             fingerprint.cold_zones.len(),
             fingerprint.frozen_zones.len(),
             fingerprint.generated_at,
-        ))
+        );
+
+        if !fingerprint.hot_zones.is_empty() {
+            out.push_str("\n\nMost active files:\n");
+            for zone in fingerprint.hot_zones.iter().take(10) {
+                let rel = zone.path.strip_prefix(&project.path).unwrap_or(&zone.path);
+                out.push_str(&format!(
+                    "  • {} ({} changes)\n",
+                    rel.display(),
+                    zone.change_count
+                ));
+            }
+        }
+
+        Ok(out)
     }
 
-    /// Compress context to save tokens
+    /// Compress context to save tokens.
     #[tool(
-        description = "Compress code/text context while preserving meaning. Strips comments, compresses whitespace. Use this to reduce token usage before sending context to an AI model."
+        description = "Compress code/text context while preserving meaning. When a `language` is given and supported (rust, typescript, javascript, python, go, csharp, java, ruby, php, kotlin, swift), function bodies are collapsed to their signatures (AST-aware). Otherwise comments and whitespace are stripped."
     )]
     async fn compress_context(
         &self,
@@ -160,16 +181,19 @@ impl CogitoServer {
     ) -> Result<String, String> {
         let options = CompressionOptions {
             max_tokens: req.max_tokens,
-            preserve_imports: req.preserve_imports,
-            preserve_types: req.preserve_types,
+            preserve_imports: true,
+            preserve_types: true,
             hot_zones_priority: true,
         };
 
-        let result = self
-            .cogito
-            .compress_context(&req.content, options)
-            .await
-            .map_err(|e| format!("Failed to compress: {e}"))?;
+        let language = req
+            .language
+            .as_deref()
+            .and_then(cogito_core::compressor::parse_language);
+
+        let result =
+            cogito_core::compressor::compress_with_language(&req.content, options, language)
+                .map_err(|e| format!("Failed to compress: {e}"))?;
 
         Ok(format!(
             "Original tokens: {}\n\
@@ -183,48 +207,41 @@ impl CogitoServer {
         ))
     }
 
-    /// Search project knowledge (tags + decisions)
+    /// Search project knowledge (tags + decisions).
     #[tool(
-        description = "Search project knowledge base: semantic tags and architectural decisions. Returns matches from both knowledge sources."
+        description = "Search project knowledge base: semantic tags and architectural decisions. Returns matches from both knowledge sources. Uses SQLite FTS5 with porter stemming, so 'scalable' also matches 'scalability'."
     )]
     async fn search_knowledge(
         &self,
         Parameters(req): Parameters<SearchKnowledgeRequest>,
     ) -> Result<String, String> {
-        let project = self
-            .cogito
-            .init_project(PathBuf::from(&req.path))
-            .map_err(|e| format!("Failed to init project: {e}"))?;
+        let (cogito, project) = open_project(&req.path)?;
 
-        let tags = self
-            .cogito
+        let tags = cogito
             .search_tags(project.id, &req.query)
-            .await
             .map_err(|e| format!("Failed to search tags: {e}"))?;
-        let decisions = self
-            .cogito
+        let decisions = cogito
             .search_decisions(project.id, &req.query)
-            .await
             .map_err(|e| format!("Failed to search decisions: {e}"))?;
 
-        let mut output = format!("Search: {}\n\n", req.query);
-        output.push_str(&format!("📌 Tags ({}):\n", tags.len()));
+        let mut out = format!("Search: {}\n\n", req.query);
+        out.push_str(&format!("Tags ({}):\n", tags.len()));
         for tag in &tags {
-            output.push_str(&format!(
+            out.push_str(&format!(
                 "  • {} ({}) - {} paths\n",
                 tag.tag,
                 tag.domain,
                 tag.paths.len()
             ));
         }
-        output.push_str(&format!("\n📋 Decisions ({}):\n", decisions.len()));
+        out.push_str(&format!("\nDecisions ({}):\n", decisions.len()));
         for d in &decisions {
-            output.push_str(&format!("  • {} - {}\n", d.title, d.why));
+            out.push_str(&format!("  • {} - {}\n", d.title, d.why));
         }
-        Ok(output)
+        Ok(out)
     }
 
-    /// Add a decision to the project log
+    /// Record an architectural decision.
     #[tool(
         description = "Record an architectural decision with title, rationale, alternatives, and tags. Helps the AI agent understand WHY past decisions were made."
     )]
@@ -232,10 +249,7 @@ impl CogitoServer {
         &self,
         Parameters(req): Parameters<AddDecisionRequest>,
     ) -> Result<String, String> {
-        let project = self
-            .cogito
-            .init_project(PathBuf::from(&req.path))
-            .map_err(|e| format!("Failed to init project: {e}"))?;
+        let (cogito, project) = open_project(&req.path)?;
 
         let mut builder = cogito_core::decision::builder(project.id)
             .title(&req.title)
@@ -247,34 +261,28 @@ impl CogitoServer {
         for tag in &req.tags {
             builder = builder.tag(tag);
         }
-        for path_str in &req.paths {
-            builder = builder.path(PathBuf::from(path_str));
+        for p in &req.paths {
+            builder = builder.path(PathBuf::from(p));
         }
-        let decision = builder.build();
 
-        let added = self
-            .cogito
-            .add_decision(decision)
-            .await
+        let added = cogito
+            .add_decision(builder.build())
             .map_err(|e| format!("Failed to add decision: {e}"))?;
 
         Ok(format!(
-            "✓ Decision added\n  ID: {}\n  Title: {}\n  Why: {}",
-            added.id, added.title, added.why
+            "Decision added\n  ID: {}\n  Title: {}\n  Why: {}\n  Project: {}",
+            added.id, added.title, added.why, project.name
         ))
     }
 
-    /// Add a semantic tag to project paths
+    /// Tag project paths.
     #[tool(
         description = "Add a semantic tag (e.g. 'auth', 'billing') to project paths. Tags are searchable and help the AI agent find relevant code quickly."
     )]
     async fn add_tag(&self, Parameters(req): Parameters<AddTagRequest>) -> Result<String, String> {
-        let project = self
-            .cogito
-            .init_project(PathBuf::from(&req.path))
-            .map_err(|e| format!("Failed to init project: {e}"))?;
+        let (cogito, project) = open_project(&req.path)?;
 
-        let semantic_tag = cogito_core::types::SemanticTag {
+        let tag = cogito_core::types::SemanticTag {
             id: Uuid::new_v4(),
             project_id: project.id,
             tag: req.tag.clone(),
@@ -284,17 +292,44 @@ impl CogitoServer {
             created_at: chrono::Utc::now(),
         };
 
-        let added = self
-            .cogito
-            .add_tag(semantic_tag)
-            .await
+        let added = cogito
+            .add_tag(tag)
             .map_err(|e| format!("Failed to add tag: {e}"))?;
 
         Ok(format!(
-            "✓ Tag added\n  Tag: {}\n  Domain: {}\n  Paths: {}",
+            "Tag added\n  Tag: {}\n  Domain: {}\n  Paths: {}\n  Project: {}",
             added.tag,
             added.domain,
-            added.paths.len()
+            added.paths.len(),
+            project.name
+        ))
+    }
+
+    /// Project storage statistics.
+    #[tool(
+        description = "Report how much knowledge Cogito has stored for a project: number of tags, decisions and cached hot zones."
+    )]
+    async fn project_stats(
+        &self,
+        Parameters(req): Parameters<ScanProjectRequest>,
+    ) -> Result<String, String> {
+        let (cogito, project) = open_project(&req.path)?;
+        let stats = cogito
+            .stats(project.id)
+            .map_err(|e| format!("Failed to read stats: {e}"))?;
+
+        Ok(format!(
+            "Project: {} ({})\n\
+             Storage: {}\n\
+             Tags: {}\n\
+             Decisions: {}\n\
+             Cached hot zones: {}",
+            project.name,
+            project.language,
+            cogito.cogito_dir().join("state.db").display(),
+            stats.tags_count,
+            stats.decisions_count,
+            stats.hot_zones_count,
         ))
     }
 }
@@ -302,32 +337,29 @@ impl CogitoServer {
 #[tool_handler]
 impl ServerHandler for CogitoServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "Cogito MCP server provides context optimization for AI coding agents. \
-             Tools: scan_project (generate fingerprint), compress_context (reduce tokens), \
-             search_knowledge (find tags/decisions), add_decision (record architecture decisions), \
-             add_tag (categorize code). \
-             All tools work with file-based persistence in .cogito/ directory.",
-            )
+        rmcp::model::InitializeResult::new(
+            ServerCapabilities::builder().enable_tools().build(),
+        )
+        // rmcp's `from_build_env` would report the crate name as "rmcp";
+        // identify as cogito so clients show the right server.
+        .with_server_info(Implementation::new(SERVER_NAME, env!("CARGO_PKG_VERSION")))
+        .with_instructions(
+            "Cogito is a context harness for AI coding agents. It stores, per project: \
+             a code fingerprint (entry points, data flows, hot/cold zones), semantic tags, \
+             and architectural decisions. \
+             Tools: scan_project, compress_context, search_knowledge, add_decision, add_tag, project_stats. \
+             Every tool takes an explicit `path` to the project root; state lives in `<path>/.cogito/state.db`."
+                .to_string(),
+        )
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
-
-    tracing::info!("Starting Cogito MCP server");
-
+/// Run the MCP server over stdio until the client disconnects.
+pub async fn serve_stdio() -> Result<()> {
     let service = CogitoServer::new()
         .serve(stdio())
         .await
-        .inspect_err(|e| tracing::error!("serving error: {:?}", e))?;
-
+        .inspect_err(|e| tracing::error!("MCP serving error: {e:?}"))?;
     service.waiting().await?;
     Ok(())
 }
