@@ -469,10 +469,129 @@ cogito doctor                    # Diagnose configuration
 ## 9. Open Questions
 
 1. **LLM Integration**: Should Cogito call an LLM for semantic compression, or stay model-agnostic?
-2. **Index Storage**: SQLite vs PostgreSQL trade-offs for large codebases
-3. **Sync Protocol**: How should collaborative memory sync work across team members?
-4. **Privacy Model**: Should fingerprints/decisions be encrypted at rest?
-5. **Versioning**: How to handle project restructuring and migration of knowledge?
+2. **Sync Protocol**: How should collaborative memory sync work across team members?
+3. **Privacy Model**: Should fingerprints/decisions be encrypted at rest?
+4. **Versioning**: How to handle project restructuring and migration of knowledge?
+
+## 10. Storage Architecture
+
+Cogito uses **SQLite** as the primary storage backend. The schema is
+designed to leverage modern SQLite features:
+
+### Schema
+
+```sql
+-- Projects
+CREATE TABLE projects (
+    id TEXT PRIMARY KEY,           -- UUID v5 of canonical path
+    path TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    language TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Decisions with FTS5 + generated columns
+CREATE TABLE decisions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    why TEXT NOT NULL,
+    alternatives TEXT NOT NULL DEFAULT '[]',
+    paths TEXT NOT NULL DEFAULT '[]',
+    consequences TEXT NOT NULL DEFAULT '[]',
+    tags TEXT NOT NULL DEFAULT '[]',
+    author TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+
+    -- Generated columns (auto-calculated on write)
+    title_lower TEXT GENERATED ALWAYS AS (lower(title)) STORED,
+    path_count INTEGER GENERATED ALWAYS AS (json_array_length(paths)) STORED,
+    tag_count INTEGER GENERATED ALWAYS AS (json_array_length(tags)) STORED,
+    alt_count INTEGER GENERATED ALWAYS AS (json_array_length(alternatives)) STORED,
+    cons_count INTEGER GENERATED ALWAYS AS (json_array_length(consequences)) STORED,
+
+    -- Concatenated search text (auto-updated, indexed by FTS5)
+    search_text TEXT GENERATED ALWAYS AS (
+        lower(coalesce(title, '')) || ' ' ||
+        lower(coalesce(why, '')) || ' ' ||
+        lower(coalesce(alternatives, '')) || ' ' ||
+        lower(coalesce(consequences, '')) || ' ' ||
+        lower(coalesce(tags, ''))
+    ) STORED
+);
+
+CREATE INDEX idx_decisions_project ON decisions(project_id);
+CREATE INDEX idx_decisions_created ON decisions(created_at DESC);
+CREATE INDEX idx_decisions_path_count ON decisions(path_count) WHERE path_count > 0;
+CREATE INDEX idx_decisions_tag_count ON decisions(tag_count) WHERE tag_count > 0;
+CREATE INDEX idx_decisions_title_lower ON decisions(title_lower);
+
+-- FTS5 with porter stemming
+CREATE VIRTUAL TABLE decisions_fts USING fts5(
+    search_text,
+    content='decisions',
+    content_rowid='rowid',
+    tokenize='porter unicode61'
+);
+
+-- Triggers keep FTS5 in sync
+CREATE TRIGGER decisions_ai AFTER INSERT ON decisions ...;
+CREATE TRIGGER decisions_au AFTER UPDATE ON decisions ...;
+CREATE TRIGGER decisions_ad AFTER DELETE ON decisions ...;
+
+-- Tags (similar structure with FTS5)
+CREATE TABLE tags (...);
+CREATE VIRTUAL TABLE tags_fts USING fts5(...);
+```
+
+### PRAGMAs
+
+```sql
+PRAGMA journal_mode = WAL;             -- concurrent readers
+PRAGMA synchronous = NORMAL;          -- balanced safety/speed
+PRAGMA temp_store = MEMORY;           -- fast temp tables
+PRAGMA mmap_size = 268435456;         -- 256 MB memory-mapped I/O
+PRAGMA page_size = 8192;
+PRAGMA foreign_keys = ON;             -- FK constraints enforced
+PRAGMA optimize;                       -- auto-tune over time
+```
+
+### Key Features
+
+| Feature | Benefit |
+|---|---|
+| **FTS5 + porter** | Stemming: "running" matches "run" |
+| **Generated columns** | Auto-calculated `path_count`, `tag_count` |
+| **Expression indexes** | Partial indexes (`WHERE path_count > 0`) |
+| **Triggers** | FTS5 always in sync, no manual updates |
+| **WAL mode** | Readers don't block writers |
+| **mmap** | ~Zero-syscall reads |
+| **JSONB** | Path arrays stored as binary JSON (planned) |
+| **Foreign keys** | Cascading deletes on project removal |
+
+### File location
+
+Default: `<project>/.cogito/state.db`
+
+WAL file: `<project>/.cogito/state.db-wal`
+Shared memory: `<project>/.cogito/state.db-shm`
+
+### Migration from JSON
+
+On first scan of a project that has legacy `.cogito/tags.json` and
+`.cogito/decisions.json`, Cogito auto-migrates them into SQLite.
+Migrated records are re-assigned to the current project's UUID
+(determined by the canonical path).
+
+### Measured Performance
+
+See `docs/benchmarks.md` for real numbers. Highlights:
+
+- **Write throughput**: 309x faster than JSON for 1000 decisions
+- **File size**: 3x more compact (164 vs 495 bytes/decision)
+- **FTS5 stemming**: matches "scalable" → "scalability" automatically
+- **No regression** on small N: both backends load in ~4 µs at 100 records
 
 ---
 

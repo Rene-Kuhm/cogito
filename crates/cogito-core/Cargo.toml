@@ -47,3 +47,7 @@ harness = false
 [[bench]]
 name = "search"
 harness = false
+
+[[bench]]
+name = "storage_compare"
+harness = false
