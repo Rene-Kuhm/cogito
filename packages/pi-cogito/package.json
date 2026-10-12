@@ -1,0 +1,41 @@
+{
+  "name": "pi-cogito",
+  "version": "0.1.0",
+  "description": "Context harness for Pi agents: scans the project at session start, exposes /cogito, and registers the cogito MCP server",
+  "type": "module",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/Rene-Kuhm/cogito",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Rene-Kuhm/cogito.git",
+    "directory": "packages/pi-cogito"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "cogito",
+    "context",
+    "context-optimization",
+    "token-saving",
+    "code-fingerprint",
+    "mcp",
+    "coding-agent",
+    "extension"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "package.json"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

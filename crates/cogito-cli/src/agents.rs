@@ -98,6 +98,21 @@ impl Agent {
         matches!(self, Agent::GentleShell)
     }
 
+    /// For agents whose MCP configuration lives in its own file, separate from
+    /// their main settings. Only Pi / Gentle Shell works this way today; every
+    /// other agent reads MCP servers from the file returned by `config_path`.
+    pub fn mcp_config_path(self, home: &Path) -> Option<PathBuf> {
+        if self != Agent::GentleShell {
+            return None;
+        }
+        let gentle = home.join(".gentle-shell/agent");
+        if gentle.exists() || !home.join(".pi").exists() {
+            Some(gentle.join("mcp.json"))
+        } else {
+            Some(home.join(".pi/agent/mcp.json"))
+        }
+    }
+
     /// Path of the file this agent is configured in.
     pub fn config_path(self, home: &Path) -> PathBuf {
         match self {
@@ -165,11 +180,20 @@ pub fn status(agent: Agent, home: &Path) -> Result<Status> {
 
     if agent.uses_pi_package() {
         let value = read_json(&path)?;
-        let configured = value
+        let package_ok = value
             .get("packages")
             .and_then(|p| p.as_array())
             .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(PI_PACKAGE)));
-        return Ok(if configured {
+
+        let mcp_ok = match agent.mcp_config_path(home) {
+            Some(mcp_path) if mcp_path.exists() => read_json(&mcp_path)?
+                .get("mcpServers")
+                .and_then(|m| m.get(SERVER_KEY))
+                .is_some(),
+            _ => false,
+        };
+
+        return Ok(if package_ok && mcp_ok {
             Status::Configured
         } else {
             Status::NotConfigured
@@ -214,9 +238,11 @@ pub fn install(agent: Agent, home: &Path, binary: &Path) -> Result<Change> {
     }
 
     let path = agent.config_path(home);
-    let backup = backup(&path)?;
+    let backup = backup_file(&path)?;
+    let bin = binary.display().to_string();
 
     if agent.uses_pi_package() {
+        // (1) Declare the pi package that provides the session adapter.
         let mut value = read_json_or_default(&path);
         let packages = value
             .as_object_mut()
@@ -230,10 +256,24 @@ pub fn install(agent: Agent, home: &Path, binary: &Path) -> Result<Change> {
             arr.push(json!(PI_PACKAGE));
         }
         write_json(&path, &value)?;
+
+        // (2) Register the MCP server. Pi reads MCP servers from its own file.
+        if let Some(mcp_path) = agent.mcp_config_path(home) {
+            let _ = backup_file(&mcp_path)?;
+            let mut mcp = read_json_or_default(&mcp_path);
+            let obj = mcp.as_object_mut().context("mcp.json is not an object")?;
+            obj.entry("mcpServers")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .context("`mcpServers` is not an object")?
+                .insert(
+                    SERVER_KEY.to_string(),
+                    json!({ "command": bin, "args": ["mcp"], "lifecycle": "lazy" }),
+                );
+            write_json(&mcp_path, &mcp)?;
+        }
         return Ok(Change::Written { backup });
     }
-
-    let bin = binary.display().to_string();
 
     if agent == Agent::Codex {
         let text = if path.exists() {
@@ -301,14 +341,26 @@ pub fn uninstall(agent: Agent, home: &Path) -> Result<Change> {
         return Ok(Change::AlreadyCorrect);
     }
 
-    let backup = backup(&path)?;
+    let backup = backup_file(&path)?;
 
     if agent.uses_pi_package() {
-        let mut value = read_json(&path)?;
-        if let Some(arr) = value.get_mut("packages").and_then(|p| p.as_array_mut()) {
-            arr.retain(|v| v.as_str() != Some(PI_PACKAGE));
+        if path.exists() {
+            let mut value = read_json(&path)?;
+            if let Some(arr) = value.get_mut("packages").and_then(|p| p.as_array_mut()) {
+                arr.retain(|v| v.as_str() != Some(PI_PACKAGE));
+            }
+            write_json(&path, &value)?;
         }
-        write_json(&path, &value)?;
+        if let Some(mcp_path) = agent.mcp_config_path(home)
+            && mcp_path.exists()
+        {
+            let _ = backup_file(&mcp_path)?;
+            let mut mcp = read_json(&mcp_path)?;
+            if let Some(table) = mcp.get_mut("mcpServers").and_then(|m| m.as_object_mut()) {
+                table.remove(SERVER_KEY);
+            }
+            write_json(&mcp_path, &mcp)?;
+        }
         return Ok(Change::Written { backup });
     }
 
@@ -367,7 +419,7 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
 /// Copy `path` to a timestamped sibling before mutating it.
 ///
 /// Returns `None` when there is nothing to back up (the file does not exist).
-fn backup(path: &Path) -> Result<Option<PathBuf>> {
+fn backup_file(path: &Path) -> Result<Option<PathBuf>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -483,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gentle_shell_adds_package() {
+    fn test_gentle_shell_adds_package_and_mcp() {
         let home = TempDir::new().unwrap();
         std::fs::create_dir_all(home.path().join(".gentle-shell/agent")).unwrap();
         std::fs::write(
@@ -492,18 +544,44 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            status(Agent::GentleShell, home.path()).unwrap(),
+            Status::NotConfigured
+        );
+
         install(Agent::GentleShell, home.path(), &bin()).unwrap();
-        let value = read_json(&home.path().join(".gentle-shell/agent/settings.json")).unwrap();
-        assert_eq!(value["tuiMode"], "fullscreen");
-        let packages = value["packages"].as_array().unwrap();
-        assert!(packages.iter().any(|v| v == "npm:other"));
+
+        // 1. the pi package is declared
+        let settings = read_json(&home.path().join(".gentle-shell/agent/settings.json")).unwrap();
+        assert_eq!(settings["tuiMode"], "fullscreen");
+        let packages = settings["packages"].as_array().unwrap();
+        assert!(
+            packages.iter().any(|v| v == "npm:other"),
+            "existing package kept"
+        );
         assert!(packages.iter().any(|v| v == PI_PACKAGE));
 
+        // 2. the MCP server is registered in pi's own file
+        let mcp = read_json(&home.path().join(".gentle-shell/agent/mcp.json")).unwrap();
+        assert_eq!(
+            mcp["mcpServers"][SERVER_KEY]["command"],
+            "/usr/local/bin/cogito"
+        );
+        assert_eq!(mcp["mcpServers"][SERVER_KEY]["args"][0], "mcp");
+
+        // Both halves present -> configured
+        assert_eq!(
+            status(Agent::GentleShell, home.path()).unwrap(),
+            Status::Configured
+        );
+
         uninstall(Agent::GentleShell, home.path()).unwrap();
-        let value = read_json(&home.path().join(".gentle-shell/agent/settings.json")).unwrap();
-        let packages = value["packages"].as_array().unwrap();
+        let settings = read_json(&home.path().join(".gentle-shell/agent/settings.json")).unwrap();
+        let packages = settings["packages"].as_array().unwrap();
         assert!(packages.iter().any(|v| v == "npm:other"));
         assert!(!packages.iter().any(|v| v == PI_PACKAGE));
+        let mcp = read_json(&home.path().join(".gentle-shell/agent/mcp.json")).unwrap();
+        assert!(mcp["mcpServers"][SERVER_KEY].is_null());
     }
 
     #[test]
