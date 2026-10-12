@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cogito installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Rene-Kuhm/cogito/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Rene-Kuhm/cogito-harness/main/install.sh | sh
 #
 # Downloads the prebuilt binary for this platform from the latest GitHub
 # Release. Falls back to `cargo install` when no prebuilt binary matches.
@@ -15,7 +15,7 @@
 
 set -eu
 
-REPO="Rene-Kuhm/cogito"
+REPO="Rene-Kuhm/cogito-harness"
 BIN="cogito"
 
 VERSION="${COGITO_VERSION:-}"
@@ -124,9 +124,9 @@ install_from_source() {
   need cargo
   info "Building from source with cargo (this can take a few minutes)…"
   if [ -n "$VERSION" ]; then
-    cargo install --locked --git "https://github.com/${REPO}" --tag "v${VERSION}" cogito-cli
+    cargo install --locked --git "https://github.com/${REPO}" --tag "v${VERSION}" cogito-harness
   else
-    cargo install --locked --git "https://github.com/${REPO}" cogito-cli
+    cargo install --locked --git "https://github.com/${REPO}" cogito-harness
   fi
   info ""
   info "Installed with cargo. The binary is in \$CARGO_HOME/bin (usually ~/.cargo/bin)."

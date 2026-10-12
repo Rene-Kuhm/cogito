@@ -1,6 +1,6 @@
-use cogito_core::Language;
-use cogito_core::compressor::compress_with_language;
-use cogito_core::types::CompressionOptions;
+use cogito_harness_core::Language;
+use cogito_harness_core::compressor::compress_with_language;
+use cogito_harness_core::types::CompressionOptions;
 
 fn main() {
     let code = r#"

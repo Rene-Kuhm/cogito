@@ -21,10 +21,10 @@ cargo bench --bench storage_compare
 ```
 
 Benchmark sources:
-- `crates/cogito-core/benches/fingerprint.rs`
-- `crates/cogito-core/benches/compress.rs`
-- `crates/cogito-core/benches/search.rs`
-- `crates/cogito-core/benches/storage_compare.rs`
+- `crates/cogito-harness-core/benches/fingerprint.rs`
+- `crates/cogito-harness-core/benches/compress.rs`
+- `crates/cogito-harness-core/benches/search.rs`
+- `crates/cogito-harness-core/benches/storage_compare.rs`
 
 ## Test Environment
 
@@ -65,7 +65,7 @@ patterns.
 
 ### Real-world compress: 12,340 bytes → 18 µs
 
-The actual `crates/cogito-core/src/fingerprint/mod.rs` file
+The actual `crates/cogito-harness-core/src/fingerprint/mod.rs` file
 (12,340 bytes, 360 lines, real Rust code) compresses in **18.2 µs** with
 a **27.2% reduction** (4113 → 2996 tokens).
 

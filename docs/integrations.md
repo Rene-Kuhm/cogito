@@ -4,7 +4,7 @@ Cogito is agent-agnostic. One binary, `cogito`, speaks MCP over stdio, HTTP,
 and the command line.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Rene-Kuhm/cogito/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Rene-Kuhm/cogito-harness/main/install.sh | sh
 cogito setup          # detects your agents and offers a menu
 cogito doctor         # shows what is configured
 ```
@@ -18,7 +18,7 @@ file it touches, merges instead of overwriting, and is safe to run twice.
 
 | Agent | Config file | Shape |
 |---|---|---|
-| **Gentle Shell / Pi** | `~/.gentle-shell/agent/settings.json`<br>`~/.gentle-shell/agent/mcp.json` | `packages: ["npm:pi-cogito"]`<br>`mcpServers.cogito` (lazy) |
+| **Gentle Shell / Pi** | `~/.gentle-shell/agent/settings.json`<br>`~/.gentle-shell/agent/mcp.json` | `packages: ["npm:cogito-harness"]`<br>`mcpServers.cogito` (direct exposure) |
 | **Claude Code** | `~/.claude.json`<br>`~/.claude/settings.json`<br>`~/.claude/hooks/cogito-session-start.sh` | `mcpServers.cogito`<br>`hooks.SessionStart` entry<br>hook script (0755) |
 | **Codex** | `~/.codex/config.toml` | `[mcp_servers.cogito]` |
 | **Gemini CLI** | `~/.gemini/settings.json` | `mcpServers.cogito` |
@@ -52,7 +52,7 @@ Agent aliases: `pi` = `gentle-shell`, `claude` = `claude-code`,
 
 Two halves, both written by setup:
 
-1. **`npm:pi-cogito`** in `settings.json` — a Pi package. On `session_start` it
+1. **`npm:cogito-harness`** in `settings.json` — a Pi package. On `session_start` it
    scans the project in the background and sets a status line, and it adds
    `/cogito` with `status`, `scan`, `query`, `stats` and `doctor`.
 
@@ -62,10 +62,11 @@ Two halves, both written by setup:
    ```
 
 2. **`mcpServers.cogito`** in `mcp.json` — the MCP tools, with
-   `lifecycle: "lazy"` so the server starts on first use instead of on every
-   session.
+   `"exposure": "direct"`. Pi's default exposure is `codemode`, and Gentle
+   Shell disables codemode, so under the default the model could not reach
+   the tools.
 
-> `npm:pi-cogito` is not published yet. Pi will skip an unresolvable package,
+> `npm:cogito-harness` is not published yet. Pi will skip an unresolvable package,
 > so the MCP half still works; the extension half starts working the day it is
 > published.
 
@@ -175,7 +176,7 @@ Telescope over `cogito scan --json`, or an MCP client such as
 ### CI
 
 ```yaml
-- run: cargo install cogito-cli --locked || true
+- run: cargo install cogito-harness --locked || true
 - run: cogito scan --json > fingerprint.json
 ```
 
@@ -185,7 +186,7 @@ Telescope over `cogito scan --json`, or an MCP client such as
 
 | Editor / Agent | MCP | Adapter | Skill | CLI | API |
 |---|---|---|---|---|---|
-| Gentle Shell (pi) | ✓ lazy | ✓ pi-cogito | ✓ | ✓ | ✓ |
+| Gentle Shell (pi) | ✓ direct | ✓ cogito-harness | ✓ | ✓ | ✓ |
 | Claude Code | ✓ | ✓ SessionStart hook | — | ✓ | ✓ |
 | opencode | ✓ | ✓ session plugin | — | ✓ | ✓ |
 | Codex | ✓ | — | — | ✓ | ✓ |
@@ -196,7 +197,7 @@ Telescope over `cogito scan --json`, or an MCP client such as
 | Aider / Neovim | via mcp | — | — | ✓ | ✓ |
 
 Missing an agent? Add a row to `Agent` in
-`crates/cogito-cli/src/agents.rs` — it needs a config path and a shape.
+`crates/cogito-harness/src/agents.rs` — it needs a config path and a shape.
 
 ---
 

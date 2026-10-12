@@ -8,7 +8,7 @@ Cogito optimizes the context AI agents receive — without modifying models or a
 
 ```bash
 # Install
-curl -fsSL https://raw.githubusercontent.com/Rene-Kuhm/cogito/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Rene-Kuhm/cogito-harness/main/install.sh | sh
 
 # Wire it into the agents you use (backs up every file it touches)
 cogito setup
@@ -23,8 +23,8 @@ cogito query "where is auth?"  # search knowledge
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](LICENSE)
-[![crates.io](https://img.shields.io/crates/v/cogito-core.svg)](https://crates.io/crates/cogito-core)
-[![docs](https://img.shields.io/badge/docs-docs.rs-orange.svg)](https://docs.rs/cogito-core)
+[![crates.io](https://img.shields.io/crates/v/cogito-harness-core.svg)](https://crates.io/crates/cogito-harness-core)
+[![docs](https://img.shields.io/badge/docs-docs.rs-orange.svg)](https://docs.rs/cogito-harness-core)
 
 ---
 
@@ -35,7 +35,7 @@ writes each agent's config, backing up every file first:
 
 | Agent | Integration |
 |---|---|
-| **Gentle Shell (pi)** | `pi-cogito` package + lazy MCP — status line, `/cogito`, session-start scan |
+| **Gentle Shell (pi)** | `cogito-harness` npm package + direct MCP — status line, `/cogito`, session-start scan |
 | **Claude Code** | MCP + `SessionStart` hook |
 | **opencode** | MCP + session plugin |
 | **Codex** | MCP (`[mcp_servers.cogito]` in `~/.codex/config.toml`) |
@@ -107,20 +107,20 @@ Cogito solves this with four core innovations:
 ### From source
 
 ```bash
-git clone https://github.com/Rene-Kuhm/cogito.git
+git clone https://github.com/Rene-Kuhm/cogito-harness.git
 cd cogito
-cargo install --path crates/cogito-cli
+cargo install --path crates/cogito-harness
 ```
 
 ### From crates.io (when published)
 
 ```bash
-cargo install cogito-cli
+cargo install cogito-harness
 ```
 
 ### Pre-built binaries
 
-Download from [GitHub Releases](https://github.com/Rene-Kuhm/cogito/releases)
+Download from [GitHub Releases](https://github.com/Rene-Kuhm/cogito-harness/releases)
 
 ---
 
