@@ -17,19 +17,18 @@ static TAGS: once_cell::sync::Lazy<parking_lot::RwLock<HashMap<Uuid, Vec<Semanti
 pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<SemanticTag>> {
     let query_lower = query.to_lowercase();
     let tags = TAGS.read();
-    
+
     let project_tags = tags.get(&project_id).cloned().unwrap_or_default();
-    
+
     let results: Vec<SemanticTag> = project_tags
         .into_iter()
         .filter(|tag| {
             tag.tag.to_lowercase().contains(&query_lower)
                 || tag.domain.to_lowercase().contains(&query_lower)
-                || tag.paths.iter().any(|p| {
-                    p.to_string_lossy()
-                        .to_lowercase()
-                        .contains(&query_lower)
-                })
+                || tag
+                    .paths
+                    .iter()
+                    .any(|p| p.to_string_lossy().to_lowercase().contains(&query_lower))
         })
         .collect();
 
@@ -91,7 +90,6 @@ fn infer_tag_from_path(path: &Path) -> Option<InferredTag> {
         ("session", ("auth", "security", 0.8)),
         ("jwt", ("auth", "security", 0.95)),
         ("oauth", ("auth", "security", 0.95)),
-        
         // Billing patterns
         ("billing", ("billing", "commerce", 0.9)),
         ("payment", ("payment", "commerce", 0.9)),
@@ -99,28 +97,24 @@ fn infer_tag_from_path(path: &Path) -> Option<InferredTag> {
         ("subscription", ("billing", "commerce", 0.9)),
         ("price", ("pricing", "commerce", 0.8)),
         ("stripe", ("payment", "commerce", 0.95)),
-        
         // API patterns
         ("api", ("api", "network", 0.85)),
         ("route", ("api", "network", 0.8)),
         ("endpoint", ("api", "network", 0.85)),
         ("controller", ("api", "network", 0.8)),
         ("handler", ("api", "network", 0.75)),
-        
         // Database patterns
         ("db", ("database", "storage", 0.85)),
         ("repo", ("repository", "storage", 0.85)),
         ("model", ("model", "data", 0.7)),
         ("schema", ("schema", "data", 0.85)),
         ("migration", ("migration", "data", 0.9)),
-        
         // UI patterns
         ("component", ("ui", "presentation", 0.8)),
         ("page", ("page", "presentation", 0.75)),
         ("layout", ("layout", "presentation", 0.8)),
         ("modal", ("ui", "presentation", 0.85)),
         ("button", ("ui", "presentation", 0.7)),
-        
         // Config patterns
         ("config", ("config", "infrastructure", 0.9)),
         ("env", ("config", "infrastructure", 0.85)),

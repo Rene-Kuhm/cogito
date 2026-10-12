@@ -6,44 +6,44 @@ use cogito_core::{Cogito, CompressionOptions};
 /// Initialize Cogito in the current directory
 pub async fn init() -> Result<()> {
     println!("Initializing Cogito in current directory...");
-    
+
     // TODO: Create .cogito/config.toml
     // TODO: Detect project type and create initial config
-    
+
     println!("✓ Cogito initialized");
     println!("  Run 'cogito scan' to generate your first fingerprint");
-    
+
     Ok(())
 }
 
 /// Scan project and generate fingerprint
 pub async fn scan(_watch: bool) -> Result<()> {
     println!("Scanning project...");
-    
+
     let cogito = Cogito::new();
     let project_path = std::env::current_dir()?;
     let project = cogito.init_project(project_path)?;
-    
+
     println!("  Project: {}", project.name);
     println!("  Language: {}", project.language);
-    
+
     let fingerprint = cogito.generate_fingerprint(&project).await?;
-    
+
     println!("✓ Fingerprint generated");
     println!("  Entry points: {}", fingerprint.entry_points.len());
     println!("  Data flows: {}", fingerprint.data_flows.len());
-    
+
     Ok(())
 }
 
 /// Show current fingerprint
 pub async fn fingerprint(_verbose: bool) -> Result<()> {
     println!("Loading fingerprint...");
-    
+
     // TODO: Load from storage
-    
+
     println!("No fingerprint found. Run 'cogito scan' first.");
-    
+
     Ok(())
 }
 
@@ -92,23 +92,23 @@ pub async fn compress(
 /// Query knowledge base
 pub async fn query(query: &str, _json: bool) -> Result<()> {
     println!("Searching for: {}", query);
-    
+
     // TODO: Load project and search
-    
+
     println!("No results found. Ensure you're in a Cogito project.");
-    
+
     Ok(())
 }
 
 /// Decision subcommands
 pub async fn decision(subcommand: Option<crate::DecisionCommands>) -> Result<()> {
     match subcommand {
-        Some(crate::DecisionCommands::Add { 
-            title, 
-            why, 
-            alternative, 
-            paths, 
-            tags 
+        Some(crate::DecisionCommands::Add {
+            title,
+            why,
+            alternative,
+            paths,
+            tags,
         }) => {
             add_decision(title, why, alternative, paths, tags).await?;
         }
@@ -142,36 +142,36 @@ async fn add_decision(
     }
 
     println!("Adding decision: {}", title.as_ref().unwrap());
-    
+
     // TODO: Create decision and save
-    
+
     println!("✓ Decision added");
     Ok(())
 }
 
 async fn list_decisions() -> Result<()> {
     println!("Listing all decisions...");
-    
+
     // TODO: Load and display decisions
-    
+
     println!("No decisions found. Add one with 'cogito decision add'.");
     Ok(())
 }
 
 async fn search_decisions(query: &str) -> Result<()> {
     println!("Searching decisions: {}", query);
-    
+
     // TODO: Search and display
-    
+
     println!("No matching decisions found.");
     Ok(())
 }
 
 async fn show_decision(id: &str) -> Result<()> {
     println!("Showing decision: {}", id);
-    
+
     // TODO: Load and display
-    
+
     Ok(())
 }
 
@@ -202,27 +202,27 @@ async fn add_tag(tag: &str, paths: Vec<String>) -> Result<()> {
     }
 
     println!("Adding tag '{}' to {} paths", tag, paths.len());
-    
+
     // TODO: Create tag and save
-    
+
     println!("✓ Tag added");
     Ok(())
 }
 
 async fn list_tags() -> Result<()> {
     println!("Listing all tags...");
-    
+
     // TODO: Load and display tags
-    
+
     println!("No tags found. Add one with 'cogito tag add'.");
     Ok(())
 }
 
 async fn search_tags(query: &str) -> Result<()> {
     println!("Searching tags: {}", query);
-    
+
     // TODO: Search and display
-    
+
     println!("No matching tags found.");
     Ok(())
 }
@@ -245,18 +245,18 @@ pub async fn project(subcommand: Option<crate::ProjectCommands>) -> Result<()> {
 
 async fn list_projects() -> Result<()> {
     println!("Listing all projects...");
-    
+
     // TODO: Load and display projects
-    
+
     println!("No projects found.");
     Ok(())
 }
 
 async fn delete_project(id: &str) -> Result<()> {
     println!("Deleting project: {}", id);
-    
+
     // TODO: Delete project
-    
+
     println!("✓ Project deleted");
     Ok(())
 }
@@ -270,12 +270,12 @@ pub async fn serve(port: u16, mcp: bool) -> Result<()> {
         println!("Starting REST API server on port {}...", port);
         // TODO: Start REST API server
     }
-    
+
     println!("Server started. Press Ctrl+C to stop.");
-    
+
     // Keep running
     tokio::signal::ctrl_c().await?;
-    
+
     Ok(())
 }
 
@@ -296,25 +296,25 @@ pub async fn stats(json: bool) -> Result<()> {
         println!("Decisions logged: 0");
         println!("Tags created: 0");
     }
-    
+
     Ok(())
 }
 
 /// Diagnose configuration
 pub async fn doctor() -> Result<()> {
     println!("Running diagnostics...");
-    
+
     // Check project directory
     let cwd = std::env::current_dir()?;
     let cogito_dir = cwd.join(".cogito");
-    
+
     if cogito_dir.exists() {
         println!("✓ .cogito directory found");
     } else {
         println!("✗ .cogito directory not found");
         println!("  Run 'cogito init' to initialize");
     }
-    
+
     // Check config
     let config_file = cogito_dir.join("config.toml");
     if config_file.exists() {
@@ -322,7 +322,7 @@ pub async fn doctor() -> Result<()> {
     } else {
         println!("○ Config file not found (will use defaults)");
     }
-    
+
     // Check for common project files
     let project_files = ["Cargo.toml", "package.json", "go.mod", "pyproject.toml"];
     for file in project_files {
@@ -330,7 +330,7 @@ pub async fn doctor() -> Result<()> {
             println!("✓ {} found", file);
         }
     }
-    
+
     Ok(())
 }
 
@@ -338,14 +338,14 @@ pub async fn doctor() -> Result<()> {
 pub async fn export(output: Option<&str>, format: &str) -> Result<()> {
     println!("Exporting data...");
     println!("Format: {}", format);
-    
+
     // TODO: Export data
-    
+
     let export_data = serde_json::json!({
         "version": "0.1.0",
         "exported_at": chrono::Utc::now().to_rfc3339(),
     });
-    
+
     match output {
         Some(path) => {
             std::fs::write(path, serde_json::to_string_pretty(&export_data)?)?;
@@ -355,6 +355,6 @@ pub async fn export(output: Option<&str>, format: &str) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&export_data)?);
         }
     }
-    
+
     Ok(())
 }

@@ -43,7 +43,13 @@ fn find_entry_points(path: &Path, language: &Language) -> Result<Vec<PathBuf>> {
     let patterns = match language {
         Language::Rust => vec!["**/main.rs", "**/lib.rs"],
         Language::TypeScript | Language::JavaScript => {
-            vec!["**/index.ts", "**/index.js", "**/main.ts", "**/main.js", "**/app.ts"]
+            vec![
+                "**/index.ts",
+                "**/index.js",
+                "**/main.ts",
+                "**/main.js",
+                "**/app.ts",
+            ]
         }
         Language::Python => vec!["**/__main__.py", "**/main.py", "**/__init__.py"],
         Language::Go => vec!["**/main.go"],
@@ -71,12 +77,13 @@ fn analyze_data_flows(path: &Path, language: &Language) -> Result<Vec<DataFlow>>
         .filter(|e| e.file_type().is_file())
     {
         let file_path = entry.path().to_path_buf();
-        
+
         if let Some(ext) = file_path.extension()
             && is_code_file(ext, language)
-                && let Ok(content) = std::fs::read_to_string(&file_path) {
-                    flows.extend(extract_imports(&file_path, &content, language)?);
-                }
+            && let Ok(content) = std::fs::read_to_string(&file_path)
+        {
+            flows.extend(extract_imports(&file_path, &content, language)?);
+        }
     }
 
     Ok(flows)
@@ -89,11 +96,7 @@ fn is_code_file(ext: &std::ffi::OsStr, language: &Language) -> bool {
 }
 
 /// Extract imports from file content
-fn extract_imports(
-    file_path: &Path,
-    content: &str,
-    language: &Language,
-) -> Result<Vec<DataFlow>> {
+fn extract_imports(file_path: &Path, content: &str, language: &Language) -> Result<Vec<DataFlow>> {
     let mut flows = Vec::new();
 
     match language {
@@ -112,7 +115,9 @@ fn extract_imports(
         }
         Language::TypeScript | Language::JavaScript => {
             // Match `import` statements
-            let re = regex::Regex::new(r#"import\s+(?:\{\s*)?([a-zA-Z0-9_*\s,}]+)(?:\s*\})?\s+from\s+["']([^"']+)["']"#)?;
+            let re = regex::Regex::new(
+                r#"import\s+(?:\{\s*)?([a-zA-Z0-9_*\s,}]+)(?:\s*\})?\s+from\s+["']([^"']+)["']"#,
+            )?;
             for cap in re.captures_iter(content) {
                 if let Some(module) = cap.get(2) {
                     flows.push(DataFlow {
@@ -151,7 +156,7 @@ pub async fn detect_zones(project: &Project) -> Result<Vec<Zone>> {
     zones.extend(hot);
     zones.extend(cold);
     zones.extend(frozen);
-    
+
     Ok(zones)
 }
 
@@ -187,9 +192,13 @@ mod tests {
     #[test]
     fn test_extract_imports_typescript() {
         let content = "import { a, b } from './mod';\nimport React from \"react\";";
-        let flows = extract_imports(&PathBuf::from("index.ts"), content, &Language::TypeScript).unwrap();
+        let flows =
+            extract_imports(&PathBuf::from("index.ts"), content, &Language::TypeScript).unwrap();
         let targets: Vec<_> = flows.iter().map(|f| f.to.clone()).collect();
-        assert_eq!(targets, vec![PathBuf::from("./mod"), PathBuf::from("react")]);
+        assert_eq!(
+            targets,
+            vec![PathBuf::from("./mod"), PathBuf::from("react")]
+        );
     }
 
     #[test]

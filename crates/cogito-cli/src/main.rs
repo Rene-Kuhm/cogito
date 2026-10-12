@@ -6,7 +6,7 @@ mod commands;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 /// Cogito - Intelligent context optimization for AI coding agents
 #[derive(Parser, Debug)]
@@ -223,8 +223,20 @@ async fn main() -> Result<()> {
         Some(Commands::Init) => commands::init().await?,
         Some(Commands::Scan { watch }) => commands::scan(watch).await?,
         Some(Commands::Fingerprint { verbose }) => commands::fingerprint(verbose).await?,
-        Some(Commands::Compress { file, max_tokens, preserve_imports, preserve_types }) => {
-            commands::compress(&file, max_tokens, preserve_imports, preserve_types, args.json).await?;
+        Some(Commands::Compress {
+            file,
+            max_tokens,
+            preserve_imports,
+            preserve_types,
+        }) => {
+            commands::compress(
+                &file,
+                max_tokens,
+                preserve_imports,
+                preserve_types,
+                args.json,
+            )
+            .await?;
         }
         Some(Commands::Query { query }) => commands::query(&query, args.json).await?,
         Some(Commands::Decision { subcommand }) => {
@@ -239,7 +251,9 @@ async fn main() -> Result<()> {
         Some(Commands::Serve { port, mcp }) => commands::serve(port, mcp).await?,
         Some(Commands::Stats) => commands::stats(args.json).await?,
         Some(Commands::Doctor) => commands::doctor().await?,
-        Some(Commands::Export { output, format }) => commands::export(output.as_deref(), &format).await?,
+        Some(Commands::Export { output, format }) => {
+            commands::export(output.as_deref(), &format).await?
+        }
         None => {
             // No subcommand, show help
             let mut cmd = Args::command();

@@ -4,18 +4,18 @@
 
 use anyhow::Result;
 use axum::{
+    Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use cogito_core::{Cogito, CompressionOptions};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 /// Application state
 #[derive(Clone)]
@@ -53,7 +53,13 @@ impl<T: Serialize> ApiResponse<T> {
 #[allow(clippy::result_large_err)]
 fn parse_project_id(raw: &str) -> Result<uuid::Uuid, axum::response::Response> {
     raw.parse().map_err(|_| {
-        (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(format!("invalid project id: {raw}")))).into_response()
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error(format!(
+                "invalid project id: {raw}"
+            ))),
+        )
+            .into_response()
     })
 }
 
@@ -67,7 +73,11 @@ async fn create_project(
     let result = state.cogito.init_project(payload.path.into());
     match result {
         Ok(project) => (StatusCode::CREATED, Json(ApiResponse::success(project))).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(e.to_string()))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error(e.to_string())),
+        )
+            .into_response(),
     }
 }
 
@@ -77,11 +87,12 @@ struct CreateProjectRequest {
 }
 
 /// Get project by ID
-async fn get_project(
-    State(_state): State<AppState>,
-    Path(_id): Path<String>,
-) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, Json(ApiResponse::<()>::error("Not implemented".into()))).into_response()
+async fn get_project(State(_state): State<AppState>, Path(_id): Path<String>) -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(ApiResponse::<()>::error("Not implemented".into())),
+    )
+        .into_response()
 }
 
 /// Delete project
@@ -89,7 +100,11 @@ async fn delete_project(
     State(_state): State<AppState>,
     Path(_id): Path<String>,
 ) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, Json(ApiResponse::<()>::error("Not implemented".into()))).into_response()
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(ApiResponse::<()>::error("Not implemented".into())),
+    )
+        .into_response()
 }
 
 // --- Context Endpoints ---
@@ -106,10 +121,17 @@ async fn compress_context(
         hot_zones_priority: payload.hot_zones_priority.unwrap_or(true),
     };
 
-    let result = state.cogito.compress_context(&payload.content, options).await;
+    let result = state
+        .cogito
+        .compress_context(&payload.content, options)
+        .await;
     match result {
         Ok(data) => (StatusCode::OK, Json(ApiResponse::success(data))).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(e.to_string()))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error(e.to_string())),
+        )
+            .into_response(),
     }
 }
 
@@ -186,7 +208,11 @@ async fn create_decision(
     let result = state.cogito.add_decision(decision).await;
     match result {
         Ok(data) => (StatusCode::CREATED, Json(ApiResponse::success(data))).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(e.to_string()))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error(e.to_string())),
+        )
+            .into_response(),
     }
 }
 
@@ -215,7 +241,11 @@ async fn list_decisions(
     let result = state.cogito.search_decisions(project_id, "").await;
     match result {
         Ok(data) => (StatusCode::OK, Json(ApiResponse::success(data))).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(e.to_string()))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error(e.to_string())),
+        )
+            .into_response(),
     }
 }
 
@@ -236,7 +266,11 @@ async fn search_decisions(
     let result = state.cogito.search_decisions(project_id, &params.q).await;
     match result {
         Ok(data) => (StatusCode::OK, Json(ApiResponse::success(data))).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(e.to_string()))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error(e.to_string())),
+        )
+            .into_response(),
     }
 }
 
@@ -274,7 +308,11 @@ async fn create_tag(
     let result = state.cogito.add_tag(tag).await;
     match result {
         Ok(data) => (StatusCode::CREATED, Json(ApiResponse::success(data))).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(e.to_string()))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error(e.to_string())),
+        )
+            .into_response(),
     }
 }
 
@@ -299,7 +337,11 @@ async fn list_tags(
     let result = state.cogito.search_tags(project_id, "").await;
     match result {
         Ok(data) => (StatusCode::OK, Json(ApiResponse::success(data))).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(e.to_string()))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error(e.to_string())),
+        )
+            .into_response(),
     }
 }
 
@@ -320,7 +362,11 @@ async fn search_tags(
     let result = state.cogito.search_tags(project_id, &params.q).await;
     match result {
         Ok(data) => (StatusCode::OK, Json(ApiResponse::success(data))).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(e.to_string()))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error(e.to_string())),
+        )
+            .into_response(),
     }
 }
 
@@ -358,7 +404,10 @@ async fn main() -> Result<()> {
         // Projects
         .route("/api/v1/projects", post(create_project))
         .route("/api/v1/projects/:id", get(get_project))
-        .route("/api/v1/projects/:id", axum::routing::delete(delete_project))
+        .route(
+            "/api/v1/projects/:id",
+            axum::routing::delete(delete_project),
+        )
         .route("/api/v1/projects/:id/scan", post(create_project))
         // Context
         .route("/api/v1/context/compress", post(compress_context))

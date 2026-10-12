@@ -8,10 +8,10 @@ use anyhow::Result;
 /// Compress context while preserving meaning
 pub fn compress(content: &str, options: CompressionOptions) -> Result<CompressedContext> {
     let original_tokens = estimate_tokens(content);
-    
+
     // Apply compression strategies
     let compressed = apply_compression(content, &options)?;
-    
+
     let compressed_tokens = estimate_tokens(&compressed);
     let savings = if original_tokens > 0 {
         (original_tokens.saturating_sub(compressed_tokens) as f32 / original_tokens as f32) * 100.0
@@ -96,10 +96,11 @@ fn remove_comments(content: &str) -> String {
                             chars.next(); // consume *
                             while let Some(c) = chars.next() {
                                 if c == '*'
-                                    && let Some(&'/') = chars.peek() {
-                                        chars.next();
-                                        break;
-                                    }
+                                    && let Some(&'/') = chars.peek()
+                                {
+                                    chars.next();
+                                    break;
+                                }
                             }
                         }
                         _ => {
@@ -165,7 +166,10 @@ mod tests {
 
     #[test]
     fn test_line_comment_keeps_following_code() {
-        let options = CompressionOptions { preserve_types: false, ..CompressionOptions::default() };
+        let options = CompressionOptions {
+            preserve_types: false,
+            ..CompressionOptions::default()
+        };
         let content = "let a = 1; // note\nlet b = 2;";
         let result = compress(content, options).unwrap();
         assert!(!result.content.contains("note"));

@@ -23,16 +23,16 @@
 //! # }
 //! ```
 
-pub mod fingerprint;
 pub mod compressor;
-pub mod semantic;
 pub mod decision;
+pub mod fingerprint;
+pub mod semantic;
 pub mod types;
 
 use anyhow::Result;
+use chrono::Utc;
 use std::path::PathBuf;
 use uuid::Uuid;
-use chrono::Utc;
 
 pub use types::*;
 
@@ -51,13 +51,15 @@ impl Cogito {
 
     /// Create with storage backend
     pub fn with_storage(storage: StorageBackend) -> Self {
-        Self { storage: Some(storage) }
+        Self {
+            storage: Some(storage),
+        }
     }
 
     /// Initialize a new project
     pub fn init_project(&self, path: PathBuf) -> Result<Project> {
         let language = Language::detect(&path)?;
-        
+
         Ok(Project {
             id: Uuid::new_v4(),
             path: path.clone(),

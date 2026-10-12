@@ -24,10 +24,7 @@ pub enum Language {
 impl Language {
     /// Detect language from file path
     pub fn detect(path: &Path) -> anyhow::Result<Self> {
-        let extension = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         let lang = match extension.to_lowercase().as_str() {
             "rs" => Language::Rust,
@@ -258,6 +255,7 @@ impl CompressedContext {
         if self.original_tokens == 0 {
             return 0.0;
         }
-        ((self.original_tokens - self.compressed_tokens) as f32 / self.original_tokens as f32) * 100.0
+        ((self.original_tokens - self.compressed_tokens) as f32 / self.original_tokens as f32)
+            * 100.0
     }
 }

@@ -24,23 +24,26 @@ pub async fn add(decision: Decision) -> Result<Decision> {
 pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<Decision>> {
     let query_lower = query.to_lowercase();
     let decisions = DECISIONS.read();
-    
+
     let project_decisions = decisions.get(&project_id).cloned().unwrap_or_default();
-    
+
     let results: Vec<Decision> = project_decisions
         .into_iter()
         .filter(|decision| {
             decision.title.to_lowercase().contains(&query_lower)
                 || decision.why.to_lowercase().contains(&query_lower)
-                || decision.tags.iter().any(|t| t.to_lowercase().contains(&query_lower))
-                || decision.paths.iter().any(|p| {
-                    p.to_string_lossy()
-                        .to_lowercase()
-                        .contains(&query_lower)
-                })
-                || decision.alternatives.iter().any(|a| {
-                    a.to_lowercase().contains(&query_lower)
-                })
+                || decision
+                    .tags
+                    .iter()
+                    .any(|t| t.to_lowercase().contains(&query_lower))
+                || decision
+                    .paths
+                    .iter()
+                    .any(|p| p.to_string_lossy().to_lowercase().contains(&query_lower))
+                || decision
+                    .alternatives
+                    .iter()
+                    .any(|a| a.to_lowercase().contains(&query_lower))
         })
         .collect();
 
@@ -163,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_and_search() {
         let project_id = Uuid::new_v4();
-        
+
         let decision = Decision {
             id: Uuid::new_v4(),
             project_id,
