@@ -110,15 +110,13 @@ impl Cogito {
                 let conn = sqlite.lock();
                 if let Ok(report) =
                     crate::storage::sqlite::migrate_from_json(&conn, &cogito_dir, Some(id))
-                {
-                    if report.tags_imported > 0 || report.decisions_imported > 0 {
+                    && (report.tags_imported > 0 || report.decisions_imported > 0) {
                         tracing::info!(
                             "Migrated {} tags and {} decisions from legacy JSON",
                             report.tags_imported,
                             report.decisions_imported
                         );
                     }
-                }
             }
         }
 

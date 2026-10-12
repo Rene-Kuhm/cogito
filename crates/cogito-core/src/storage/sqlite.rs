@@ -533,13 +533,13 @@ pub fn migrate_from_json(
     if tags_path.exists() {
         let tags = persistence::load_tags(cogito_dir)?;
         for tag in &tags {
-            ensure_project_exists(conn, tag.project_id, "migrated");
+            let _ = ensure_project_exists(conn, tag.project_id, "migrated");
         }
     }
     if decisions_path.exists() {
         let decisions = persistence::load_decisions(cogito_dir)?;
         for decision in &decisions {
-            ensure_project_exists(conn, decision.project_id, "migrated");
+            let _ = ensure_project_exists(conn, decision.project_id, "migrated");
         }
     }
 
