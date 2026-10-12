@@ -205,7 +205,7 @@ async fn create_decision(
     }
     let decision = builder.build();
 
-    let result = state.cogito.add_decision(decision).await;
+    let result = state.cogito.add_decision(decision);
     match result {
         Ok(data) => (StatusCode::CREATED, Json(ApiResponse::success(data))).into_response(),
         Err(e) => (
@@ -238,7 +238,7 @@ async fn list_decisions(
         Err(response) => return response,
     };
     // An empty query matches every decision, the same way list_tags lists tags.
-    let result = state.cogito.search_decisions(project_id, "").await;
+    let result = state.cogito.search_decisions(project_id, "");
     match result {
         Ok(data) => (StatusCode::OK, Json(ApiResponse::success(data))).into_response(),
         Err(e) => (
@@ -263,7 +263,7 @@ async fn search_decisions(
         Ok(id) => id,
         Err(response) => return response,
     };
-    let result = state.cogito.search_decisions(project_id, &params.q).await;
+    let result = state.cogito.search_decisions(project_id, &params.q);
     match result {
         Ok(data) => (StatusCode::OK, Json(ApiResponse::success(data))).into_response(),
         Err(e) => (
@@ -305,7 +305,7 @@ async fn create_tag(
         created_at: Utc::now(),
     };
 
-    let result = state.cogito.add_tag(tag).await;
+    let result = state.cogito.add_tag(tag);
     match result {
         Ok(data) => (StatusCode::CREATED, Json(ApiResponse::success(data))).into_response(),
         Err(e) => (
@@ -334,7 +334,7 @@ async fn list_tags(
         Ok(id) => id,
         Err(response) => return response,
     };
-    let result = state.cogito.search_tags(project_id, "").await;
+    let result = state.cogito.search_tags(project_id, "");
     match result {
         Ok(data) => (StatusCode::OK, Json(ApiResponse::success(data))).into_response(),
         Err(e) => (
@@ -359,7 +359,7 @@ async fn search_tags(
         Ok(id) => id,
         Err(response) => return response,
     };
-    let result = state.cogito.search_tags(project_id, &params.q).await;
+    let result = state.cogito.search_tags(project_id, &params.q);
     match result {
         Ok(data) => (StatusCode::OK, Json(ApiResponse::success(data))).into_response(),
         Err(e) => (

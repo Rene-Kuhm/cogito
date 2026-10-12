@@ -154,7 +154,7 @@ async fn test_decision_lifecycle() {
         .path(PathBuf::from("src/auth/"))
         .build();
 
-    let added = cogito.add_decision(decision).await.unwrap();
+    let added = cogito.add_decision(decision).unwrap();
     assert_eq!(added.title, "Use JWT for auth");
     assert_eq!(added.why, "Stateless, scales better than sessions");
     assert!(added.alternatives.contains(&"Cookie sessions".to_string()));
@@ -162,22 +162,21 @@ async fn test_decision_lifecycle() {
     assert!(added.tags.contains(&"security".to_string()));
 
     // Search by title
-    let results = cogito.search_decisions(project.id, "JWT").await.unwrap();
+    let results = cogito.search_decisions(project.id, "JWT").unwrap();
     assert!(!results.is_empty(), "Should find decision by 'JWT'");
     assert_eq!(results[0].id, added.id);
 
     // Search by tag
-    let results = cogito.search_decisions(project.id, "auth").await.unwrap();
+    let results = cogito.search_decisions(project.id, "auth").unwrap();
     assert!(!results.is_empty(), "Should find decision by tag 'auth'");
 
     // Search by alternative
-    let results = cogito.search_decisions(project.id, "Cookie").await.unwrap();
+    let results = cogito.search_decisions(project.id, "Cookie").unwrap();
     assert!(!results.is_empty(), "Should find decision by alternative");
 
     // Search returns empty for non-existent query
     let results = cogito
         .search_decisions(project.id, "nonexistent-query-xyz")
-        .await
         .unwrap();
     assert!(results.is_empty(), "Should not find non-matching decision");
 }
@@ -199,25 +198,22 @@ async fn test_tag_lifecycle() {
         created_at: chrono::Utc::now(),
     };
 
-    let added = cogito.add_tag(tag).await.unwrap();
+    let added = cogito.add_tag(tag).unwrap();
     assert_eq!(added.tag, "auth");
     assert_eq!(added.domain, "security");
     assert_eq!(added.confidence, 0.95);
 
     // Search by tag name
-    let results = cogito.search_tags(project.id, "auth").await.unwrap();
+    let results = cogito.search_tags(project.id, "auth").unwrap();
     assert!(!results.is_empty(), "Should find tag 'auth'");
     assert_eq!(results[0].id, added.id);
 
     // Search by domain
-    let results = cogito.search_tags(project.id, "security").await.unwrap();
+    let results = cogito.search_tags(project.id, "security").unwrap();
     assert!(!results.is_empty(), "Should find tag by domain");
 
     // Search returns empty for non-existent query
-    let results = cogito
-        .search_tags(project.id, "nonexistent-xyz")
-        .await
-        .unwrap();
+    let results = cogito.search_tags(project.id, "nonexistent-xyz").unwrap();
     assert!(results.is_empty());
 }
 
@@ -238,7 +234,7 @@ async fn test_persistence_roundtrip() {
         .why("Test persistence")
         .build();
 
-    let _added = cogito.add_decision(decision).await.unwrap();
+    let _added = cogito.add_decision(decision).unwrap();
 
     // Verify .cogito/decisions.json was created
     let decisions_file = project_path.join(".cogito/decisions.json");

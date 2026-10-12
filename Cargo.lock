@@ -359,6 +359,8 @@ dependencies = [
  "colored",
  "indicatif",
  "predicates 3.1.4",
+ "rmcp",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",
@@ -417,24 +419,6 @@ dependencies = [
  "cogito-core",
  "tokio",
  "uuid",
-]
-
-[[package]]
-name = "cogito-mcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "cogito-core",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "whoami",
 ]
 
 [[package]]

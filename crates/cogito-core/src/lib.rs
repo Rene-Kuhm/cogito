@@ -39,86 +39,118 @@ use uuid::Uuid;
 pub use types::*;
 
 /// Main Cogito engine
+///
+/// A `Cogito` instance is bound to **one project's `.cogito` directory**.
+/// Building a new instance for each project is the supported way to serve
+/// several projects from one process (e.g. the MCP server): see
+/// [`Cogito::for_project`].
 #[derive(Debug, Clone)]
 pub struct Cogito {
-    /// Optional SQLite connection (None = use legacy JSON file storage)
+    /// SQLite connection, or `None` to use the legacy JSON store.
     sqlite: Option<std::sync::Arc<parking_lot::Mutex<rusqlite::Connection>>>,
+    /// The project's `.cogito` directory. All persistence resolves against it.
+    cogito_dir: PathBuf,
 }
 
 impl Cogito {
-    /// Create a new Cogito instance
+    /// Default `.cogito` directory next to the current working directory.
+    ///
+    /// Prefer [`Cogito::for_project`] so the location is explicit.
     pub fn new() -> Self {
-        Self { sqlite: None }
+        let cogito_dir = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".cogito");
+        Self {
+            sqlite: None,
+            cogito_dir,
+        }
     }
 
-    /// Open a Cogito instance backed by SQLite at the given path
-    /// (e.g. `.cogito/state.db`). Idempotent and safe to call repeatedly.
-    pub fn with_sqlite(path: &std::path::Path) -> Result<Self> {
-        let conn = crate::storage::open(path)?;
-        let arc = std::sync::Arc::new(parking_lot::Mutex::new(conn));
-        crate::semantic::set_sqlite(arc.clone());
-        crate::decision::set_sqlite(arc.clone());
-        Ok(Self { sqlite: Some(arc) })
+    /// Open a Cogito instance bound to a project directory.
+    ///
+    /// Opens (creating if needed) `<project>/.cogito/state.db`. This is the
+    /// correct constructor when the path is supplied by a caller — for
+    /// example an MCP tool argument — rather than inherited from the process
+    /// working directory.
+    pub fn for_project(project: &std::path::Path) -> Result<Self> {
+        Self::with_project_sqlite(&project.join(".cogito"))
     }
 
-    /// Open a Cogito instance backed by the project's `.cogito/state.db`.
-    /// Auto-migration happens later in `init_project` once the project_id is known.
+    /// Open a Cogito instance bound to a `.cogito` directory.
     pub fn with_project_sqlite(cogito_dir: &std::path::Path) -> Result<Self> {
         let db_path = crate::storage::db_path(cogito_dir);
         let conn = crate::storage::open(&db_path)?;
-        let arc = std::sync::Arc::new(parking_lot::Mutex::new(conn));
-        crate::semantic::set_sqlite(arc.clone());
-        crate::decision::set_sqlite(arc.clone());
-        Ok(Self { sqlite: Some(arc) })
+        Ok(Self {
+            sqlite: Some(std::sync::Arc::new(parking_lot::Mutex::new(conn))),
+            cogito_dir: cogito_dir.to_path_buf(),
+        })
     }
 
-    /// Open an in-memory SQLite Cogito (for tests)
+    /// Open a Cogito instance backed by an explicit SQLite file.
+    pub fn with_sqlite(path: &std::path::Path) -> Result<Self> {
+        let conn = crate::storage::open(path)?;
+        let cogito_dir = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".cogito"));
+        Ok(Self {
+            sqlite: Some(std::sync::Arc::new(parking_lot::Mutex::new(conn))),
+            cogito_dir,
+        })
+    }
+
+    /// Open an in-memory SQLite Cogito (for tests).
     pub fn in_memory() -> Result<Self> {
         let conn = rusqlite::Connection::open_in_memory()?;
         crate::storage::sqlite::migrate_v1_pub(&conn)?;
-        let arc = std::sync::Arc::new(parking_lot::Mutex::new(conn));
-        crate::semantic::set_sqlite(arc.clone());
-        crate::decision::set_sqlite(arc.clone());
-        Ok(Self { sqlite: Some(arc) })
+        Ok(Self {
+            sqlite: Some(std::sync::Arc::new(parking_lot::Mutex::new(conn))),
+            cogito_dir: PathBuf::from(".cogito"),
+        })
+    }
+
+    /// The `.cogito` directory this instance is bound to.
+    pub fn cogito_dir(&self) -> &std::path::Path {
+        &self.cogito_dir
     }
 
     /// Get the SQLite connection if SQLite is enabled.
-    /// Returns None if the engine is using legacy JSON storage.
+    /// Returns `None` if the engine is using the legacy JSON store.
     pub fn sqlite(&self) -> Option<&std::sync::Arc<parking_lot::Mutex<rusqlite::Connection>>> {
         self.sqlite.as_ref()
     }
 
-    /// Initialize a new project
+    /// Borrow the connection, if any.
+    fn connection(&self) -> Option<parking_lot::MutexGuard<'_, rusqlite::Connection>> {
+        self.sqlite.as_ref().map(|c| c.lock())
+    }
+
+    /// Initialize a project rooted at `path`.
+    ///
+    /// If SQLite is open and legacy `.cogito/*.json` files exist, they are
+    /// migrated into SQLite and re-assigned to this project's id.
     pub fn init_project(&self, path: PathBuf) -> Result<Project> {
-        // Detect language: if path is a directory, use project detection; otherwise use file extension
         let language = if path.is_dir() {
             Language::detect_project(&path)?
         } else {
             Language::detect(&path)?
         };
 
-        // Use a deterministic project_id based on the absolute path so
-        // decisions/tags persist across CLI invocations.
+        // Deterministic id: identical canonical paths map to the same project.
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
         let id = Uuid::new_v5(&Uuid::NAMESPACE_OID, canonical.to_string_lossy().as_bytes());
 
-        // If SQLite is open, run auto-migration from JSON to SQLite,
-        // re-assigning migrated records to this project_id.
-        if let Some(sqlite) = self.sqlite() {
-            let cogito_dir = path.join(".cogito");
-            if cogito_dir.exists() {
-                let conn = sqlite.lock();
-                if let Ok(report) =
-                    crate::storage::sqlite::migrate_from_json(&conn, &cogito_dir, Some(id))
-                    && (report.tags_imported > 0 || report.decisions_imported > 0)
-                {
-                    tracing::info!(
-                        "Migrated {} tags and {} decisions from legacy JSON",
-                        report.tags_imported,
-                        report.decisions_imported
-                    );
-                }
-            }
+        if let Some(conn) = self.connection()
+            && self.cogito_dir.exists()
+            && let Ok(report) =
+                crate::storage::sqlite::migrate_from_json(&conn, &self.cogito_dir, Some(id))
+            && (report.tags_imported > 0 || report.decisions_imported > 0)
+        {
+            tracing::info!(
+                "Migrated {} tags and {} decisions from legacy JSON",
+                report.tags_imported,
+                report.decisions_imported
+            );
         }
 
         Ok(Project {
@@ -136,6 +168,27 @@ impl Cogito {
         })
     }
 
+    /// Register a project row so foreign keys resolve.
+    pub fn register_project(&self, project: &Project) -> Result<()> {
+        if let Some(conn) = self.connection() {
+            crate::storage::sqlite::upsert_project(
+                &conn,
+                project.id,
+                &project.path,
+                &project.name,
+                &project.language.to_string(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Load the project rooted at `path`, registering it in SQLite.
+    pub fn load_project(&self, path: PathBuf) -> Result<Project> {
+        let project = self.init_project(path)?;
+        self.register_project(&project)?;
+        Ok(project)
+    }
+
     /// Generate fingerprint for a project
     pub async fn generate_fingerprint(&self, project: &Project) -> Result<Fingerprint> {
         fingerprint::generate(project).await
@@ -151,23 +204,52 @@ impl Cogito {
     }
 
     /// Search semantic tags
-    pub async fn search_tags(&self, project_id: Uuid, query: &str) -> Result<Vec<SemanticTag>> {
-        semantic::search(project_id, query).await
+    pub fn search_tags(&self, project_id: Uuid, query: &str) -> Result<Vec<SemanticTag>> {
+        let guard = self.connection();
+        semantic::search(guard.as_deref(), project_id, query)
     }
 
-    /// Add semantic tag
-    pub async fn add_tag(&self, tag: SemanticTag) -> Result<SemanticTag> {
-        semantic::add(tag).await
+    /// Add a semantic tag
+    pub fn add_tag(&self, tag: SemanticTag) -> Result<SemanticTag> {
+        let guard = self.connection();
+        semantic::add(guard.as_deref(), &self.cogito_dir, tag)
     }
 
-    /// Create decision
-    pub async fn add_decision(&self, decision: Decision) -> Result<Decision> {
-        decision::add(decision).await
+    /// Delete a semantic tag
+    pub fn delete_tag(&self, project_id: Uuid, tag_id: Uuid) -> Result<bool> {
+        let guard = self.connection();
+        semantic::delete(guard.as_deref(), &self.cogito_dir, project_id, tag_id)
+    }
+
+    /// Create a decision
+    pub fn add_decision(&self, decision: Decision) -> Result<Decision> {
+        let guard = self.connection();
+        decision::add(guard.as_deref(), &self.cogito_dir, decision)
     }
 
     /// Search decisions
-    pub async fn search_decisions(&self, project_id: Uuid, query: &str) -> Result<Vec<Decision>> {
-        decision::search(project_id, query).await
+    pub fn search_decisions(&self, project_id: Uuid, query: &str) -> Result<Vec<Decision>> {
+        let guard = self.connection();
+        decision::search(guard.as_deref(), project_id, query)
+    }
+
+    /// Delete a decision
+    pub fn delete_decision(&self, project_id: Uuid, decision_id: Uuid) -> Result<bool> {
+        let guard = self.connection();
+        decision::delete(guard.as_deref(), &self.cogito_dir, project_id, decision_id)
+    }
+
+    /// Storage statistics for a project
+    pub fn stats(&self, project_id: Uuid) -> Result<crate::storage::Stats> {
+        match self.connection() {
+            Some(conn) => crate::storage::sqlite::get_stats(&conn, project_id),
+            None => Ok(crate::storage::Stats {
+                project_id,
+                tags_count: 0,
+                decisions_count: 0,
+                hot_zones_count: 0,
+            }),
+        }
     }
 
     /// Get hot/cold zones

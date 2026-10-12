@@ -62,7 +62,7 @@ fn bench_write_json(c: &mut Criterion) {
                 let count = decisions.len();
                 futures::executor::block_on(async {
                     for d in decisions {
-                        let _ = cogito.add_decision(d).await;
+                        let _ = cogito.add_decision(d);
                     }
                 });
                 count
@@ -84,7 +84,7 @@ fn bench_write_sqlite(c: &mut Criterion) {
                 let count = decisions.len();
                 futures::executor::block_on(async {
                     for d in decisions {
-                        let _ = cogito.add_decision(d).await;
+                        let _ = cogito.add_decision(d);
                     }
                 });
                 count
@@ -107,13 +107,13 @@ fn bench_read_json(c: &mut Criterion) {
         let decisions = make_decisions(project_id, n);
         futures::executor::block_on(async {
             for d in decisions {
-                let _ = cogito.add_decision(d).await;
+                let _ = cogito.add_decision(d);
             }
         });
 
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _n| {
-            b.iter(|| futures::executor::block_on(cogito.search_decisions(project_id, "")));
+            b.iter(|| cogito.search_decisions(project_id, ""));
         });
     }
     group.finish();
@@ -128,13 +128,13 @@ fn bench_read_sqlite(c: &mut Criterion) {
         let decisions = make_decisions(project_id, n);
         futures::executor::block_on(async {
             for d in decisions {
-                let _ = cogito.add_decision(d).await;
+                let _ = cogito.add_decision(d);
             }
         });
 
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _n| {
-            b.iter(|| futures::executor::block_on(cogito.search_decisions(project_id, "")));
+            b.iter(|| cogito.search_decisions(project_id, ""));
         });
     }
     group.finish();
@@ -151,7 +151,7 @@ fn bench_search_with_stemming(c: &mut Criterion) {
     let decisions = make_decisions(project_id, 1000);
     futures::executor::block_on(async {
         for d in decisions {
-            let _ = cogito.add_decision(d).await;
+            let _ = cogito.add_decision(d);
         }
     });
 
@@ -161,7 +161,7 @@ fn bench_search_with_stemming(c: &mut Criterion) {
     // Let's use a search that demonstrably hits stemming.
     for query in &["scalable", "performance", "decision"] {
         group.bench_with_input(BenchmarkId::from_parameter(query), query, |b, q| {
-            b.iter(|| futures::executor::block_on(cogito.search_decisions(project_id, q)));
+            b.iter(|| cogito.search_decisions(project_id, q));
         });
     }
     group.finish();
@@ -205,7 +205,7 @@ fn measure_file_sizes() {
         let decisions = make_decisions(project_id, n);
         futures::executor::block_on(async {
             for d in decisions {
-                let _ = cogito.add_decision(d).await;
+                let _ = cogito.add_decision(d);
             }
         });
 

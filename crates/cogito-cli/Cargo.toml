@@ -27,6 +27,8 @@ indicatif.workspace = true
 whoami.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
 
 [dev-dependencies]
 assert_cmd = "1"

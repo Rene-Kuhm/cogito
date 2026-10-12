@@ -206,14 +206,11 @@ pub async fn query(query_str: &str, json: bool) -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
     let tags = cogito
         .search_tags(project.id, query_str)
-        .await
         .context("Failed to search tags")?;
     let decisions = cogito
         .search_decisions(project.id, query_str)
-        .await
         .context("Failed to search decisions")?;
 
     if json {
@@ -283,8 +280,6 @@ async fn add_decision(
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
-
     // Build the decision with all options
     let mut builder = cogito_core::decision::builder(project.id)
         .title(&title_str)
@@ -303,7 +298,6 @@ async fn add_decision(
 
     let added = cogito
         .add_decision(decision)
-        .await
         .context("Failed to add decision")?;
 
     println!("✓ Decision added");
@@ -328,11 +322,9 @@ async fn list_decisions() -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
     // For now, return all by searching empty
     let decisions = cogito
         .search_decisions(project.id, "")
-        .await
         .context("Failed to list decisions")?;
 
     if decisions.is_empty() {
@@ -353,10 +345,8 @@ async fn search_decisions(query_str: &str) -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
     let decisions = cogito
         .search_decisions(project.id, query_str)
-        .await
         .context("Failed to search decisions")?;
 
     if decisions.is_empty() {
@@ -404,7 +394,6 @@ async fn add_tag(tag: &str, paths: Vec<String>) -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
     let semantic_tag = cogito_core::types::SemanticTag {
         id: Uuid::new_v4(),
         project_id: project.id,
@@ -415,10 +404,7 @@ async fn add_tag(tag: &str, paths: Vec<String>) -> Result<()> {
         created_at: chrono::Utc::now(),
     };
 
-    let added = cogito
-        .add_tag(semantic_tag)
-        .await
-        .context("Failed to add tag")?;
+    let added = cogito.add_tag(semantic_tag).context("Failed to add tag")?;
 
     println!("✓ Tag added");
     println!("  Tag:  {}", added.tag);
@@ -432,10 +418,8 @@ async fn list_tags() -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
     let tags = cogito
         .search_tags(project.id, "")
-        .await
         .context("Failed to list tags")?;
 
     if tags.is_empty() {
@@ -461,10 +445,8 @@ async fn search_tags(query_str: &str) -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
     let tags = cogito
         .search_tags(project.id, query_str)
-        .await
         .context("Failed to search tags")?;
 
     if tags.is_empty() {
@@ -543,12 +525,8 @@ pub async fn stats(json: bool) -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
-    let tags = cogito.search_tags(project.id, "").await.unwrap_or_default();
-    let decisions = cogito
-        .search_decisions(project.id, "")
-        .await
-        .unwrap_or_default();
+    let tags = cogito.search_tags(project.id, "").unwrap_or_default();
+    let decisions = cogito.search_decisions(project.id, "").unwrap_or_default();
 
     if json {
         let stats = serde_json::json!({
@@ -618,10 +596,9 @@ pub async fn export(output: Option<&str>, format: &str) -> Result<()> {
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
-    let cogito = Cogito::new();
     let fingerprint = cogito.generate_fingerprint(&project).await?;
-    let tags = cogito.search_tags(project.id, "").await?;
-    let decisions = cogito.search_decisions(project.id, "").await?;
+    let tags = cogito.search_tags(project.id, "")?;
+    let decisions = cogito.search_decisions(project.id, "")?;
 
     let export_data = serde_json::json!({
         "version": "0.1.0",

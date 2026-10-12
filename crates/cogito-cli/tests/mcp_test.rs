@@ -1,6 +1,6 @@
 //! End-to-end MCP server tests
 //!
-//! These tests spawn the `cogito-mcp` binary and verify JSON-RPC protocol
+//! These tests spawn `cogito mcp` and verify the JSON-RPC protocol
 //! implementation: initialize, list tools, call tools.
 
 use std::io::Write;
@@ -8,16 +8,22 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 fn mcp_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cogito-mcp"))
+    PathBuf::from(env!("CARGO_BIN_EXE_cogito"))
+}
+
+/// Arguments that select the MCP subcommand.
+fn mcp_args() -> [&'static str; 1] {
+    ["mcp"]
 }
 
 fn send_jsonrpc(messages: Vec<&str>) -> String {
     let mut child = Command::new(mcp_bin())
+        .args(mcp_args())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("Failed to spawn cogito-mcp");
+        .expect("Failed to spawn cogito mcp");
 
     let mut stdin = child.stdin.take().expect("Failed to open stdin");
     for msg in messages {
@@ -27,7 +33,7 @@ fn send_jsonrpc(messages: Vec<&str>) -> String {
 
     let output = child
         .wait_with_output()
-        .expect("Failed to read cogito-mcp output");
+        .expect("Failed to read cogito mcp output");
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 

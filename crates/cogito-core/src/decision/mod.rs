@@ -1,89 +1,63 @@
 //! Decision Log Engine
 //!
 //! Structured reasoning that survives sessions. Backed by SQLite (with FTS5 +
-//! porter stemming) when available, falls back to legacy JSON files otherwise.
+//! porter stemming) when a connection is provided, falls back to legacy JSON
+//! files otherwise.
+//!
+//! See [`crate::semantic`] for why the connection is an explicit parameter
+//! instead of a process-global.
 
 use crate::types::Decision;
 use anyhow::Result;
 use chrono::Utc;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
+use rusqlite::Connection;
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-/// Legacy in-memory storage for decisions (used when SQLite is not open).
+/// Legacy in-memory storage (used only when no SQLite connection is provided).
 static LEGACY_DECISIONS: Lazy<RwLock<HashMap<Uuid, Vec<Decision>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-fn legacy_cogito_dir() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".cogito")
+fn legacy_read() -> HashMap<Uuid, Vec<Decision>> {
+    LEGACY_DECISIONS.read().clone()
 }
 
-fn legacy_persist() {
-    let map = LEGACY_DECISIONS.read().clone();
-    let all: Vec<Decision> = map.into_values().flatten().collect();
-    let _ = crate::persistence::save_decisions(&legacy_cogito_dir(), &all);
+fn legacy_persist(cogito_dir: &Path) {
+    let all: Vec<Decision> = legacy_read().into_values().flatten().collect();
+    let _ = crate::persistence::save_decisions(cogito_dir, &all);
 }
 
-fn legacy_hydrate() {
-    let dir = legacy_cogito_dir();
-    if let Ok(loaded) = crate::persistence::load_decisions(&dir) {
-        let mut map = LEGACY_DECISIONS.write();
-        for d in loaded {
-            map.entry(d.project_id).or_default().push(d);
-        }
-    }
-}
-
-fn ensure_legacy_loaded() {
-    static LOADED: once_cell::sync::Lazy<parking_lot::Once> =
-        once_cell::sync::Lazy::new(parking_lot::Once::new);
-    LOADED.call_once(legacy_hydrate);
-}
-
-/// Optional SQLite connection (set by Cogito before calling these fns).
-static SQLITE: once_cell::sync::OnceCell<Arc<parking_lot::Mutex<rusqlite::Connection>>> =
-    once_cell::sync::OnceCell::new();
-
-pub(crate) fn set_sqlite(conn: Arc<parking_lot::Mutex<rusqlite::Connection>>) {
-    let _ = SQLITE.set(conn);
-}
-
-/// Add a new decision
-pub async fn add(decision: Decision) -> Result<Decision> {
-    if let Some(conn) = SQLITE.get() {
-        let guard = conn.lock();
-        crate::storage::sqlite::insert_decision(&guard, &decision)?;
+/// Add a new decision.
+pub fn add(conn: Option<&Connection>, cogito_dir: &Path, decision: Decision) -> Result<Decision> {
+    if let Some(conn) = conn {
+        crate::storage::sqlite::insert_decision(conn, &decision)?;
         return Ok(decision);
     }
 
-    ensure_legacy_loaded();
-    let mut decisions = LEGACY_DECISIONS.write();
-    let project_decisions = decisions.entry(decision.project_id).or_default();
-    project_decisions.push(decision.clone());
-    drop(decisions);
-    legacy_persist();
+    {
+        let mut decisions = LEGACY_DECISIONS.write();
+        decisions
+            .entry(decision.project_id)
+            .or_default()
+            .push(decision.clone());
+    }
+    legacy_persist(cogito_dir);
     Ok(decision)
 }
 
-/// Search decisions by query
-pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<Decision>> {
-    if let Some(conn) = SQLITE.get() {
-        let guard = conn.lock();
-        return crate::storage::sqlite::search_decisions(&guard, project_id, query);
+/// Search decisions by query.
+pub fn search(conn: Option<&Connection>, project_id: Uuid, query: &str) -> Result<Vec<Decision>> {
+    if let Some(conn) = conn {
+        return crate::storage::sqlite::search_decisions(conn, project_id, query);
     }
 
-    ensure_legacy_loaded();
     let query_lower = query.to_lowercase();
-    let decisions = LEGACY_DECISIONS.read();
+    let project_decisions = legacy_read().get(&project_id).cloned().unwrap_or_default();
 
-    let project_decisions = decisions.get(&project_id).cloned().unwrap_or_default();
-
-    let results: Vec<Decision> = project_decisions
+    Ok(project_decisions
         .into_iter()
         .filter(|decision| {
             if query.is_empty() {
@@ -104,61 +78,67 @@ pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<Decision>> {
                     .iter()
                     .any(|a| a.to_lowercase().contains(&query_lower))
         })
-        .collect();
-
-    Ok(results)
+        .collect())
 }
 
-/// Get all decisions for a project
-pub async fn get_all(project_id: Uuid) -> Result<Vec<Decision>> {
-    search(project_id, "").await
+/// Get all decisions for a project.
+pub fn get_all(conn: Option<&Connection>, project_id: Uuid) -> Result<Vec<Decision>> {
+    search(conn, project_id, "")
 }
 
-/// Get decision by ID
-pub async fn get(project_id: Uuid, decision_id: Uuid) -> Result<Option<Decision>> {
-    let results = search(project_id, "").await?;
-    Ok(results.into_iter().find(|d| d.id == decision_id))
+/// Get a single decision by id.
+pub fn get(
+    conn: Option<&Connection>,
+    project_id: Uuid,
+    decision_id: Uuid,
+) -> Result<Option<Decision>> {
+    Ok(get_all(conn, project_id)?
+        .into_iter()
+        .find(|d| d.id == decision_id))
 }
 
-/// Delete a decision
-pub async fn delete(project_id: Uuid, decision_id: Uuid) -> Result<bool> {
-    if let Some(conn) = SQLITE.get() {
-        let guard = conn.lock();
-        let deleted = guard.execute(
+/// Delete a decision by id.
+pub fn delete(
+    conn: Option<&Connection>,
+    cogito_dir: &Path,
+    project_id: Uuid,
+    decision_id: Uuid,
+) -> Result<bool> {
+    if let Some(conn) = conn {
+        let deleted = conn.execute(
             "DELETE FROM decisions WHERE id = ?1 AND project_id = ?2",
             rusqlite::params![decision_id.to_string(), project_id.to_string()],
         )?;
         return Ok(deleted > 0);
     }
 
-    ensure_legacy_loaded();
     let mut decisions = LEGACY_DECISIONS.write();
     if let Some(project_decisions) = decisions.get_mut(&project_id) {
-        let len_before = project_decisions.len();
+        let before = project_decisions.len();
         project_decisions.retain(|d| d.id != decision_id);
-        let deleted = project_decisions.len() < len_before;
+        let deleted = project_decisions.len() < before;
         drop(decisions);
         if deleted {
-            legacy_persist();
+            legacy_persist(cogito_dir);
         }
         return Ok(deleted);
     }
     Ok(false)
 }
 
-/// Create a builder for new decisions
+/// Create a builder for new decisions.
 pub fn builder(project_id: Uuid) -> DecisionBuilder {
     DecisionBuilder::new(project_id)
 }
 
-/// Builder for decisions
+/// Builder for decisions.
 #[derive(Debug)]
 pub struct DecisionBuilder {
     project_id: Uuid,
     title: String,
     why: String,
     alternatives: Vec<String>,
-    paths: Vec<std::path::PathBuf>,
+    paths: Vec<PathBuf>,
     consequences: Vec<String>,
     tags: Vec<String>,
     author: String,
@@ -193,7 +173,7 @@ impl DecisionBuilder {
         self
     }
 
-    pub fn path(mut self, path: std::path::PathBuf) -> Self {
+    pub fn path(mut self, path: PathBuf) -> Self {
         self.paths.push(path);
         self
     }

@@ -4,7 +4,7 @@ members = [
     "crates/cogito-core",
     "crates/cogito-cli",
     "crates/cogito-api",
-    "crates/cogito-mcp",
+
     "examples",
     "skills/cogito",
 ]
@@ -39,6 +39,8 @@ parking_lot = "0.12"
 git2 = "0.20"
 criterion = { version = "0.5", features = ["html_reports"] }
 rusqlite = { version = "0.32", features = ["bundled", "modern_sqlite", "blob"] }
+rmcp = { version = "1.8", features = ["server", "transport-io", "macros", "schemars"] }
+schemars = "1"
 syn = { version = "2", features = ["full", "extra-traits", "parsing"] }
 quote = "1"
 proc-macro2 = "1"

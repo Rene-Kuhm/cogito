@@ -3,6 +3,7 @@
 //! Intelligent context harness for AI coding agents.
 
 mod commands;
+mod mcp;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -95,6 +96,9 @@ enum Commands {
         #[command(subcommand)]
         subcommand: Option<ProjectCommands>,
     },
+
+    /// Run the MCP server over stdio (for AI agents)
+    Mcp,
 
     /// Start server mode
     Serve {
@@ -248,6 +252,7 @@ async fn main() -> Result<()> {
         Some(Commands::Project { subcommand }) => {
             commands::project(subcommand).await?;
         }
+        Some(Commands::Mcp) => mcp::serve_stdio().await?,
         Some(Commands::Serve { port, mcp }) => commands::serve(port, mcp).await?,
         Some(Commands::Stats) => commands::stats(args.json).await?,
         Some(Commands::Doctor) => commands::doctor().await?,

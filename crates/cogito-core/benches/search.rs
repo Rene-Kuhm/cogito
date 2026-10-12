@@ -27,7 +27,7 @@ fn setup_with_n_decisions(n: usize) -> (TempDir, Uuid, Cogito) {
             .tag(&format!("domain-{}", i % 3))
             .path(PathBuf::from(format!("src/module_{i}/")))
             .build();
-        let _ = futures::executor::block_on(cogito.add_decision(d));
+        let _ = cogito.add_decision(d);
     }
 
     std::env::set_current_dir(&original).unwrap();
@@ -42,7 +42,7 @@ fn bench_search_decisions(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter(n), n, |b, _| {
             b.iter(|| {
-                let _ = futures::executor::block_on(cogito.search_decisions(pid, "scalability"));
+                let _ = cogito.search_decisions(pid, "scalability");
             });
         });
     }
@@ -58,7 +58,7 @@ fn bench_search_tags(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter(n), n, |b, _| {
             b.iter(|| {
-                let _ = futures::executor::block_on(cogito.search_tags(pid, "tag-5"));
+                let _ = cogito.search_tags(pid, "tag-5");
             });
         });
     }
