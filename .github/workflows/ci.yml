@@ -64,8 +64,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run benchmarks
-        run: cargo bench --no-run
+        with:
+          components: rustfmt, clippy
+      - name: Build benchmarks
+        run: cargo bench -p cogito-core --no-run
+      - name: Run quick benchmarks
+        run: |
+          for bench in fingerprint compress search; do
+            cargo bench -p cogito-core --bench $bench -- --quick || true
+          done
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-results
+          path: target/criterion
+          retention-days: 30
 
   security:
     name: Security Audit

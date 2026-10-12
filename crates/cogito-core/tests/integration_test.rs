@@ -57,11 +57,6 @@ mod billing {
         .output()
         .expect("git init failed");
     std::process::Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(&project_path)
-        .output()
-        .expect("git add failed");
-    std::process::Command::new("git")
         .args(["config", "user.email", "test@test.com"])
         .current_dir(&project_path)
         .output()
@@ -71,6 +66,11 @@ mod billing {
         .current_dir(&project_path)
         .output()
         .ok();
+    std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&project_path)
+        .output()
+        .expect("git add failed");
     std::process::Command::new("git")
         .args(["commit", "-m", "initial", "--no-gpg-sign", "-q"])
         .current_dir(&project_path)

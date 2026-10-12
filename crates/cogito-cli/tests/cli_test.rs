@@ -35,6 +35,7 @@ edition = "2021"
         .current_dir(project_path)
         .output()
         .ok();
+    // Use the legacy "key value" form which works on both old and new git
     Command::new("git")
         .args(["config", "user.email", "test@test.com"])
         .current_dir(project_path)
