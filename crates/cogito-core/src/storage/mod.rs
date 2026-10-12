@@ -6,4 +6,4 @@
 
 pub mod sqlite;
 
-pub use sqlite::{db_path, open, MigrateReport, Stats};
+pub use sqlite::{MigrateReport, Stats, db_path, open};

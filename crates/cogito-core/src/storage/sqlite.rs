@@ -11,7 +11,7 @@
 
 use crate::types::{Decision, SemanticTag};
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -21,9 +21,8 @@ const SCHEMA_VERSION: i32 = 1;
 /// Open a connection with all PRAGMAs applied.
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create directory {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
     }
 
     let conn = Connection::open(path)
@@ -285,11 +284,7 @@ pub fn insert_decision(conn: &Connection, d: &Decision) -> Result<()> {
     Ok(())
 }
 
-pub fn search_decisions(
-    conn: &Connection,
-    project_id: Uuid,
-    query: &str,
-) -> Result<Vec<Decision>> {
+pub fn search_decisions(conn: &Connection, project_id: Uuid, query: &str) -> Result<Vec<Decision>> {
     let pid_str = project_id.to_string();
 
     // Two strategies combined: FTS5 (with stemming) + LIKE fallback
@@ -327,8 +322,7 @@ pub fn search_decisions(
     sql.push_str(" ORDER BY created_at DESC");
 
     let mut stmt = conn.prepare(&sql)?;
-    let params_refs: Vec<&dyn rusqlite::ToSql> =
-        params_vec.iter().map(|p| p.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
 
     let rows = stmt.query_map(&params_refs[..], |row| {
         let id: String = row.get(0)?;
@@ -394,11 +388,7 @@ pub fn insert_tag(conn: &Connection, t: &SemanticTag) -> Result<()> {
     Ok(())
 }
 
-pub fn search_tags(
-    conn: &Connection,
-    project_id: Uuid,
-    query: &str,
-) -> Result<Vec<SemanticTag>> {
+pub fn search_tags(conn: &Connection, project_id: Uuid, query: &str) -> Result<Vec<SemanticTag>> {
     let pid_str = project_id.to_string();
 
     let mut sql = String::from(
@@ -426,8 +416,7 @@ pub fn search_tags(
     sql.push_str(" ORDER BY confidence DESC, created_at DESC");
 
     let mut stmt = conn.prepare(&sql)?;
-    let params_refs: Vec<&dyn rusqlite::ToSql> =
-        params_vec.iter().map(|p| p.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
 
     let rows = stmt.query_map(&params_refs[..], |row| {
         let id: String = row.get(0)?;
