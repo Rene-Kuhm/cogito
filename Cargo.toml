@@ -42,6 +42,8 @@ rusqlite = { version = "0.32", features = ["bundled", "modern_sqlite", "blob"] }
 syn = { version = "2", features = ["full", "extra-traits", "parsing"] }
 quote = "1"
 proc-macro2 = "1"
+tree-sitter = "0.25"
+tree-sitter-typescript = "0.23"
 whoami = "1"
 clap = { version = "4", features = ["derive", "env"] }
 colored = "2"
