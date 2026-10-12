@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Supported programming languages
@@ -23,7 +23,7 @@ pub enum Language {
 
 impl Language {
     /// Detect language from file path
-    pub fn detect(path: &PathBuf) -> anyhow::Result<Self> {
+    pub fn detect(path: &Path) -> anyhow::Result<Self> {
         let extension = path
             .extension()
             .and_then(|e| e.to_str())

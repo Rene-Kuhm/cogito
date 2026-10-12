@@ -15,7 +15,7 @@ static DECISIONS: once_cell::sync::Lazy<parking_lot::RwLock<HashMap<Uuid, Vec<De
 /// Add a new decision
 pub async fn add(decision: Decision) -> Result<Decision> {
     let mut decisions = DECISIONS.write();
-    let project_decisions = decisions.entry(decision.project_id).or_insert_with(Vec::new);
+    let project_decisions = decisions.entry(decision.project_id).or_default();
     project_decisions.push(decision.clone());
     Ok(decision)
 }

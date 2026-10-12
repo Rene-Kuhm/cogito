@@ -90,7 +90,7 @@ pub async fn compress(
 }
 
 /// Query knowledge base
-pub async fn query(query: &str, json: bool) -> Result<()> {
+pub async fn query(query: &str, _json: bool) -> Result<()> {
     println!("Searching for: {}", query);
     
     // TODO: Load project and search
@@ -131,9 +131,9 @@ pub async fn decision(subcommand: Option<crate::DecisionCommands>) -> Result<()>
 async fn add_decision(
     title: Option<String>,
     why: Option<String>,
-    alternatives: Vec<String>,
-    paths: Vec<String>,
-    tags: Vec<String>,
+    _alternatives: Vec<String>,
+    _paths: Vec<String>,
+    _tags: Vec<String>,
 ) -> Result<()> {
     if title.is_none() || why.is_none() {
         println!("Error: --title and --why are required");

@@ -84,7 +84,7 @@ fn remove_comments(content: &str) -> String {
                     match next {
                         '/' => {
                             // Single-line comment
-                            while let Some(c) = chars.next() {
+                            for c in chars.by_ref() {
                                 if c == '\n' {
                                     result.push('\n');
                                     break;
@@ -95,12 +95,11 @@ fn remove_comments(content: &str) -> String {
                             // Multi-line comment
                             chars.next(); // consume *
                             while let Some(c) = chars.next() {
-                                if c == '*' {
-                                    if let Some(&'/') = chars.peek() {
+                                if c == '*'
+                                    && let Some(&'/') = chars.peek() {
                                         chars.next();
                                         break;
                                     }
-                                }
                             }
                         }
                         _ => {
@@ -113,20 +112,12 @@ fn remove_comments(content: &str) -> String {
             }
             '#' => {
                 // Python/shell comment
-                while let Some(c) = chars.next() {
+                for c in chars.by_ref() {
                     if c == '\n' {
                         result.push('\n');
                         break;
                     }
                 }
-            }
-            '/' => {
-                if let Some(&next) = chars.peek() {
-                    if next == '/' || next == '*' {
-                        continue;
-                    }
-                }
-                result.push(ch);
             }
             _ => result.push(ch),
         }
@@ -185,7 +176,7 @@ mod tests {
     fn test_compress() {
         let options = CompressionOptions::default();
         let content = "fn   main() { \n    println!(\"hello\"); \n}";
-        let result = compress(&content, options).unwrap();
+        let result = compress(content, options).unwrap();
         assert!(result.compressed_tokens < result.original_tokens);
     }
 }

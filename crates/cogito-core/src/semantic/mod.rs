@@ -6,7 +6,7 @@ use crate::types::SemanticTag;
 use anyhow::Result;
 use chrono::Utc;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// In-memory storage for semantic tags (TODO: replace with proper storage)
@@ -39,7 +39,7 @@ pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<SemanticTag>> {
 /// Add a semantic tag
 pub async fn add(tag: SemanticTag) -> Result<SemanticTag> {
     let mut tags = TAGS.write();
-    let project_tags = tags.entry(tag.project_id).or_insert_with(Vec::new);
+    let project_tags = tags.entry(tag.project_id).or_default();
     project_tags.push(tag.clone());
     Ok(tag)
 }
@@ -63,7 +63,7 @@ pub async fn auto_tag(project_id: Uuid, paths: Vec<PathBuf>) -> Result<Vec<Seman
     }
 
     let mut storage = TAGS.write();
-    let project_tags = storage.entry(project_id).or_insert_with(Vec::new);
+    let project_tags = storage.entry(project_id).or_default();
     project_tags.extend(tags.clone());
 
     Ok(tags)
@@ -77,7 +77,7 @@ struct InferredTag {
 }
 
 /// Infer tag from file path patterns
-fn infer_tag_from_path(path: &PathBuf) -> Option<InferredTag> {
+fn infer_tag_from_path(path: &Path) -> Option<InferredTag> {
     let path_str = path.to_string_lossy().to_lowercase();
     let segments: Vec<&str> = path_str.split('/').collect();
 

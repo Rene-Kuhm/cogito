@@ -32,13 +32,14 @@ pub mod types;
 use anyhow::Result;
 use std::path::PathBuf;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 
 pub use types::*;
 
 /// Main Cogito engine
 #[derive(Debug, Clone)]
 pub struct Cogito {
+    #[allow(dead_code)] // No backend reads it yet: with_storage only stores it.
     storage: Option<StorageBackend>,
 }
 

@@ -5,7 +5,7 @@
 use crate::types::*;
 use anyhow::Result;
 use chrono::Utc;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 /// Generate fingerprint for a project
@@ -37,7 +37,7 @@ pub async fn generate(project: &Project) -> Result<Fingerprint> {
 }
 
 /// Find entry points based on language
-fn find_entry_points(path: &PathBuf, language: &Language) -> Result<Vec<PathBuf>> {
+fn find_entry_points(path: &Path, language: &Language) -> Result<Vec<PathBuf>> {
     let mut entry_points = Vec::new();
 
     let patterns = match language {
@@ -53,10 +53,8 @@ fn find_entry_points(path: &PathBuf, language: &Language) -> Result<Vec<PathBuf>
     };
 
     for pattern in patterns {
-        for entry in glob::glob(&path.join(pattern).to_string_lossy())? {
-            if let Ok(entry) = entry {
-                entry_points.push(entry);
-            }
+        for entry in glob::glob(&path.join(pattern).to_string_lossy())?.flatten() {
+            entry_points.push(entry);
         }
     }
 
@@ -64,7 +62,7 @@ fn find_entry_points(path: &PathBuf, language: &Language) -> Result<Vec<PathBuf>
 }
 
 /// Analyze data flows between modules
-fn analyze_data_flows(path: &PathBuf, language: &Language) -> Result<Vec<DataFlow>> {
+fn analyze_data_flows(path: &Path, language: &Language) -> Result<Vec<DataFlow>> {
     let mut flows = Vec::new();
 
     for entry in WalkDir::new(path)
@@ -74,13 +72,11 @@ fn analyze_data_flows(path: &PathBuf, language: &Language) -> Result<Vec<DataFlo
     {
         let file_path = entry.path().to_path_buf();
         
-        if let Some(ext) = file_path.extension() {
-            if is_code_file(ext, language) {
-                if let Ok(content) = std::fs::read_to_string(&file_path) {
+        if let Some(ext) = file_path.extension()
+            && is_code_file(ext, language)
+                && let Ok(content) = std::fs::read_to_string(&file_path) {
                     flows.extend(extract_imports(&file_path, &content, language)?);
                 }
-            }
-        }
     }
 
     Ok(flows)
@@ -94,7 +90,7 @@ fn is_code_file(ext: &std::ffi::OsStr, language: &Language) -> bool {
 
 /// Extract imports from file content
 fn extract_imports(
-    file_path: &PathBuf,
+    file_path: &Path,
     content: &str,
     language: &Language,
 ) -> Result<Vec<DataFlow>> {
@@ -107,7 +103,7 @@ fn extract_imports(
             for cap in re.captures_iter(content) {
                 if let Some(module) = cap.get(1) {
                     flows.push(DataFlow {
-                        from: file_path.clone(),
+                        from: file_path.to_path_buf(),
                         to: PathBuf::from(module.as_str()),
                         flow_type: FlowType::Import,
                     });
@@ -120,7 +116,7 @@ fn extract_imports(
             for cap in re.captures_iter(content) {
                 if let Some(module) = cap.get(2) {
                     flows.push(DataFlow {
-                        from: file_path.clone(),
+                        from: file_path.to_path_buf(),
                         to: PathBuf::from(module.as_str()),
                         flow_type: FlowType::Import,
                     });
@@ -133,7 +129,7 @@ fn extract_imports(
             for cap in re.captures_iter(content) {
                 let module = cap.get(1).or(cap.get(2)).map(|m| m.as_str()).unwrap_or("");
                 flows.push(DataFlow {
-                    from: file_path.clone(),
+                    from: file_path.to_path_buf(),
                     to: PathBuf::from(module),
                     flow_type: FlowType::Import,
                 });
@@ -159,18 +155,18 @@ pub async fn detect_zones(project: &Project) -> Result<Vec<Zone>> {
     Ok(zones)
 }
 
-fn detect_hot_zones(path: &PathBuf) -> Result<Vec<Zone>> {
+fn detect_hot_zones(_path: &Path) -> Result<Vec<Zone>> {
     // TODO: Implement git history analysis
     // For now, return empty
     Ok(Vec::new())
 }
 
-fn detect_cold_zones(path: &PathBuf) -> Result<Vec<Zone>> {
+fn detect_cold_zones(_path: &Path) -> Result<Vec<Zone>> {
     // TODO: Implement git history analysis
     Ok(Vec::new())
 }
 
-fn detect_frozen_zones(path: &PathBuf) -> Result<Vec<Zone>> {
+fn detect_frozen_zones(_path: &Path) -> Result<Vec<Zone>> {
     // TODO: Implement git history analysis
     Ok(Vec::new())
 }
