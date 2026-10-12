@@ -1,0 +1,263 @@
+//! Core types for Cogito
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use uuid::Uuid;
+
+/// Supported programming languages
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    Rust,
+    TypeScript,
+    JavaScript,
+    Python,
+    Go,
+    Java,
+    CSharp,
+    Ruby,
+    Php,
+    Unknown,
+}
+
+impl Language {
+    /// Detect language from file path
+    pub fn detect(path: &PathBuf) -> anyhow::Result<Self> {
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        let lang = match extension.to_lowercase().as_str() {
+            "rs" => Language::Rust,
+            "ts" | "tsx" => Language::TypeScript,
+            "js" | "jsx" | "mjs" | "cjs" => Language::JavaScript,
+            "py" => Language::Python,
+            "go" => Language::Go,
+            "java" => Language::Java,
+            "cs" => Language::CSharp,
+            "rb" => Language::Ruby,
+            "php" => Language::Php,
+            _ => Language::Unknown,
+        };
+
+        Ok(lang)
+    }
+
+    /// Get file extensions for this language
+    pub fn extensions(&self) -> Vec<&'static str> {
+        match self {
+            Language::Rust => vec!["rs"],
+            Language::TypeScript => vec!["ts", "tsx"],
+            Language::JavaScript => vec!["js", "jsx", "mjs", "cjs"],
+            Language::Python => vec!["py"],
+            Language::Go => vec!["go"],
+            Language::Java => vec!["java"],
+            Language::CSharp => vec!["cs"],
+            Language::Ruby => vec!["rb"],
+            Language::Php => vec!["php"],
+            Language::Unknown => vec![],
+        }
+    }
+}
+
+impl std::fmt::Display for Language {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Language::Rust => write!(f, "Rust"),
+            Language::TypeScript => write!(f, "TypeScript"),
+            Language::JavaScript => write!(f, "JavaScript"),
+            Language::Python => write!(f, "Python"),
+            Language::Go => write!(f, "Go"),
+            Language::Java => write!(f, "Java"),
+            Language::CSharp => write!(f, "C#"),
+            Language::Ruby => write!(f, "Ruby"),
+            Language::Php => write!(f, "PHP"),
+            Language::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+/// Project entity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    pub id: Uuid,
+    pub path: PathBuf,
+    pub name: String,
+    pub language: Language,
+    pub fingerprint: Option<Fingerprint>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Code fingerprint - minimal structural snapshot
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fingerprint {
+    pub project_id: Uuid,
+    pub entry_points: Vec<PathBuf>,
+    pub data_flows: Vec<DataFlow>,
+    pub hot_zones: Vec<Zone>,
+    pub cold_zones: Vec<Zone>,
+    pub frozen_zones: Vec<Zone>,
+    pub language: Language,
+    pub generated_at: DateTime<Utc>,
+}
+
+/// Data flow between modules
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataFlow {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    pub flow_type: FlowType,
+}
+
+/// Type of data flow
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowType {
+    Import,
+    FunctionCall,
+    Inheritance,
+    Composition,
+    Event,
+}
+
+/// Code zone with change frequency
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Zone {
+    pub path: PathBuf,
+    pub frequency: ZoneFrequency,
+    pub last_modified: DateTime<Utc>,
+    pub change_count: usize,
+}
+
+/// Zone frequency classification
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ZoneFrequency {
+    Hot,    // > 5 changes/month
+    Warm,   // 2-5 changes/month
+    Cold,   // < 2 changes/month
+    Frozen, // no changes in 6 months
+}
+
+/// Semantic memory tag
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticTag {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub tag: String,
+    pub domain: String,
+    pub paths: Vec<PathBuf>,
+    pub confidence: f32,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Decision log entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Decision {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub title: String,
+    pub why: String,
+    pub alternatives: Vec<String>,
+    pub paths: Vec<PathBuf>,
+    pub consequences: Vec<String>,
+    pub tags: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub author: String,
+}
+
+/// Context compression options
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionOptions {
+    pub max_tokens: usize,
+    pub preserve_imports: bool,
+    pub preserve_types: bool,
+    pub hot_zones_priority: bool,
+}
+
+impl Default for CompressionOptions {
+    fn default() -> Self {
+        Self {
+            max_tokens: 8000,
+            preserve_imports: true,
+            preserve_types: true,
+            hot_zones_priority: true,
+        }
+    }
+}
+
+/// Compressed context result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressedContext {
+    pub original_tokens: usize,
+    pub compressed_tokens: usize,
+    pub savings_percent: f32,
+    pub content: String,
+    pub sources: Vec<SourceRef>,
+}
+
+/// Reference to a source file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceRef {
+    pub path: PathBuf,
+    pub source_type: SourceType,
+    pub relevance: f32,
+}
+
+/// Type of source
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceType {
+    File,
+    Directory,
+    Function,
+    Type,
+    Module,
+}
+
+/// Context request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextRequest {
+    pub project_id: Uuid,
+    pub query: String,
+    pub scope: Scope,
+    pub max_tokens: usize,
+    pub hot_zones_only: bool,
+    pub include_decisions: bool,
+    pub include_tags: bool,
+}
+
+/// Scope of context
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Scope {
+    Project,
+    Directory { path: PathBuf },
+    Files { paths: Vec<PathBuf> },
+    HotOnly,
+}
+
+/// Context response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextResponse {
+    pub compressed: String,
+    pub tokens_used: usize,
+    pub tokens_saved: usize,
+    pub savings_percent: f32,
+    pub sources: Vec<SourceRef>,
+    pub tags: Vec<SemanticTag>,
+    pub decisions: Vec<Decision>,
+}
+
+impl CompressedContext {
+    /// Calculate token savings
+    pub fn calculate_savings(&self) -> f32 {
+        if self.original_tokens == 0 {
+            return 0.0;
+        }
+        ((self.original_tokens - self.compressed_tokens) as f32 / self.original_tokens as f32) * 100.0
+    }
+}
