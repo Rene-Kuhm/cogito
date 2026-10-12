@@ -146,7 +146,7 @@ enum DecisionCommands {
         paths: Vec<String>,
 
         /// Tags
-        #[arg(short, long)]
+        #[arg(short = 'T', long)]
         tags: Vec<String>,
     },
 

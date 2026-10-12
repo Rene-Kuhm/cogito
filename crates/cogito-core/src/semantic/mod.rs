@@ -1,20 +1,50 @@
 //! Semantic Memory Tags
 //!
-//! Index knowledge without reading code.
+//! Index knowledge without reading code. Persists to `.cogito/tags.json`.
 
 use crate::types::SemanticTag;
 use anyhow::Result;
 use chrono::Utc;
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-/// In-memory storage for semantic tags (TODO: replace with proper storage)
-static TAGS: once_cell::sync::Lazy<parking_lot::RwLock<HashMap<Uuid, Vec<SemanticTag>>>> =
-    once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(HashMap::new()));
+static TAGS: Lazy<RwLock<HashMap<Uuid, Vec<SemanticTag>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+fn cogito_dir() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".cogito")
+}
+
+fn persist() {
+    let map = TAGS.read().clone();
+    let all: Vec<SemanticTag> = map.into_values().flatten().collect();
+    let _ = crate::persistence::save_tags(&cogito_dir(), &all);
+}
+
+fn hydrate() {
+    let dir = cogito_dir();
+    if let Ok(loaded) = crate::persistence::load_tags(&dir) {
+        let mut map = TAGS.write();
+        for tag in loaded {
+            map.entry(tag.project_id).or_default().push(tag);
+        }
+    }
+}
+
+fn ensure_loaded() {
+    static LOADED: once_cell::sync::Lazy<parking_lot::Once> =
+        once_cell::sync::Lazy::new(parking_lot::Once::new);
+    LOADED.call_once(hydrate);
+}
 
 /// Search semantic tags by query
 pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<SemanticTag>> {
+    ensure_loaded();
     let query_lower = query.to_lowercase();
     let tags = TAGS.read();
 
@@ -23,6 +53,9 @@ pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<SemanticTag>> {
     let results: Vec<SemanticTag> = project_tags
         .into_iter()
         .filter(|tag| {
+            if query.is_empty() {
+                return true;
+            }
             tag.tag.to_lowercase().contains(&query_lower)
                 || tag.domain.to_lowercase().contains(&query_lower)
                 || tag
@@ -37,9 +70,12 @@ pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<SemanticTag>> {
 
 /// Add a semantic tag
 pub async fn add(tag: SemanticTag) -> Result<SemanticTag> {
+    ensure_loaded();
     let mut tags = TAGS.write();
     let project_tags = tags.entry(tag.project_id).or_default();
     project_tags.push(tag.clone());
+    drop(tags);
+    persist();
     Ok(tag)
 }
 
@@ -64,6 +100,8 @@ pub async fn auto_tag(project_id: Uuid, paths: Vec<PathBuf>) -> Result<Vec<Seman
     let mut storage = TAGS.write();
     let project_tags = storage.entry(project_id).or_default();
     project_tags.extend(tags.clone());
+    drop(storage);
+    persist();
 
     Ok(tags)
 }
@@ -137,17 +175,24 @@ fn infer_tag_from_path(path: &Path) -> Option<InferredTag> {
 
 /// Get all tags for a project
 pub async fn get_all(project_id: Uuid) -> Result<Vec<SemanticTag>> {
+    ensure_loaded();
     let tags = TAGS.read();
     Ok(tags.get(&project_id).cloned().unwrap_or_default())
 }
 
 /// Delete a tag
 pub async fn delete(project_id: Uuid, tag_id: Uuid) -> Result<bool> {
+    ensure_loaded();
     let mut tags = TAGS.write();
     if let Some(project_tags) = tags.get_mut(&project_id) {
         let len_before = project_tags.len();
         project_tags.retain(|t| t.id != tag_id);
-        return Ok(project_tags.len() < len_before);
+        let deleted = project_tags.len() < len_before;
+        drop(tags);
+        if deleted {
+            persist();
+        }
+        return Ok(deleted);
     }
     Ok(false)
 }

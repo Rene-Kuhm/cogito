@@ -1,27 +1,61 @@
 //! Decision Log Engine
 //!
-//! Structured reasoning that survives sessions.
+//! Structured reasoning that survives sessions. Persists to `.cogito/decisions.json`.
 
 use crate::types::Decision;
 use anyhow::Result;
 use chrono::Utc;
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use uuid::Uuid;
 
-/// In-memory storage for decisions (TODO: replace with proper storage)
-static DECISIONS: once_cell::sync::Lazy<parking_lot::RwLock<HashMap<Uuid, Vec<Decision>>>> =
-    once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(HashMap::new()));
+static DECISIONS: Lazy<RwLock<HashMap<Uuid, Vec<Decision>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+fn cogito_dir() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".cogito")
+}
+
+fn persist() {
+    let map = DECISIONS.read().clone();
+    let all: Vec<Decision> = map.into_values().flatten().collect();
+    let _ = crate::persistence::save_decisions(&cogito_dir(), &all);
+}
+
+fn hydrate() {
+    let dir = cogito_dir();
+    if let Ok(loaded) = crate::persistence::load_decisions(&dir) {
+        let mut map = DECISIONS.write();
+        for d in loaded {
+            map.entry(d.project_id).or_default().push(d);
+        }
+    }
+}
+
+fn ensure_loaded() {
+    static LOADED: once_cell::sync::Lazy<parking_lot::Once> =
+        once_cell::sync::Lazy::new(parking_lot::Once::new);
+    LOADED.call_once(hydrate);
+}
 
 /// Add a new decision
 pub async fn add(decision: Decision) -> Result<Decision> {
+    ensure_loaded();
     let mut decisions = DECISIONS.write();
     let project_decisions = decisions.entry(decision.project_id).or_default();
     project_decisions.push(decision.clone());
+    drop(decisions);
+    persist();
     Ok(decision)
 }
 
 /// Search decisions by query
 pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<Decision>> {
+    ensure_loaded();
     let query_lower = query.to_lowercase();
     let decisions = DECISIONS.read();
 
@@ -30,6 +64,9 @@ pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<Decision>> {
     let results: Vec<Decision> = project_decisions
         .into_iter()
         .filter(|decision| {
+            if query.is_empty() {
+                return true;
+            }
             decision.title.to_lowercase().contains(&query_lower)
                 || decision.why.to_lowercase().contains(&query_lower)
                 || decision
@@ -52,12 +89,14 @@ pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<Decision>> {
 
 /// Get all decisions for a project
 pub async fn get_all(project_id: Uuid) -> Result<Vec<Decision>> {
+    ensure_loaded();
     let decisions = DECISIONS.read();
     Ok(decisions.get(&project_id).cloned().unwrap_or_default())
 }
 
 /// Get decision by ID
 pub async fn get(project_id: Uuid, decision_id: Uuid) -> Result<Option<Decision>> {
+    ensure_loaded();
     let decisions = DECISIONS.read();
     Ok(decisions
         .get(&project_id)
@@ -67,11 +106,17 @@ pub async fn get(project_id: Uuid, decision_id: Uuid) -> Result<Option<Decision>
 
 /// Delete a decision
 pub async fn delete(project_id: Uuid, decision_id: Uuid) -> Result<bool> {
+    ensure_loaded();
     let mut decisions = DECISIONS.write();
     if let Some(project_decisions) = decisions.get_mut(&project_id) {
         let len_before = project_decisions.len();
         project_decisions.retain(|d| d.id != decision_id);
-        return Ok(project_decisions.len() < len_before);
+        let deleted = project_decisions.len() < len_before;
+        drop(decisions);
+        if deleted {
+            persist();
+        }
+        return Ok(deleted);
     }
     Ok(false)
 }
