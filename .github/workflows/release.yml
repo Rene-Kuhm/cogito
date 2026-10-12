@@ -60,7 +60,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --locked -p cogito-cli --target ${{ matrix.target }}
+        run: cargo build --release --locked -p cogito-harness --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -141,8 +141,8 @@ jobs:
   #     - uses: dtolnay/rust-toolchain@stable
   #     - name: Publish
   #       run: |
-  #         cargo publish -p cogito-core
-  #         cargo publish -p cogito-cli
-  #         cargo publish -p cogito-api
+  #         cargo publish -p cogito-harness-core
+  #         cargo publish -p cogito-harness
+  #         cargo publish -p cogito-harness-api
   #       env:
   #         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

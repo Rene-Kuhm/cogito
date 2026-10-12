@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo run --example basic
 
-use cogito_core::{Cogito, CompressionOptions};
+use cogito_harness_core::{Cogito, CompressionOptions};
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     // Add a semantic tag
     println!("\nAdding semantic tag...");
     use chrono::Utc;
-    use cogito_core::types::SemanticTag;
+    use cogito_harness_core::types::SemanticTag;
     use uuid::Uuid;
 
     let tag = SemanticTag {
@@ -83,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Add a decision
     println!("\nAdding architectural decision...");
-    use cogito_core::decision;
+    use cogito_harness_core::decision;
 
     let decision = decision::builder(project.id)
         .title("Example decision")

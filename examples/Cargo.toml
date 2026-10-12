@@ -19,7 +19,7 @@ name = "test_ast"
 path = "test_ast.rs"
 
 [dependencies]
-cogito-core.workspace = true
+cogito-harness-core.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 chrono.workspace = true

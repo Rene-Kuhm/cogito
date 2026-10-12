@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/cogito-core",
-    "crates/cogito-cli",
-    "crates/cogito-api",
+    "crates/cogito-harness-core",
+    "crates/cogito-harness",
+    "crates/cogito-harness-api",
 
     "examples",
     "skills/cogito",
@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Cogito Team <hello@cogito.ai>"]
 license = "Apache-2.0"
-repository = "https://github.com/Rene-Kuhm/cogito"
+repository = "https://github.com/Rene-Kuhm/cogito-harness"
 homepage = "https://cogito.ai"
 description = "Intelligent context harness for AI coding agents"
 keywords = ["ai", "agents", "context", "optimization", "coding"]
@@ -65,9 +65,9 @@ tower-http = { version = "0.5", features = ["cors", "trace"] }
 hyper = "1"
 
 # Internal crates
-cogito-core = { path = "crates/cogito-core" }
-cogito-cli = { path = "crates/cogito-cli" }
-cogito-api = { path = "crates/cogito-api" }
+cogito-harness-core = { version = "0.1.0", path = "crates/cogito-harness-core" }
+cogito-harness = { version = "0.1.0", path = "crates/cogito-harness" }
+cogito-harness-api = { version = "0.1.0", path = "crates/cogito-harness-api" }
 
 [profile.release]
 opt-level = 3

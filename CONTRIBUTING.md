@@ -14,7 +14,7 @@ Thank you for your interest in contributing to Cogito!
 
 ```bash
 # Clone the repository
-git clone https://github.com/Rene-Kuhm/cogito.git
+git clone https://github.com/Rene-Kuhm/cogito-harness.git
 cd cogito
 
 # Install Rust if needed
@@ -83,7 +83,7 @@ Public APIs must have doc comments:
 /// # Example
 ///
 /// ```
-/// use cogito_core::{Cogito, CompressionOptions};
+/// use cogito_harness_core::{Cogito, CompressionOptions};
 ///
 /// let cogito = Cogito::new();
 /// let result = cogito.compress_context("...", options).await?;
@@ -185,7 +185,7 @@ cargo doc --no-deps
 ```
 cogito/
 ├── crates/
-│   ├── cogito-core/     # Core engine
+│   ├── cogito-harness-core/     # Core engine
 │   │   └── src/
 │   │       ├── lib.rs         # Main entry
 │   │       ├── types.rs        # Shared types
@@ -193,8 +193,8 @@ cogito/
 │   │       ├── compressor/     # Context compression
 │   │       ├── semantic/       # Semantic tags
 │   │       └── decision/       # Decision log
-│   ├── cogito-cli/      # CLI tool
-│   └── cogito-api/      # REST API
+│   ├── cogito-harness/      # CLI tool
+│   └── cogito-harness-api/      # REST API
 ├── SPEC.md              # Project specification
 └── README.md            # Documentation
 ```

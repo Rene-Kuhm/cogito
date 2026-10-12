@@ -327,35 +327,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
-name = "cogito-api"
+name = "cogito-examples"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
  "chrono",
- "cogito-core",
- "hyper",
- "serde",
- "serde_json",
+ "cogito-harness-core",
  "tokio",
- "tokio-test",
- "tower 0.4.13",
- "tower-http",
- "tracing",
- "tracing-subscriber",
  "uuid",
- "whoami",
 ]
 
 [[package]]
-name = "cogito-cli"
+name = "cogito-harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
  "chrono",
  "clap",
- "cogito-core",
+ "cogito-harness-core",
  "colored",
  "indicatif",
  "predicates 3.1.4",
@@ -373,7 +363,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "cogito-core"
+name = "cogito-harness-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "cogito-harness-core",
+ "hyper",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-test",
+ "tower 0.4.13",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "whoami",
+]
+
+[[package]]
+name = "cogito-harness-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -409,17 +420,6 @@ dependencies = [
  "uuid",
  "walkdir",
  "whoami",
-]
-
-[[package]]
-name = "cogito-examples"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "cogito-core",
- "tokio",
- "uuid",
 ]
 
 [[package]]
