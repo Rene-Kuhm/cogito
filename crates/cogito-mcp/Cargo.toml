@@ -23,6 +23,6 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-rmcp = { version = "0.7", features = ["server", "transport-io", "macros", "schemars"] }
+rmcp = { version = "1.4", features = ["server", "transport-io", "macros", "schemars"] }
 schemars = "1"
 whoami = "1"

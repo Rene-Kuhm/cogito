@@ -91,7 +91,9 @@ pub struct AddTagRequest {
 
 #[derive(Clone)]
 pub struct CogitoServer {
+    #[allow(dead_code)]
     cogito: Cogito,
+    #[allow(dead_code)]
     tool_router: ToolRouter<CogitoServer>,
 }
 
@@ -300,18 +302,14 @@ impl CogitoServer {
 #[tool_handler]
 impl ServerHandler for CogitoServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::ServerInfo {
-            instructions: Some(
+        rmcp::model::InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(
                 "Cogito MCP server provides context optimization for AI coding agents. \
-                 Tools: scan_project (generate fingerprint), compress_context (reduce tokens), \
-                 search_knowledge (find tags/decisions), add_decision (record architecture decisions), \
-                 add_tag (categorize code). \
-                 All tools work with file-based persistence in .cogito/ directory."
-                    .to_string(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+             Tools: scan_project (generate fingerprint), compress_context (reduce tokens), \
+             search_knowledge (find tags/decisions), add_decision (record architecture decisions), \
+             add_tag (categorize code). \
+             All tools work with file-based persistence in .cogito/ directory.",
+            )
     }
 }
 
