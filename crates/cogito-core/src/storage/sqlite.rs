@@ -64,6 +64,11 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Public version of migrate_v1 for direct connection use (e.g. in-memory tests).
+pub fn migrate_v1_pub(conn: &Connection) -> Result<()> {
+    migrate_v1(conn)
+}
+
 fn migrate_v1(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -504,17 +509,49 @@ pub fn db_path(cogito_dir: &Path) -> PathBuf {
 }
 
 /// Run the migration from legacy JSON files to SQLite. Idempotent.
-pub fn migrate_from_json(conn: &Connection, cogito_dir: &Path) -> Result<MigrateReport> {
+/// If `current_project_id` is provided, all migrated records are re-assigned
+/// to that project (the legacy project_id is replaced).
+pub fn migrate_from_json(
+    conn: &Connection,
+    cogito_dir: &Path,
+    current_project_id: Option<Uuid>,
+) -> Result<MigrateReport> {
     use crate::persistence;
 
     let mut report = MigrateReport::default();
 
-    // Migrate tags
     let tags_path = cogito_dir.join("tags.json");
+    let decisions_path = cogito_dir.join("decisions.json");
+
+    let has_json = tags_path.exists() || decisions_path.exists();
+    if !has_json {
+        return Ok(report);
+    }
+
+    // Pre-create any project_ids referenced by the JSON files
+    // (the JSON files have their own project_id that we don't know in advance)
     if tags_path.exists() {
         let tags = persistence::load_tags(cogito_dir)?;
         for tag in &tags {
-            // Skip if already in DB
+            ensure_project_exists(conn, tag.project_id, "migrated");
+        }
+    }
+    if decisions_path.exists() {
+        let decisions = persistence::load_decisions(cogito_dir)?;
+        for decision in &decisions {
+            ensure_project_exists(conn, decision.project_id, "migrated");
+        }
+    }
+
+    // Migrate tags
+    if tags_path.exists() {
+        let mut tags = persistence::load_tags(cogito_dir)?;
+        if let Some(new_pid) = current_project_id {
+            for tag in &mut tags {
+                tag.project_id = new_pid;
+            }
+        }
+        for tag in &tags {
             let exists: bool = conn
                 .query_row(
                     "SELECT 1 FROM tags WHERE id = ?1",
@@ -531,9 +568,13 @@ pub fn migrate_from_json(conn: &Connection, cogito_dir: &Path) -> Result<Migrate
     }
 
     // Migrate decisions
-    let decisions_path = cogito_dir.join("decisions.json");
     if decisions_path.exists() {
-        let decisions = persistence::load_decisions(cogito_dir)?;
+        let mut decisions = persistence::load_decisions(cogito_dir)?;
+        if let Some(new_pid) = current_project_id {
+            for d in &mut decisions {
+                d.project_id = new_pid;
+            }
+        }
         for decision in &decisions {
             let exists: bool = conn
                 .query_row(
@@ -551,6 +592,25 @@ pub fn migrate_from_json(conn: &Connection, cogito_dir: &Path) -> Result<Migrate
     }
 
     Ok(report)
+}
+
+/// Create a project row for a given project_id if it doesn't exist yet.
+/// Used during migration to satisfy FK constraints for legacy JSON records.
+fn ensure_project_exists(conn: &Connection, project_id: Uuid, name: &str) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        r#"
+        INSERT OR IGNORE INTO projects (id, path, name, language, created_at, updated_at)
+        VALUES (?1, ?2, ?3, 'Unknown', ?4, ?4)
+        "#,
+        params![
+            project_id.to_string(),
+            format!("migrated://{}", project_id),
+            name,
+            now,
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Default, Clone)]
