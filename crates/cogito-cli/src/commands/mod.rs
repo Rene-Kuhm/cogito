@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use cogito_core::{Cogito, CompressionOptions, Project};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::DecisionCommands;
@@ -18,18 +18,34 @@ use crate::TagCommands;
 /// Initialize Cogito in the current directory
 pub async fn init() -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
+    let cogito_dir = cwd.join(".cogito");
 
     println!("Initializing Cogito in: {}", cwd.display());
 
-    let cogito = Cogito::new();
+    let cogito = open_cogito(&cwd)?;
     let project = cogito
         .init_project(cwd.clone())
         .context("Failed to initialize project")?;
 
+    // Register project in SQLite
+    if let Some(sqlite) = cogito.sqlite() {
+        let _ = cogito_core::storage::sqlite::upsert_project(
+            &sqlite.lock(),
+            project.id,
+            &project.path,
+            &project.name,
+            &project.language.to_string(),
+        );
+    }
+
     println!("✓ Project created");
-    println!("  ID:      {}", project.id);
-    println!("  Name:    {}", project.name);
+    println!("  ID:       {}", project.id);
+    println!("  Name:     {}", project.name);
     println!("  Language: {}", project.language);
+    println!(
+        "  Storage:  SQLite at {}",
+        cogito_dir.join("state.db").display()
+    );
     println!();
     println!("Next steps:");
     println!("  cogito scan        # Generate fingerprint");
@@ -41,12 +57,12 @@ pub async fn init() -> Result<()> {
 /// Scan project and generate fingerprint
 pub async fn scan(_watch: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let project = load_or_create_project(&cwd)?;
+    let cogito = open_cogito(&cwd)?;
+    let project = load_or_create_project(&cogito, &cwd)?;
 
     println!("Scanning: {} ({})", project.name, project.language);
     println!();
 
-    let cogito = Cogito::new();
     let fingerprint = cogito
         .generate_fingerprint(&project)
         .await
@@ -187,7 +203,8 @@ pub async fn compress(
 /// Query knowledge base
 pub async fn query(query_str: &str, json: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let project = load_or_create_project(&cwd)?;
+    let cogito = open_cogito(&cwd)?;
+    let project = load_or_create_project(&cogito, &cwd)?;
 
     let cogito = Cogito::new();
     let tags = cogito
@@ -263,7 +280,8 @@ async fn add_decision(
     };
 
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let project = load_or_create_project(&cwd)?;
+    let cogito = open_cogito(&cwd)?;
+    let project = load_or_create_project(&cogito, &cwd)?;
 
     let cogito = Cogito::new();
 
@@ -307,7 +325,8 @@ async fn add_decision(
 
 async fn list_decisions() -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let project = load_or_create_project(&cwd)?;
+    let cogito = open_cogito(&cwd)?;
+    let project = load_or_create_project(&cogito, &cwd)?;
 
     let cogito = Cogito::new();
     // For now, return all by searching empty
@@ -331,7 +350,8 @@ async fn list_decisions() -> Result<()> {
 
 async fn search_decisions(query_str: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let project = load_or_create_project(&cwd)?;
+    let cogito = open_cogito(&cwd)?;
+    let project = load_or_create_project(&cogito, &cwd)?;
 
     let cogito = Cogito::new();
     let decisions = cogito
@@ -381,7 +401,8 @@ async fn add_tag(tag: &str, paths: Vec<String>) -> Result<()> {
     }
 
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let project = load_or_create_project(&cwd)?;
+    let cogito = open_cogito(&cwd)?;
+    let project = load_or_create_project(&cogito, &cwd)?;
 
     let cogito = Cogito::new();
     let semantic_tag = cogito_core::types::SemanticTag {
@@ -408,7 +429,8 @@ async fn add_tag(tag: &str, paths: Vec<String>) -> Result<()> {
 
 async fn list_tags() -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let project = load_or_create_project(&cwd)?;
+    let cogito = open_cogito(&cwd)?;
+    let project = load_or_create_project(&cogito, &cwd)?;
 
     let cogito = Cogito::new();
     let tags = cogito
@@ -436,7 +458,8 @@ async fn list_tags() -> Result<()> {
 
 async fn search_tags(query_str: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let project = load_or_create_project(&cwd)?;
+    let cogito = open_cogito(&cwd)?;
+    let project = load_or_create_project(&cogito, &cwd)?;
 
     let cogito = Cogito::new();
     let tags = cogito
@@ -517,7 +540,8 @@ pub async fn serve(port: u16, mcp: bool) -> Result<()> {
 /// Show statistics
 pub async fn stats(json: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let project = load_or_create_project(&cwd)?;
+    let cogito = open_cogito(&cwd)?;
+    let project = load_or_create_project(&cogito, &cwd)?;
 
     let cogito = Cogito::new();
     let tags = cogito.search_tags(project.id, "").await.unwrap_or_default();
@@ -591,7 +615,8 @@ pub async fn doctor() -> Result<()> {
 /// Export project data
 pub async fn export(output: Option<&str>, format: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let project = load_or_create_project(&cwd)?;
+    let cogito = open_cogito(&cwd)?;
+    let project = load_or_create_project(&cogito, &cwd)?;
 
     let cogito = Cogito::new();
     let fingerprint = cogito.generate_fingerprint(&project).await?;
@@ -644,12 +669,38 @@ pub async fn export(output: Option<&str>, format: &str) -> Result<()> {
 // Helpers
 // ============================================================
 
-/// Load or create a project for the current directory
-fn load_or_create_project(cwd: &std::path::Path) -> Result<Project> {
-    let cogito = Cogito::new();
-    cogito
+/// Open a Cogito instance backed by SQLite at `<cwd>/.cogito/state.db`.
+/// Auto-migrates legacy JSON files on first run.
+fn open_cogito(cwd: &Path) -> Result<Cogito> {
+    let cogito_dir = cwd.join(".cogito");
+    std::fs::create_dir_all(&cogito_dir)
+        .with_context(|| format!("Failed to create {}", cogito_dir.display()))?;
+    Cogito::with_project_sqlite(&cogito_dir).with_context(|| {
+        format!(
+            "Failed to open SQLite at {}",
+            cogito_dir.join("state.db").display()
+        )
+    })
+}
+
+/// Load or create a project for the current directory, registering it in SQLite
+fn load_or_create_project(cogito: &Cogito, cwd: &Path) -> Result<Project> {
+    let project = cogito
         .init_project(cwd.to_path_buf())
-        .context("Failed to load/create project")
+        .context("Failed to load/create project")?;
+
+    // Register in SQLite so foreign keys resolve
+    if let Some(sqlite) = cogito.sqlite() {
+        let _ = cogito_core::storage::sqlite::upsert_project(
+            &sqlite.lock(),
+            project.id,
+            &project.path,
+            &project.name,
+            &project.language.to_string(),
+        );
+    }
+
+    Ok(project)
 }
 
 // ProjectId is just a type alias for Uuid

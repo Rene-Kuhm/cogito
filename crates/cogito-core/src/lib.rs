@@ -41,21 +41,51 @@ pub use types::*;
 /// Main Cogito engine
 #[derive(Debug, Clone)]
 pub struct Cogito {
-    #[allow(dead_code)] // No backend reads it yet: with_storage only stores it.
-    storage: Option<StorageBackend>,
+    /// Optional SQLite connection (None = use legacy JSON file storage)
+    sqlite: Option<std::sync::Arc<parking_lot::Mutex<rusqlite::Connection>>>,
 }
 
 impl Cogito {
     /// Create a new Cogito instance
     pub fn new() -> Self {
-        Self { storage: None }
+        Self { sqlite: None }
     }
 
-    /// Create with storage backend
-    pub fn with_storage(storage: StorageBackend) -> Self {
-        Self {
-            storage: Some(storage),
-        }
+    /// Open a Cogito instance backed by SQLite at the given path
+    /// (e.g. `.cogito/state.db`). Idempotent and safe to call repeatedly.
+    pub fn with_sqlite(path: &std::path::Path) -> Result<Self> {
+        let conn = crate::storage::open(path)?;
+        let arc = std::sync::Arc::new(parking_lot::Mutex::new(conn));
+        crate::semantic::set_sqlite(arc.clone());
+        crate::decision::set_sqlite(arc.clone());
+        Ok(Self { sqlite: Some(arc) })
+    }
+
+    /// Open a Cogito instance backed by the project's `.cogito/state.db`.
+    /// Auto-migration happens later in `init_project` once the project_id is known.
+    pub fn with_project_sqlite(cogito_dir: &std::path::Path) -> Result<Self> {
+        let db_path = crate::storage::db_path(cogito_dir);
+        let conn = crate::storage::open(&db_path)?;
+        let arc = std::sync::Arc::new(parking_lot::Mutex::new(conn));
+        crate::semantic::set_sqlite(arc.clone());
+        crate::decision::set_sqlite(arc.clone());
+        Ok(Self { sqlite: Some(arc) })
+    }
+
+    /// Open an in-memory SQLite Cogito (for tests)
+    pub fn in_memory() -> Result<Self> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        crate::storage::sqlite::migrate_v1_pub(&conn)?;
+        let arc = std::sync::Arc::new(parking_lot::Mutex::new(conn));
+        crate::semantic::set_sqlite(arc.clone());
+        crate::decision::set_sqlite(arc.clone());
+        Ok(Self { sqlite: Some(arc) })
+    }
+
+    /// Get the SQLite connection if SQLite is enabled.
+    /// Returns None if the engine is using legacy JSON storage.
+    pub fn sqlite(&self) -> Option<&std::sync::Arc<parking_lot::Mutex<rusqlite::Connection>>> {
+        self.sqlite.as_ref()
     }
 
     /// Initialize a new project
@@ -71,6 +101,25 @@ impl Cogito {
         // decisions/tags persist across CLI invocations.
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
         let id = Uuid::new_v5(&Uuid::NAMESPACE_OID, canonical.to_string_lossy().as_bytes());
+
+        // If SQLite is open, run auto-migration from JSON to SQLite,
+        // re-assigning migrated records to this project_id.
+        if let Some(sqlite) = self.sqlite() {
+            let cogito_dir = path.join(".cogito");
+            if cogito_dir.exists() {
+                let conn = sqlite.lock();
+                if let Ok(report) =
+                    crate::storage::sqlite::migrate_from_json(&conn, &cogito_dir, Some(id))
+                    && (report.tags_imported > 0 || report.decisions_imported > 0)
+                {
+                    tracing::info!(
+                        "Migrated {} tags and {} decisions from legacy JSON",
+                        report.tags_imported,
+                        report.decisions_imported
+                    );
+                }
+            }
+        }
 
         Ok(Project {
             id,
@@ -133,16 +182,8 @@ impl Default for Cogito {
     }
 }
 
-/// Storage backend trait
-#[derive(Debug, Clone)]
-pub enum StorageBackend {
-    /// In-memory storage (for testing)
-    Memory,
-    /// SQLite storage
-    Sqlite(PathBuf),
-    /// PostgreSQL storage
-    Postgres(String),
-}
+// StorageBackend enum removed: SQLite is now the default,
+// legacy JSON is implicit. See `Cogito::with_sqlite` and `with_project_sqlite`.
 
 #[cfg(test)]
 mod tests {
@@ -151,7 +192,7 @@ mod tests {
     #[test]
     fn test_cogito_new() {
         let cogito = Cogito::new();
-        assert!(cogito.storage.is_none());
+        assert!(cogito.sqlite.is_none());
     }
 
     #[test]

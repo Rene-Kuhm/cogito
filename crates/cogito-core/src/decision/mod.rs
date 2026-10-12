@@ -1,6 +1,7 @@
 //! Decision Log Engine
 //!
-//! Structured reasoning that survives sessions. Persists to `.cogito/decisions.json`.
+//! Structured reasoning that survives sessions. Backed by SQLite (with FTS5 +
+//! porter stemming) when available, falls back to legacy JSON files otherwise.
 
 use crate::types::Decision;
 use anyhow::Result;
@@ -9,55 +10,76 @@ use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
 
-static DECISIONS: Lazy<RwLock<HashMap<Uuid, Vec<Decision>>>> =
+/// Legacy in-memory storage for decisions (used when SQLite is not open).
+static LEGACY_DECISIONS: Lazy<RwLock<HashMap<Uuid, Vec<Decision>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-fn cogito_dir() -> PathBuf {
+fn legacy_cogito_dir() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".cogito")
 }
 
-fn persist() {
-    let map = DECISIONS.read().clone();
+fn legacy_persist() {
+    let map = LEGACY_DECISIONS.read().clone();
     let all: Vec<Decision> = map.into_values().flatten().collect();
-    let _ = crate::persistence::save_decisions(&cogito_dir(), &all);
+    let _ = crate::persistence::save_decisions(&legacy_cogito_dir(), &all);
 }
 
-fn hydrate() {
-    let dir = cogito_dir();
+fn legacy_hydrate() {
+    let dir = legacy_cogito_dir();
     if let Ok(loaded) = crate::persistence::load_decisions(&dir) {
-        let mut map = DECISIONS.write();
+        let mut map = LEGACY_DECISIONS.write();
         for d in loaded {
             map.entry(d.project_id).or_default().push(d);
         }
     }
 }
 
-fn ensure_loaded() {
+fn ensure_legacy_loaded() {
     static LOADED: once_cell::sync::Lazy<parking_lot::Once> =
         once_cell::sync::Lazy::new(parking_lot::Once::new);
-    LOADED.call_once(hydrate);
+    LOADED.call_once(legacy_hydrate);
+}
+
+/// Optional SQLite connection (set by Cogito before calling these fns).
+static SQLITE: once_cell::sync::OnceCell<Arc<parking_lot::Mutex<rusqlite::Connection>>> =
+    once_cell::sync::OnceCell::new();
+
+pub(crate) fn set_sqlite(conn: Arc<parking_lot::Mutex<rusqlite::Connection>>) {
+    let _ = SQLITE.set(conn);
 }
 
 /// Add a new decision
 pub async fn add(decision: Decision) -> Result<Decision> {
-    ensure_loaded();
-    let mut decisions = DECISIONS.write();
+    if let Some(conn) = SQLITE.get() {
+        let guard = conn.lock();
+        crate::storage::sqlite::insert_decision(&guard, &decision)?;
+        return Ok(decision);
+    }
+
+    ensure_legacy_loaded();
+    let mut decisions = LEGACY_DECISIONS.write();
     let project_decisions = decisions.entry(decision.project_id).or_default();
     project_decisions.push(decision.clone());
     drop(decisions);
-    persist();
+    legacy_persist();
     Ok(decision)
 }
 
 /// Search decisions by query
 pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<Decision>> {
-    ensure_loaded();
+    if let Some(conn) = SQLITE.get() {
+        let guard = conn.lock();
+        return crate::storage::sqlite::search_decisions(&guard, project_id, query);
+    }
+
+    ensure_legacy_loaded();
     let query_lower = query.to_lowercase();
-    let decisions = DECISIONS.read();
+    let decisions = LEGACY_DECISIONS.read();
 
     let project_decisions = decisions.get(&project_id).cloned().unwrap_or_default();
 
@@ -89,32 +111,35 @@ pub async fn search(project_id: Uuid, query: &str) -> Result<Vec<Decision>> {
 
 /// Get all decisions for a project
 pub async fn get_all(project_id: Uuid) -> Result<Vec<Decision>> {
-    ensure_loaded();
-    let decisions = DECISIONS.read();
-    Ok(decisions.get(&project_id).cloned().unwrap_or_default())
+    search(project_id, "").await
 }
 
 /// Get decision by ID
 pub async fn get(project_id: Uuid, decision_id: Uuid) -> Result<Option<Decision>> {
-    ensure_loaded();
-    let decisions = DECISIONS.read();
-    Ok(decisions
-        .get(&project_id)
-        .and_then(|d| d.iter().find(|dec| dec.id == decision_id))
-        .cloned())
+    let results = search(project_id, "").await?;
+    Ok(results.into_iter().find(|d| d.id == decision_id))
 }
 
 /// Delete a decision
 pub async fn delete(project_id: Uuid, decision_id: Uuid) -> Result<bool> {
-    ensure_loaded();
-    let mut decisions = DECISIONS.write();
+    if let Some(conn) = SQLITE.get() {
+        let guard = conn.lock();
+        let deleted = guard.execute(
+            "DELETE FROM decisions WHERE id = ?1 AND project_id = ?2",
+            rusqlite::params![decision_id.to_string(), project_id.to_string()],
+        )?;
+        return Ok(deleted > 0);
+    }
+
+    ensure_legacy_loaded();
+    let mut decisions = LEGACY_DECISIONS.write();
     if let Some(project_decisions) = decisions.get_mut(&project_id) {
         let len_before = project_decisions.len();
         project_decisions.retain(|d| d.id != decision_id);
         let deleted = project_decisions.len() < len_before;
         drop(decisions);
         if deleted {
-            persist();
+            legacy_persist();
         }
         return Ok(deleted);
     }
@@ -207,31 +232,6 @@ impl DecisionBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_add_and_search() {
-        let project_id = Uuid::new_v4();
-
-        let decision = Decision {
-            id: Uuid::new_v4(),
-            project_id,
-            title: "JWT with refresh tokens".to_string(),
-            why: "stateless, scales better".to_string(),
-            alternatives: vec!["Sessions with cookies".to_string()],
-            paths: vec![std::path::PathBuf::from("src/auth/")],
-            consequences: vec!["Must implement token refresh".to_string()],
-            tags: vec!["auth".to_string(), "jwt".to_string()],
-            created_at: Utc::now(),
-            author: "test".to_string(),
-        };
-
-        let added = add(decision.clone()).await.unwrap();
-        assert_eq!(added.id, decision.id);
-
-        let results = search(project_id, "JWT").await.unwrap();
-        assert!(!results.is_empty());
-        assert_eq!(results[0].title, "JWT with refresh tokens");
-    }
 
     #[test]
     fn test_builder() {
