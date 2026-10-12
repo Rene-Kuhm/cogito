@@ -6,6 +6,7 @@ use crate::types::{CompressedContext, CompressionOptions, Language, SourceRef, S
 use anyhow::Result;
 
 pub mod ast;
+pub mod ast_ts;
 
 /// Compress context while preserving meaning
 pub fn compress(content: &str, options: CompressionOptions) -> Result<CompressedContext> {
@@ -20,14 +21,19 @@ pub fn compress_with_language(
 ) -> Result<CompressedContext> {
     let original_tokens = estimate_tokens(content);
 
-    // Try AST-aware compression first if language is known and is Rust
-    let compressed = if matches!(language, Some(Language::Rust)) {
-        match ast::compress_rust_only(content, &options) {
+    // Try AST-aware compression first if language is known
+    let compressed = match language {
+        Some(Language::Rust) => match ast::compress_rust_only(content, &options) {
             Ok(r) => r.content,
             Err(_) => apply_compression(content, &options)?,
+        },
+        Some(Language::TypeScript) | Some(Language::JavaScript) => {
+            match ast_ts::compress_typescript(content, &options) {
+                Ok(r) => r.content,
+                Err(_) => apply_compression(content, &options)?,
+            }
         }
-    } else {
-        apply_compression(content, &options)?
+        _ => apply_compression(content, &options)?,
     };
 
     let compressed_tokens = estimate_tokens(&compressed);

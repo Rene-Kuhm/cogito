@@ -29,6 +29,8 @@ rusqlite.workspace = true
 syn.workspace = true
 quote.workspace = true
 proc-macro2.workspace = true
+tree-sitter.workspace = true
+tree-sitter-typescript.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
@@ -57,4 +59,8 @@ harness = false
 
 [[bench]]
 name = "ast_vs_structural"
+harness = false
+
+[[bench]]
+name = "ast_ts_vs_structural"
 harness = false
