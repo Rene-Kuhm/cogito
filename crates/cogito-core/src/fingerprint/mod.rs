@@ -116,7 +116,7 @@ fn extract_imports(
         }
         Language::TypeScript | Language::JavaScript => {
             // Match `import` statements
-            let re = regex::Regex::new(r#"import\s+(?:{\s*)?([a-zA-Z0-9_*\s,}]+)(?:\s*})?\s+from\s+["']([^"']+)["']"#)?;
+            let re = regex::Regex::new(r#"import\s+(?:\{\s*)?([a-zA-Z0-9_*\s,}]+)(?:\s*\})?\s+from\s+["']([^"']+)["']"#)?;
             for cap in re.captures_iter(content) {
                 if let Some(module) = cap.get(2) {
                     flows.push(DataFlow {
@@ -186,6 +186,14 @@ mod tests {
         let result = find_entry_points(&path, &language).unwrap();
         // May be empty if no Rust files in current dir
         assert!(result.len() <= 10);
+    }
+
+    #[test]
+    fn test_extract_imports_typescript() {
+        let content = "import { a, b } from './mod';\nimport React from \"react\";";
+        let flows = extract_imports(&PathBuf::from("index.ts"), content, &Language::TypeScript).unwrap();
+        let targets: Vec<_> = flows.iter().map(|f| f.to.clone()).collect();
+        assert_eq!(targets, vec![PathBuf::from("./mod"), PathBuf::from("react")]);
     }
 
     #[test]
