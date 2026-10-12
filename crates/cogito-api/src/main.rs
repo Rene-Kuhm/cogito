@@ -48,6 +48,15 @@ impl<T: Serialize> ApiResponse<T> {
     }
 }
 
+/// Parse a project id from the request; a malformed one is the client's error.
+// The Err is the ready-made 400 response: large, but it goes straight back to axum.
+#[allow(clippy::result_large_err)]
+fn parse_project_id(raw: &str) -> Result<uuid::Uuid, axum::response::Response> {
+    raw.parse().map_err(|_| {
+        (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(format!("invalid project id: {raw}")))).into_response()
+    })
+}
+
 // --- Project Endpoints ---
 
 /// Create a new project
@@ -104,7 +113,10 @@ async fn compress_context(
     }
 }
 
+// project_id, query and include_* are part of the documented request but the
+// compressor does not use them yet.
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct CompressRequest {
     project_id: Option<String>,
     content: String,
@@ -149,11 +161,27 @@ async fn create_decision(
 ) -> impl IntoResponse {
     use cogito_core::decision;
 
-    let decision = decision::builder(payload.project_id.parse().unwrap())
+    let project_id = match parse_project_id(&payload.project_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let mut builder = decision::builder(project_id)
         .title(&payload.title)
         .why(&payload.why)
-        .author(&payload.author.unwrap_or_else(whoami::username))
-        .build();
+        .author(&payload.author.unwrap_or_else(whoami::username));
+    for alternative in payload.alternatives.unwrap_or_default() {
+        builder = builder.alternative(&alternative);
+    }
+    for path in payload.paths.unwrap_or_default() {
+        builder = builder.path(path.into());
+    }
+    for consequence in payload.consequences.unwrap_or_default() {
+        builder = builder.consequence(&consequence);
+    }
+    for tag in payload.tags.unwrap_or_default() {
+        builder = builder.tag(&tag);
+    }
+    let decision = builder.build();
 
     let result = state.cogito.add_decision(decision).await;
     match result {
@@ -176,10 +204,19 @@ struct CreateDecisionRequest {
 
 /// List decisions
 async fn list_decisions(
-    State(_state): State<AppState>,
-    Query(_params): Query<ListParams>,
+    State(state): State<AppState>,
+    Query(params): Query<ListParams>,
 ) -> impl IntoResponse {
-    (StatusCode::OK, Json(ApiResponse::success(Vec::<()>::new()))).into_response()
+    let project_id = match parse_project_id(&params.project) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    // An empty query matches every decision, the same way list_tags lists tags.
+    let result = state.cogito.search_decisions(project_id, "").await;
+    match result {
+        Ok(data) => (StatusCode::OK, Json(ApiResponse::success(data))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(e.to_string()))).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -192,7 +229,11 @@ async fn search_decisions(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
-    let result = state.cogito.search_decisions(params.project.parse().unwrap(), &params.q).await;
+    let project_id = match parse_project_id(&params.project) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let result = state.cogito.search_decisions(project_id, &params.q).await;
     match result {
         Ok(data) => (StatusCode::OK, Json(ApiResponse::success(data))).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(e.to_string()))).into_response(),
@@ -216,9 +257,13 @@ async fn create_tag(
     use cogito_core::types::SemanticTag;
     use uuid::Uuid;
 
+    let project_id = match parse_project_id(&payload.project_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
     let tag = SemanticTag {
         id: Uuid::new_v4(),
-        project_id: payload.project_id.parse().unwrap(),
+        project_id,
         tag: payload.tag,
         domain: payload.domain.unwrap_or_default(),
         paths: payload.paths.into_iter().map(Into::into).collect(),
@@ -247,7 +292,11 @@ async fn list_tags(
     State(state): State<AppState>,
     Query(params): Query<TagListParams>,
 ) -> impl IntoResponse {
-    let result = state.cogito.search_tags(params.project.parse().unwrap(), "").await;
+    let project_id = match parse_project_id(&params.project) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let result = state.cogito.search_tags(project_id, "").await;
     match result {
         Ok(data) => (StatusCode::OK, Json(ApiResponse::success(data))).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(e.to_string()))).into_response(),
@@ -264,7 +313,11 @@ async fn search_tags(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
-    let result = state.cogito.search_tags(params.project.parse().unwrap(), &params.q).await;
+    let project_id = match parse_project_id(&params.project) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let result = state.cogito.search_tags(project_id, &params.q).await;
     match result {
         Ok(data) => (StatusCode::OK, Json(ApiResponse::success(data))).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(e.to_string()))).into_response(),
@@ -317,6 +370,7 @@ async fn main() -> Result<()> {
         // Tags
         .route("/api/v1/tags", post(create_tag))
         .route("/api/v1/tags", get(list_tags))
+        .route("/api/v1/tags/search", get(search_tags))
         .with_state(state)
         .layer(cors);
 
