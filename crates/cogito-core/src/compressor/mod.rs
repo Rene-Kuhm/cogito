@@ -6,6 +6,8 @@ use crate::types::{CompressedContext, CompressionOptions, Language, SourceRef, S
 use anyhow::Result;
 
 pub mod ast;
+pub mod ast_go;
+pub mod ast_py;
 pub mod ast_ts;
 
 /// Compress context while preserving meaning
@@ -33,6 +35,14 @@ pub fn compress_with_language(
                 Err(_) => apply_compression(content, &options)?,
             }
         }
+        Some(Language::Python) => match ast_py::compress_python(content, &options) {
+            Ok(r) => r.content,
+            Err(_) => apply_compression(content, &options)?,
+        },
+        Some(Language::Go) => match ast_go::compress_go(content, &options) {
+            Ok(r) => r.content,
+            Err(_) => apply_compression(content, &options)?,
+        },
         _ => apply_compression(content, &options)?,
     };
 
