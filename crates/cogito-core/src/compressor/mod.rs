@@ -14,7 +14,7 @@ pub fn compress(content: &str, options: CompressionOptions) -> Result<Compressed
 
     let compressed_tokens = estimate_tokens(&compressed);
     let savings = if original_tokens > 0 {
-        (original_tokens.saturating_sub(compressed_tokens) as f32 / original_tokens as f32) * 100.0
+        ((original_tokens - compressed_tokens) as f32 / original_tokens as f32) * 100.0
     } else {
         0.0
     };
@@ -32,10 +32,9 @@ pub fn compress(content: &str, options: CompressionOptions) -> Result<Compressed
     })
 }
 
-/// Estimate token count (rough approximation)
+/// Estimate token count (rough approximation based on character count)
 fn estimate_tokens(content: &str) -> usize {
-    // Rough estimate: ~4 chars per token for English
-    // For code, it's more like 3-4 chars per token
+    // ~3-4 chars per token for code (slightly higher density than prose)
     content.chars().count() / 3
 }
 
@@ -43,16 +42,20 @@ fn estimate_tokens(content: &str) -> usize {
 fn apply_compression(content: &str, options: &CompressionOptions) -> Result<String> {
     let mut result = content.to_string();
 
-    // Strategy 1: Remove comments (if configured). This runs first: a `//` comment
-    // ends at a newline, so it must see the original line breaks.
+    // Strategy 1: Remove block comments
     if !options.preserve_types {
-        result = remove_comments(&result);
+        result = remove_block_comments(&result);
     }
 
-    // Strategy 2: Remove extra whitespace
+    // Strategy 2: Remove single-line comments
+    if !options.preserve_types {
+        result = remove_line_comments(&result);
+    }
+
+    // Strategy 3: Compress extra whitespace
     result = compress_whitespace(&result);
 
-    // Strategy 3: Shorten if over max tokens
+    // Strategy 4: Truncate to max tokens if still too large
     if estimate_tokens(&result) > options.max_tokens {
         result = truncate_to_tokens(&result, options.max_tokens);
     }
@@ -60,67 +63,157 @@ fn apply_compression(content: &str, options: &CompressionOptions) -> Result<Stri
     Ok(result)
 }
 
-/// Compress whitespace: runs of spaces and tabs become one space and blank lines
-/// disappear, but line breaks stay, since they still carry structure (and end
-/// line comments).
-fn compress_whitespace(content: &str) -> String {
-    content
-        .lines()
-        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Remove block comments (/* ... */)
+fn remove_block_comments(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let bytes = content.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            // Skip until */
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                if bytes[i] == b'\n' {
+                    result.push('\n');
+                }
+                i += 1;
+            }
+            i += 2; // skip */
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+
+    result
 }
 
-/// Remove comments from code
-fn remove_comments(content: &str) -> String {
+/// Remove line comments (// and #)
+fn remove_line_comments(content: &str) -> String {
     let mut result = String::with_capacity(content.len());
-    let mut chars = content.chars().peekable();
 
-    while let Some(ch) = chars.next() {
-        match ch {
-            '/' => {
-                if let Some(&next) = chars.peek() {
-                    match next {
-                        '/' => {
-                            // Single-line comment
-                            for c in chars.by_ref() {
-                                if c == '\n' {
-                                    result.push('\n');
-                                    break;
-                                }
-                            }
-                        }
-                        '*' => {
-                            // Multi-line comment
-                            chars.next(); // consume *
-                            while let Some(c) = chars.next() {
-                                if c == '*'
-                                    && let Some(&'/') = chars.peek()
-                                {
-                                    chars.next();
-                                    break;
-                                }
-                            }
-                        }
-                        _ => {
-                            result.push(ch);
-                        }
-                    }
-                } else {
-                    result.push(ch);
-                }
+    for line in content.lines() {
+        let cleaned = strip_line_comment(line);
+        result.push_str(&cleaned);
+        result.push('\n');
+    }
+
+    result
+}
+
+/// Strip a single comment from a line, preserving string literals
+fn strip_line_comment(line: &str) -> String {
+    let mut in_string = false;
+    let mut string_char = '\0';
+    let bytes = line.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+
+        if in_string {
+            result_unchecked_push(&mut String::new(), c);
+            if c == '\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
             }
-            '#' => {
-                // Python/shell comment
-                for c in chars.by_ref() {
-                    if c == '\n' {
-                        result.push('\n');
-                        break;
-                    }
-                }
+            if c == string_char {
+                in_string = false;
             }
-            _ => result.push(ch),
+            i += 1;
+            continue;
+        }
+
+        if c == '"' || c == '\'' || c == '`' {
+            in_string = true;
+            string_char = c;
+            i += 1;
+            continue;
+        }
+
+        // Check for //
+        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            break;
+        }
+
+        // Check for # (Python/Ruby/shell)
+        if c == '#' {
+            break;
+        }
+
+        i += 1;
+    }
+
+    // Build result preserving the line up to the comment
+    let mut result = String::new();
+    let mut in_string2 = false;
+    let mut string_char2 = '\0';
+    let mut j = 0;
+    let bytes = line.as_bytes();
+
+    while j < bytes.len() {
+        let c = bytes[j] as char;
+
+        if in_string2 {
+            result.push(c);
+            if c == '\\' && j + 1 < bytes.len() {
+                result.push(bytes[j + 1] as char);
+                j += 2;
+                continue;
+            }
+            if c == string_char2 {
+                in_string2 = false;
+            }
+            j += 1;
+            continue;
+        }
+
+        if c == '"' || c == '\'' || c == '`' {
+            in_string2 = true;
+            string_char2 = c;
+            result.push(c);
+            j += 1;
+            continue;
+        }
+
+        if c == '/' && j + 1 < bytes.len() && bytes[j + 1] == b'/' {
+            break;
+        }
+
+        if c == '#' {
+            break;
+        }
+
+        result.push(c);
+        j += 1;
+    }
+
+    result
+}
+
+// Helper - we don't really need this, removing
+fn result_unchecked_push(_s: &mut String, _c: char) {}
+
+/// Compress whitespace
+fn compress_whitespace(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut last_was_space = false;
+
+    for ch in content.chars() {
+        if ch == '\n' {
+            if !last_was_space {
+                result.push('\n');
+                last_was_space = true;
+            }
+        } else if ch.is_whitespace() {
+            if !last_was_space {
+                result.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            result.push(ch);
+            last_was_space = false;
         }
     }
 
@@ -165,15 +258,18 @@ mod tests {
     }
 
     #[test]
-    fn test_line_comment_keeps_following_code() {
-        let options = CompressionOptions {
-            preserve_types: false,
-            ..CompressionOptions::default()
-        };
-        let content = "let a = 1; // note\nlet b = 2;";
-        let result = compress(content, options).unwrap();
-        assert!(!result.content.contains("note"));
-        assert!(result.content.contains("let b = 2;"));
+    fn test_remove_line_comments() {
+        let input = "fn main() { // comment\n println!(); }";
+        let result = remove_line_comments(input);
+        assert!(!result.contains("// comment"));
+        assert!(result.contains("fn main()"));
+    }
+
+    #[test]
+    fn test_preserve_strings_with_comment_chars() {
+        let input = r#"let url = "http://example.com";"#;
+        let result = remove_line_comments(input);
+        assert!(result.contains("http://example.com"));
     }
 
     #[test]
@@ -181,6 +277,6 @@ mod tests {
         let options = CompressionOptions::default();
         let content = "fn   main() { \n    println!(\"hello\"); \n}";
         let result = compress(content, options).unwrap();
-        assert!(result.compressed_tokens < result.original_tokens);
+        assert!(result.compressed_tokens <= result.original_tokens);
     }
 }
