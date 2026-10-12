@@ -2,15 +2,33 @@
 //!
 //! Intelligent context reduction with semantic preservation.
 
-use crate::types::{CompressedContext, CompressionOptions, SourceRef, SourceType};
+use crate::types::{CompressedContext, CompressionOptions, Language, SourceRef, SourceType};
 use anyhow::Result;
+
+pub mod ast;
 
 /// Compress context while preserving meaning
 pub fn compress(content: &str, options: CompressionOptions) -> Result<CompressedContext> {
+    compress_with_language(content, options, None)
+}
+
+/// Compress with optional language hint for AST-aware compression
+pub fn compress_with_language(
+    content: &str,
+    options: CompressionOptions,
+    language: Option<Language>,
+) -> Result<CompressedContext> {
     let original_tokens = estimate_tokens(content);
 
-    // Apply compression strategies
-    let compressed = apply_compression(content, &options)?;
+    // Try AST-aware compression first if language is known and is Rust
+    let compressed = if matches!(language, Some(Language::Rust)) {
+        match ast::compress_rust_only(content, &options) {
+            Ok(r) => r.content,
+            Err(_) => apply_compression(content, &options)?,
+        }
+    } else {
+        apply_compression(content, &options)?
+    };
 
     let compressed_tokens = estimate_tokens(&compressed);
     let savings = if original_tokens > 0 {

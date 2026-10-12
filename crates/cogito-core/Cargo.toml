@@ -26,6 +26,9 @@ parking_lot.workspace = true
 whoami.workspace = true
 git2.workspace = true
 rusqlite.workspace = true
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
@@ -50,4 +53,8 @@ harness = false
 
 [[bench]]
 name = "storage_compare"
+harness = false
+
+[[bench]]
+name = "ast_vs_structural"
 harness = false
