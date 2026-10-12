@@ -35,6 +35,10 @@ tree-sitter-python.workspace = true
 tree-sitter-go.workspace = true
 tree-sitter-c-sharp.workspace = true
 tree-sitter-java.workspace = true
+tree-sitter-ruby.workspace = true
+tree-sitter-php.workspace = true
+tree-sitter-kotlin-ng.workspace = true
+tree-sitter-swift.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
@@ -75,4 +79,8 @@ harness = false
 
 [[bench]]
 name = "ast_csharp_java"
+harness = false
+
+[[bench]]
+name = "ast_ruby_php_kotlin_swift"
 harness = false

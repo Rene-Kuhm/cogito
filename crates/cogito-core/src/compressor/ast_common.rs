@@ -47,51 +47,63 @@ pub fn apply_replacements(source: &str, ranges: &[Range]) -> (String, usize) {
     (out, applied)
 }
 
-/// Walk the tree collecting the byte range of every `body` field found on
-/// nodes matching `is_function`, then return the ranges sorted by start.
+/// Walk the tree calling `extract` on every node; collect the `Some` ranges.
+/// Ranges are returned sorted by start byte.
+///
+/// This is the most flexible form: languages whose grammar doesn't use a
+/// `body` field (e.g. Kotlin) can look up the body child by kind directly.
 ///
 /// Nested functions are handled naturally: since we sort by start and skip
 /// overlaps during replacement, an outer body that contains an inner one
 /// simply swallows the inner range.
-pub fn collect_body_ranges<F>(root: Node, is_function: F) -> Vec<Range>
+pub fn collect_ranges<F>(root: Node, extract: F) -> Vec<Range>
 where
-    F: Fn(&str) -> bool,
+    F: Fn(Node) -> Option<Range>,
 {
     let mut ranges = Vec::new();
-    collect_recursive(root, &is_function, &mut ranges);
+    collect_recursive(root, &extract, &mut ranges);
     ranges.sort_by_key(|(s, _)| *s);
     ranges
 }
 
-fn collect_recursive<F>(node: Node, is_function: &F, ranges: &mut Vec<Range>)
+fn collect_recursive<F>(node: Node, extract: &F, ranges: &mut Vec<Range>)
 where
-    F: Fn(&str) -> bool,
+    F: Fn(Node) -> Option<Range>,
 {
-    if is_function(node.kind())
-        && let Some(body) = node.child_by_field_name("body")
-    {
-        // Only replace block-like bodies, never single expressions
-        if is_block_like(body.kind()) {
-            ranges.push((body.start_byte(), body.end_byte()));
-        }
+    if let Some(range) = extract(node) {
+        ranges.push(range);
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_recursive(child, is_function, ranges);
+        collect_recursive(child, extract, ranges);
     }
 }
 
+/// Convenience wrapper: collect the `body` field of every node whose kind
+/// matches `is_function`, restricted to block-like bodies.
+pub fn collect_body_ranges<F>(root: Node, is_function: F) -> Vec<Range>
+where
+    F: Fn(&str) -> bool,
+{
+    collect_ranges(root, |node| {
+        if !is_function(node.kind()) {
+            return None;
+        }
+        let body = node.child_by_field_name("body")?;
+        if is_block_like(body.kind()) {
+            Some((body.start_byte(), body.end_byte()))
+        } else {
+            None
+        }
+    })
+}
+
 /// Kinds that look like a statement block we can replace with `{ /* ... */ }`.
-fn is_block_like(kind: &str) -> bool {
+pub fn is_block_like(kind: &str) -> bool {
     matches!(
         kind,
-        "block"
-            | "statement_block"
-            | "function_body"
-            | "compound_statement"
-            | "class_body"
-            | "declaration_list"
+        "block" | "statement_block" | "function_body" | "compound_statement" | "body_statement"
     )
 }
 

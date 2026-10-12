@@ -18,6 +18,8 @@ pub enum Language {
     CSharp,
     Ruby,
     Php,
+    Kotlin,
+    Swift,
     Unknown,
 }
 
@@ -44,6 +46,12 @@ impl Language {
         }
         if path.join("composer.json").exists() {
             return Ok(Language::Php);
+        }
+        if path.join("build.gradle.kts").exists() || path.join("build.gradle.kts").exists() {
+            return Ok(Language::Kotlin);
+        }
+        if path.join("Package.swift").exists() {
+            return Ok(Language::Swift);
         }
 
         // Fallback: try to detect from code files
@@ -84,6 +92,8 @@ impl Language {
             "cs" => Language::CSharp,
             "rb" => Language::Ruby,
             "php" => Language::Php,
+            "kt" | "kts" => Language::Kotlin,
+            "swift" => Language::Swift,
             _ => Language::Unknown,
         };
 
@@ -102,6 +112,8 @@ impl Language {
             Language::CSharp => vec!["cs"],
             Language::Ruby => vec!["rb"],
             Language::Php => vec!["php"],
+            Language::Kotlin => vec!["kt", "kts"],
+            Language::Swift => vec!["swift"],
             Language::Unknown => vec![],
         }
     }
@@ -119,6 +131,8 @@ impl std::fmt::Display for Language {
             Language::CSharp => write!(f, "C#"),
             Language::Ruby => write!(f, "Ruby"),
             Language::Php => write!(f, "PHP"),
+            Language::Kotlin => write!(f, "Kotlin"),
+            Language::Swift => write!(f, "Swift"),
             Language::Unknown => write!(f, "Unknown"),
         }
     }

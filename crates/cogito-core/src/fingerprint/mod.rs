@@ -81,6 +81,8 @@ fn find_entry_points(path: &Path, language: &Language) -> Result<Vec<PathBuf>> {
         Language::CSharp => &["**/Program.cs", "**/Startup.cs", "**/Application.cs"],
         Language::Ruby => &["**/config.ru", "**/Rakefile", "**/bin/*"],
         Language::Php => &["**/index.php", "**/app.php"],
+        Language::Kotlin => &["**/Main.kt", "**/Application.kt", "**/main.kt"],
+        Language::Swift => &["**/main.swift", "**/App.swift", "**/Package.swift"],
         Language::Unknown => &[],
     };
 
