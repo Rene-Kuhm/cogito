@@ -2,6 +2,7 @@
 //!
 //! Intelligent context harness for AI coding agents.
 
+mod agents;
 mod commands;
 mod mcp;
 
@@ -99,6 +100,27 @@ enum Commands {
 
     /// Run the MCP server over stdio (for AI agents)
     Mcp,
+
+    /// Install Cogito into one or more AI agents
+    Setup {
+        /// Agents to configure (omit for an interactive menu)
+        agents: Vec<String>,
+        /// Configure every detected agent without asking
+        #[arg(long)]
+        all: bool,
+        /// Show what would change without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Remove Cogito from one or more AI agents
+    Uninstall {
+        /// Agents to clean up (omit to remove from every configured agent)
+        agents: Vec<String>,
+        /// Skip the confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 
     /// Start server mode
     Serve {
@@ -253,6 +275,12 @@ async fn main() -> Result<()> {
             commands::project(subcommand).await?;
         }
         Some(Commands::Mcp) => mcp::serve_stdio().await?,
+        Some(Commands::Setup {
+            agents,
+            all,
+            dry_run,
+        }) => commands::setup(agents, all, dry_run)?,
+        Some(Commands::Uninstall { agents, yes }) => commands::uninstall(agents, yes)?,
         Some(Commands::Serve { port, mcp }) => commands::serve(port, mcp).await?,
         Some(Commands::Stats) => commands::stats(args.json).await?,
         Some(Commands::Doctor) => commands::doctor().await?,

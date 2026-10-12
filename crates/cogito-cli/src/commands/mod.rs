@@ -548,46 +548,312 @@ pub async fn stats(json: bool) -> Result<()> {
 pub async fn doctor() -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
 
-    println!("Running diagnostics...");
+    println!("Cogito diagnostics");
     println!();
+    println!("Binary");
+    println!("  cogito    {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  path      {}",
+        std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "(unknown)".into())
+    );
 
-    // Check project directory
-    println!("  Project: {}", cwd.display());
+    println!();
+    println!("Project");
+    println!("  path      {}", cwd.display());
 
-    // Check git
     let has_git = std::process::Command::new("git")
-        .arg("rev-parse")
-        .arg("--git-dir")
+        .args(["rev-parse", "--git-dir"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
     println!(
-        "  Git:     {}",
+        "  git       {}",
         if has_git {
-            "✓ found"
+            "found"
         } else {
-            "○ not a git repo (zone detection will be limited)"
+            "not a repository (zone detection limited to filesystem)"
         }
     );
 
-    // Check for common project files
-    let project_files = [
-        ("Cargo.toml", "Rust project"),
-        ("package.json", "Node.js project"),
-        ("go.mod", "Go project"),
-        ("pyproject.toml", "Python project"),
-        ("Gemfile", "Ruby project"),
-        ("composer.json", "PHP project"),
-    ];
-    for (file, desc) in project_files {
-        if cwd.join(file).exists() {
-            println!("  Project file: ✓ {} ({})", file, desc);
+    let state_db = cwd.join(".cogito/state.db");
+    println!(
+        "  storage   {}",
+        if state_db.exists() {
+            format!("SQLite at {}", state_db.display())
+        } else {
+            "no .cogito/state.db yet (run `cogito scan` or `cogito init`)".to_string()
         }
+    );
+
+    let project_files = [
+        ("Cargo.toml", "Rust"),
+        ("package.json", "Node.js"),
+        ("go.mod", "Go"),
+        ("pyproject.toml", "Python"),
+        ("Gemfile", "Ruby"),
+        ("composer.json", "PHP"),
+        ("build.gradle.kts", "Kotlin"),
+        ("Package.swift", "Swift"),
+    ];
+    let detected: Vec<&str> = project_files
+        .iter()
+        .filter(|(f, _)| cwd.join(f).exists())
+        .map(|(_, d)| *d)
+        .collect();
+    println!(
+        "  language  {}",
+        if detected.is_empty() {
+            "unknown".to_string()
+        } else {
+            detected.join(", ")
+        }
+    );
+
+    // -- Agent integrations --
+    println!();
+    println!("Agent integrations");
+    let home = crate::agents::home_dir()?;
+    for agent in crate::agents::ALL {
+        let status = crate::agents::status(*agent, &home)?;
+        let mark = match status {
+            crate::agents::Status::Configured => "✓",
+            crate::agents::Status::NotConfigured => "○",
+            crate::agents::Status::AgentMissing => "·",
+        };
+        println!("  {mark} {:<20} {}", agent.display(), status.label());
     }
 
     println!();
     println!("✓ Diagnostics complete");
     Ok(())
+}
+
+// ============================================================
+// Agent setup / uninstall
+// ============================================================
+
+/// Resolve the list of agents to act on from CLI arguments.
+fn resolve_agents(agents: &[String]) -> Result<Vec<crate::agents::Agent>> {
+    let mut selected = Vec::new();
+    for name in agents {
+        match crate::agents::Agent::parse(name) {
+            Some(agent) => {
+                if !selected.contains(&agent) {
+                    selected.push(agent);
+                }
+            }
+            None => {
+                eprintln!("Unknown agent: {name}");
+                eprintln!(
+                    "Known agents: {}",
+                    crate::agents::ALL
+                        .iter()
+                        .map(|a| a.id())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                anyhow::bail!("unknown agent `{name}`");
+            }
+        }
+    }
+    Ok(selected)
+}
+
+/// Install Cogito into the requested (or all detected) agents.
+pub fn setup(agents: Vec<String>, all: bool, dry_run: bool) -> Result<()> {
+    let home = crate::agents::home_dir()?;
+    let binary = std::env::current_exe().context("Cannot locate the cogito binary")?;
+
+    let mut selected = resolve_agents(&agents)?;
+    if selected.is_empty() {
+        if all {
+            selected = crate::agents::ALL
+                .iter()
+                .copied()
+                .filter(|a| a.agent_present(&home))
+                .collect();
+        } else {
+            selected = pick_interactively(&home)?;
+        }
+    }
+
+    if selected.is_empty() {
+        println!("Nothing selected. Use `cogito setup <agent>` or `cogito setup --all`.");
+        return Ok(());
+    }
+
+    println!("Home:   {}", home.display());
+    println!("Binary: {}", binary.display());
+    if dry_run {
+        println!("Mode:   dry run (nothing will be written)");
+    }
+    println!();
+
+    for agent in selected {
+        if agent.uses_pi_package() {
+            println!("  {}:", agent.display());
+            println!(
+                "    registers the npm package `{}` in {}",
+                crate::agents::PI_PACKAGE,
+                agent.config_path(&home).display()
+            );
+            println!(
+                "    note: that package is not published yet — the agent will skip it until it is"
+            );
+        }
+
+        if dry_run {
+            let status = crate::agents::status(agent, &home)?;
+            println!(
+                "  {} [{}] -> would {}",
+                agent.display(),
+                status.label(),
+                if status == crate::agents::Status::Configured {
+                    "stay as is"
+                } else {
+                    "write"
+                }
+            );
+            continue;
+        }
+
+        match crate::agents::install(agent, &home, &binary) {
+            Ok(crate::agents::Change::AlreadyCorrect) => {
+                println!("  {} — already configured", agent.display());
+            }
+            Ok(crate::agents::Change::Written { backup }) => {
+                println!("  {} — configured", agent.display());
+                println!("    file:   {}", agent.config_path(&home).display());
+                if let Some(b) = backup {
+                    println!("    backup: {}", b.display());
+                }
+            }
+            Err(e) => {
+                println!("  {} — failed: {e}", agent.display());
+            }
+        }
+    }
+
+    println!();
+    println!("Restart the agent(s) for the MCP server to load.");
+    Ok(())
+}
+
+/// Remove Cogito from the requested (or every configured) agents.
+pub fn uninstall(agents: Vec<String>, yes: bool) -> Result<()> {
+    let home = crate::agents::home_dir()?;
+
+    let mut selected = resolve_agents(&agents)?;
+    if selected.is_empty() {
+        selected = crate::agents::ALL
+            .iter()
+            .copied()
+            .filter(|a| {
+                matches!(
+                    crate::agents::status(*a, &home),
+                    Ok(crate::agents::Status::Configured)
+                )
+            })
+            .collect();
+    }
+
+    if selected.is_empty() {
+        println!("Cogito is not configured in any agent.");
+        return Ok(());
+    }
+
+    if !yes {
+        println!("Cogito will be removed from:");
+        for agent in &selected {
+            println!(
+                "  • {} ({})",
+                agent.display(),
+                agent.config_path(&home).display()
+            );
+        }
+        print!("\nContinue? [y/N] ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    println!();
+    for agent in selected {
+        match crate::agents::uninstall(agent, &home) {
+            Ok(crate::agents::Change::AlreadyCorrect) => {
+                println!("  {} — nothing to do", agent.display());
+            }
+            Ok(crate::agents::Change::Written { backup }) => {
+                println!("  {} — removed", agent.display());
+                if let Some(b) = backup {
+                    println!("    backup: {}", b.display());
+                }
+            }
+            Err(e) => println!("  {} — failed: {e}", agent.display()),
+        }
+    }
+    Ok(())
+}
+
+/// Ask which detected agents to configure.
+fn pick_interactively(home: &Path) -> Result<Vec<crate::agents::Agent>> {
+    let available: Vec<crate::agents::Agent> = crate::agents::ALL
+        .iter()
+        .copied()
+        .filter(|a| a.agent_present(home))
+        .collect();
+
+    if available.is_empty() {
+        println!("No supported agents detected in {}.\n", home.display());
+        println!(
+            "Supported agents: {}",
+            crate::agents::ALL
+                .iter()
+                .map(|a| a.id())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return Ok(Vec::new());
+    }
+
+    println!("Detected agents:");
+    for (i, agent) in available.iter().enumerate() {
+        let status = crate::agents::status(*agent, home)?;
+        println!("  {}) {:<20} {}", i + 1, agent.display(), status.label());
+    }
+    println!("  a) all of them");
+    print!("\nSelect (comma-separated numbers, or `a`): ");
+    use std::io::Write;
+    std::io::stdout().flush()?;
+
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim().to_lowercase();
+
+    if answer == "a" || answer == "all" {
+        return Ok(available);
+    }
+
+    let mut chosen = Vec::new();
+    for part in answer.split(',') {
+        if let Ok(n) = part.trim().parse::<usize>()
+            && n >= 1
+            && n <= available.len()
+        {
+            let agent = available[n - 1];
+            if !chosen.contains(&agent) {
+                chosen.push(agent);
+            }
+        }
+    }
+    Ok(chosen)
 }
 
 /// Export project data

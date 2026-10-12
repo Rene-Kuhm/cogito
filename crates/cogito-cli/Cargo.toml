@@ -29,8 +29,10 @@ chrono.workspace = true
 uuid.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
+toml_edit.workspace = true
 
 [dev-dependencies]
 assert_cmd = "1"
 predicates = "3"
 tempfile = "3"
+serde_json.workspace = true
