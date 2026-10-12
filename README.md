@@ -4,6 +4,8 @@
 
 Cogito optimizes the context AI agents receive — without modifying models or agents. It acts as an intelligent middle layer that reduces token consumption, improves context relevance, and accelerates agent performance.
 
+**Storage**: SQLite (FTS5 + generated columns + WAL). Auto-migrates from legacy JSON files.
+
 ```bash
 # Quick Start
 cargo install cogito-cli          # Install
@@ -47,6 +49,7 @@ Cogito solves this with four core innovations:
 | Feature | What it does | Why it matters |
 |---------|-------------|----------------|
 | **Code Fingerprints** | Minimal structural snapshots of projects | Agents understand structure without reading everything |
+| **SQLite + FTS5** | Single-file local DB with porter stemming | "scalable" matches "scalability"; 309x faster writes than JSON |
 | **Semantic Memory Tags** | Indexed knowledge with zero reading | Query "where is auth?" returns instant answers |
 | **Decision Log** | Structured reasoning that survives sessions | "Why did we choose JWT?" is always answerable |
 | **Context Compressor** | Intelligent context reduction | 50%+ token savings, zero semantic loss |
