@@ -615,18 +615,31 @@ pub async fn doctor() -> Result<()> {
     println!();
     println!("Agent integrations");
     let home = crate::agents::home_dir()?;
+    let binary = std::env::current_exe().context("Cannot locate the cogito binary")?;
+    let mut outdated = 0usize;
     for agent in crate::agents::ALL {
-        let status = crate::agents::status(*agent, &home)?;
+        let status = crate::agents::status(*agent, &home, &binary)?;
         let mark = match status {
             crate::agents::Status::Configured => "✓",
+            crate::agents::Status::Outdated => "!",
             crate::agents::Status::NotConfigured => "○",
             crate::agents::Status::AgentMissing => "·",
         };
+        if status == crate::agents::Status::Outdated {
+            outdated += 1;
+        }
         println!("  {mark} {:<20} {}", agent.display(), status.label());
     }
 
     println!();
-    println!("✓ Diagnostics complete");
+    if outdated > 0 {
+        println!(
+            "{outdated} agent(s) hold a stale entry (a different binary path, or older fields)."
+        );
+        println!("Re-run `cogito setup` to bring them up to date.");
+    } else {
+        println!("✓ Diagnostics complete");
+    }
     Ok(())
 }
 
@@ -685,7 +698,7 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool) -> Result<()> {
                 .filter(|a| a.agent_present(&home))
                 .collect();
         } else {
-            selected = pick_interactively(&home)?;
+            selected = pick_interactively(&home, &binary)?;
         }
     }
 
@@ -726,15 +739,15 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool) -> Result<()> {
         }
 
         if dry_run {
-            let status = crate::agents::status(agent, &home)?;
+            let status = crate::agents::status(agent, &home, &binary)?;
             println!(
                 "  {} [{}] -> would {}",
                 agent.display(),
                 status.label(),
-                if status == crate::agents::Status::Configured {
-                    "stay as is"
-                } else {
-                    "write"
+                match status {
+                    crate::agents::Status::Configured => "stay as is",
+                    crate::agents::Status::Outdated => "update the entry",
+                    _ => "write",
                 }
             );
             continue;
@@ -742,7 +755,7 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool) -> Result<()> {
 
         match crate::agents::install(agent, &home, &binary) {
             Ok(crate::agents::Change::AlreadyCorrect) => {
-                println!("  {} — already configured", agent.display());
+                println!("  {} — already up to date", agent.display());
                 configured.push(agent);
             }
             Ok(crate::agents::Change::Written { backup }) => {
@@ -796,6 +809,7 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool) -> Result<()> {
 /// Remove Cogito from the requested (or every configured) agents.
 pub fn uninstall(agents: Vec<String>, yes: bool) -> Result<()> {
     let home = crate::agents::home_dir()?;
+    let binary = std::env::current_exe().context("Cannot locate the cogito binary")?;
 
     let mut selected = resolve_agents(&agents)?;
     if selected.is_empty() {
@@ -803,10 +817,10 @@ pub fn uninstall(agents: Vec<String>, yes: bool) -> Result<()> {
             .iter()
             .copied()
             .filter(|a| {
-                matches!(
-                    crate::agents::status(*a, &home),
-                    Ok(crate::agents::Status::Configured)
-                )
+                // Include outdated entries: they are Cogito's and must go too.
+                crate::agents::status(*a, &home, &binary)
+                    .map(|s| s.is_present())
+                    .unwrap_or(false)
             })
             .collect();
     }
@@ -855,7 +869,7 @@ pub fn uninstall(agents: Vec<String>, yes: bool) -> Result<()> {
 }
 
 /// Ask which detected agents to configure.
-fn pick_interactively(home: &Path) -> Result<Vec<crate::agents::Agent>> {
+fn pick_interactively(home: &Path, binary: &Path) -> Result<Vec<crate::agents::Agent>> {
     let available: Vec<crate::agents::Agent> = crate::agents::ALL
         .iter()
         .copied()
@@ -877,7 +891,7 @@ fn pick_interactively(home: &Path) -> Result<Vec<crate::agents::Agent>> {
 
     println!("Detected agents:");
     for (i, agent) in available.iter().enumerate() {
-        let status = crate::agents::status(*agent, home)?;
+        let status = crate::agents::status(*agent, home, binary)?;
         println!("  {}) {:<20} {}", i + 1, agent.display(), status.label());
     }
     println!("  a) all of them");

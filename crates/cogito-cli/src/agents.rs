@@ -166,7 +166,11 @@ command -v cogito >/dev/null 2>&1 || exit 0
 # Only touch directories that already look like a project. Scanning
 # unconditionally would create a `.cogito/` in $HOME, or in any unrelated tree
 # an agent happens to start in, and walk the whole thing.
-[ -d .git ] || [ -d .cogito ] || exit 0
+#
+# `-e`, not `-d`: in a git worktree or a submodule `.git` is a *file*
+# containing `gitdir: …`, so a directory test rejects the very repositories
+# most likely to be large.
+[ -e .git ] || [ -d .cogito ] || exit 0
 
 # Bounded, so a huge repository cannot leave a scan running forever.
 # `nohup` survives the SIGHUP this shell gets when it exits.
@@ -193,8 +197,9 @@ export const CogitoPlugin = async ({ directory, $ }) => {
     try {
       // Only touch real projects. Scanning unconditionally would create a
       // `.cogito/` in $HOME or in any tree opencode happens to start in.
+      // `-e`, not `-d`: in a git worktree or submodule `.git` is a file.
       const isProject =
-        (await $`test -d .git`.cwd(directory).quiet().nothrow()).exitCode === 0 ||
+        (await $`test -e .git`.cwd(directory).quiet().nothrow()).exitCode === 0 ||
         (await $`test -d .cogito`.cwd(directory).quiet().nothrow()).exitCode === 0;
       if (!isProject) return;
 
@@ -291,7 +296,10 @@ pub enum Status {
     AgentMissing,
     /// The agent is installed but Cogito is not configured.
     NotConfigured,
-    /// Cogito is configured for this agent.
+    /// Cogito is configured, but not the way this binary would write it:
+    /// a stale command path, a missing field, or an old hook script.
+    Outdated,
+    /// Cogito is configured exactly as this binary would write it.
     Configured,
 }
 
@@ -300,8 +308,14 @@ impl Status {
         match self {
             Status::AgentMissing => "not installed",
             Status::NotConfigured => "installed, cogito missing",
+            Status::Outdated => "configured but outdated",
             Status::Configured => "cogito configured",
         }
+    }
+
+    /// Whether Cogito's configuration is present in any form.
+    pub fn is_present(self) -> bool {
+        matches!(self, Status::Configured | Status::Outdated)
     }
 }
 
@@ -314,8 +328,80 @@ pub enum Change {
     AlreadyCorrect,
 }
 
-/// Inspect whether Cogito is configured for `agent`.
-pub fn status(agent: Agent, home: &Path) -> Result<Status> {
+/// The exact MCP server entry Cogito wants for `agent` at `binary`.
+///
+/// Keeping this in one place is what lets `status` detect a stale entry and
+/// `install` rewrite it, instead of treating "a key named cogito exists" as
+/// success.
+fn desired_server_entry(agent: Agent, bin: &str) -> Value {
+    match agent {
+        Agent::GentleShell => json!({
+            "command": bin,
+            "args": ["mcp"],
+            "exposure": "direct",
+            "description": SERVER_DESCRIPTION,
+        }),
+        Agent::Opencode => json!({
+            "type": "local",
+            "command": [bin, "mcp"],
+            "enabled": true,
+        }),
+        Agent::Crush => json!({
+            "type": "stdio",
+            "command": bin,
+            "args": ["mcp"],
+        }),
+        Agent::Gemini => json!({
+            "command": bin,
+            "args": ["mcp"],
+        }),
+        // Claude Code and any other client using the `mcpServers` shape.
+        _ => json!({
+            "type": "stdio",
+            "command": bin,
+            "args": ["mcp"],
+            "env": {},
+        }),
+    }
+}
+
+/// The TOML fields Cogito wants for Codex, as `(key, expected literal)`.
+fn desired_codex_fields(bin: &str) -> [(&'static str, String); 3] {
+    [
+        ("command", format!("\"{bin}\"")),
+        ("args", "[\"mcp\"]".to_string()),
+        ("enabled", "true".to_string()),
+    ]
+}
+
+/// Compare an existing Codex `[mcp_servers.cogito]` table with the desired fields.
+fn codex_entry_matches(existing: &toml_edit::Item, bin: &str) -> bool {
+    let Some(table) = existing.as_table_like() else {
+        return false;
+    };
+    desired_codex_fields(bin).iter().all(|(key, want)| {
+        table
+            .get(key)
+            .is_some_and(|have| normalize_toml(&have.to_string()) == normalize_toml(want))
+    })
+}
+
+/// Collapse whitespace so `[ "mcp" ]` and `["mcp"]` compare equal.
+fn normalize_toml(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join("")
+}
+
+/// Whether every companion artifact exists with the expected content.
+fn extras_current(agent: Agent, home: &Path, binary: &Path) -> bool {
+    agent.extra_files(home, binary).iter().all(|file| {
+        std::fs::read_to_string(&file.path)
+            .map(|existing| existing == file.content)
+            .unwrap_or(false)
+    })
+}
+
+/// Inspect how `agent` is configured, relative to what `binary` would write.
+pub fn status(agent: Agent, home: &Path, binary: &Path) -> Result<Status> {
     if !agent.agent_present(home) {
         return Ok(Status::AgentMissing);
     }
@@ -324,70 +410,66 @@ pub fn status(agent: Agent, home: &Path) -> Result<Status> {
         return Ok(Status::NotConfigured);
     }
 
+    let bin = binary.display().to_string();
+    let want = desired_server_entry(agent, &bin);
+
     if agent.uses_pi_package() {
         let value = read_json(&path)?;
         let package_ok = value
             .get("packages")
             .and_then(|p| p.as_array())
             .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(PI_PACKAGE)));
+        if !package_ok {
+            return Ok(Status::NotConfigured);
+        }
 
-        let mcp_ok = match agent.mcp_config_path(home) {
-            Some(mcp_path) if mcp_path.exists() => read_json(&mcp_path)?
-                .get("mcpServers")
-                .and_then(|m| m.get(SERVER_KEY))
-                .is_some(),
-            _ => false,
+        let Some(mcp_path) = agent.mcp_config_path(home) else {
+            return Ok(Status::NotConfigured);
         };
-
-        return Ok(if package_ok && mcp_ok {
-            Status::Configured
-        } else {
-            Status::NotConfigured
-        });
+        if !mcp_path.exists() {
+            return Ok(Status::NotConfigured);
+        }
+        let mcp = read_json(&mcp_path)?;
+        let Some(entry) = mcp.get("mcpServers").and_then(|m| m.get(SERVER_KEY)) else {
+            return Ok(Status::NotConfigured);
+        };
+        if entry != &want || !extras_current(agent, home, binary) {
+            return Ok(Status::Outdated);
+        }
+        return Ok(Status::Configured);
     }
 
     if agent == Agent::Codex {
         let text = std::fs::read_to_string(&path)?;
         let doc: toml_edit::DocumentMut = text.parse()?;
-        let present = doc
-            .get("mcp_servers")
-            .and_then(|t| t.get(SERVER_KEY))
-            .is_some();
-        return Ok(if present {
+        let Some(existing) = doc.get("mcp_servers").and_then(|t| t.get(SERVER_KEY)) else {
+            return Ok(Status::NotConfigured);
+        };
+        return Ok(if codex_entry_matches(existing, &bin) {
             Status::Configured
         } else {
-            Status::NotConfigured
+            Status::Outdated
         });
     }
 
     let value = read_json(&path)?;
-    let present = match agent {
-        Agent::Opencode | Agent::Crush => {
-            value.get("mcp").and_then(|m| m.get(SERVER_KEY)).is_some()
-        }
-        _ => value
-            .get("mcpServers")
-            .and_then(|m| m.get(SERVER_KEY))
-            .is_some(),
+    let section = match agent {
+        Agent::Opencode | Agent::Crush => "mcp",
+        _ => "mcpServers",
     };
-    Ok(if !present {
-        Status::NotConfigured
-    } else if !agent
-        .extra_files(home, Path::new("cogito"))
-        .iter()
-        .all(|f| f.path.exists())
-    {
-        // Companion artifacts (hook script, plugin) are part of the install;
-        // without them the harness half would silently be missing.
-        Status::NotConfigured
-    } else {
-        Status::Configured
-    })
+    let Some(entry) = value.get(section).and_then(|m| m.get(SERVER_KEY)) else {
+        return Ok(Status::NotConfigured);
+    };
+
+    if entry != &want || !extras_current(agent, home, binary) {
+        return Ok(Status::Outdated);
+    }
+    Ok(Status::Configured)
 }
 
 /// Configure `agent` to use the `cogito` binary at `binary`.
 pub fn install(agent: Agent, home: &Path, binary: &Path) -> Result<Change> {
-    if status(agent, home)? == Status::Configured {
+    if status(agent, home, binary)? == Status::Configured {
         return Ok(Change::AlreadyCorrect);
     }
 
@@ -420,21 +502,7 @@ pub fn install(agent: Agent, home: &Path, binary: &Path) -> Result<Change> {
                 .or_insert_with(|| json!({}))
                 .as_object_mut()
                 .context("`mcpServers` is not an object")?
-                .insert(
-                    SERVER_KEY.to_string(),
-                    json!({
-                        "command": bin,
-                        "args": ["mcp"],
-                        // Pi defaults every MCP server to `codemode` exposure.
-                        // Gentle Shell ships with `-builtin:codemode`, so under
-                        // the default the model could never reach these tools.
-                        // `direct` declares them like built-in tools, which is
-                        // what the Pi docs recommend for a small, frequently
-                        // used tool set.
-                        "exposure": "direct",
-                        "description": SERVER_DESCRIPTION,
-                    }),
-                );
+                .insert(SERVER_KEY.to_string(), desired_server_entry(agent, &bin));
             write_json(&mcp_path, &mcp)?;
         }
         return Ok(Change::Written { backup });
@@ -471,22 +539,11 @@ pub fn install(agent: Agent, home: &Path, binary: &Path) -> Result<Change> {
     }
 
     let mut value = read_json_or_default(&path);
-    let (section, entry) = match agent {
-        Agent::Opencode => (
-            "mcp",
-            json!({ "type": "local", "command": [bin, "mcp"], "enabled": true }),
-        ),
-        Agent::Crush => (
-            "mcp",
-            json!({ "type": "stdio", "command": bin, "args": ["mcp"] }),
-        ),
-        Agent::Gemini => ("mcpServers", json!({ "command": bin, "args": ["mcp"] })),
-        // Claude Code wants an explicit transport type.
-        _ => (
-            "mcpServers",
-            json!({ "type": "stdio", "command": bin, "args": ["mcp"], "env": {} }),
-        ),
+    let section = match agent {
+        Agent::Opencode | Agent::Crush => "mcp",
+        _ => "mcpServers",
     };
+    let entry = desired_server_entry(agent, &bin);
 
     let obj = value.as_object_mut().context("config is not an object")?;
     obj.entry(section)
@@ -731,14 +788,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            status(Agent::ClaudeCode, home.path()).unwrap(),
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
             Status::NotConfigured
         );
 
         let change = install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
         assert!(matches!(change, Change::Written { backup: Some(_) }));
         assert_eq!(
-            status(Agent::ClaudeCode, home.path()).unwrap(),
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
             Status::Configured
         );
 
@@ -759,7 +816,7 @@ mod tests {
 
         uninstall(Agent::ClaudeCode, home.path()).unwrap();
         assert_eq!(
-            status(Agent::ClaudeCode, home.path()).unwrap(),
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
             Status::NotConfigured
         );
         let value = read_json(&home.path().join(".claude.json")).unwrap();
@@ -789,7 +846,7 @@ mod tests {
         );
         assert!(text.contains("mcp_servers.cogito"), "cogito added: {text}");
         assert_eq!(
-            status(Agent::Codex, home.path()).unwrap(),
+            status(Agent::Codex, home.path(), &bin()).unwrap(),
             Status::Configured
         );
 
@@ -810,7 +867,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            status(Agent::GentleShell, home.path()).unwrap(),
+            status(Agent::GentleShell, home.path(), &bin()).unwrap(),
             Status::NotConfigured
         );
 
@@ -836,7 +893,7 @@ mod tests {
 
         // Both halves present -> configured
         assert_eq!(
-            status(Agent::GentleShell, home.path()).unwrap(),
+            status(Agent::GentleShell, home.path(), &bin()).unwrap(),
             Status::Configured
         );
 
@@ -907,7 +964,7 @@ mod tests {
 
         // Nothing configured yet, and the hook script does not exist.
         assert_eq!(
-            status(Agent::ClaudeCode, home.path()).unwrap(),
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
             Status::NotConfigured
         );
 
@@ -943,7 +1000,7 @@ mod tests {
 
         // Both halves present -> configured
         assert_eq!(
-            status(Agent::ClaudeCode, home.path()).unwrap(),
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
             Status::Configured
         );
 
@@ -981,7 +1038,7 @@ mod tests {
         assert!(source.contains("cogito scan"), "{source}");
 
         assert_eq!(
-            status(Agent::Opencode, home.path()).unwrap(),
+            status(Agent::Opencode, home.path(), &bin()).unwrap(),
             Status::Configured
         );
 
@@ -1002,11 +1059,11 @@ mod tests {
 
         // MCP entry present but the plugin file is not -> not configured yet.
         assert_eq!(
-            status(Agent::Opencode, home.path()).unwrap(),
+            status(Agent::Opencode, home.path(), &bin()).unwrap(),
             Status::AgentMissing
         );
         assert_eq!(
-            status(Agent::ClaudeCode, home.path()).unwrap(),
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
             Status::NotConfigured
         );
     }
@@ -1106,10 +1163,125 @@ mod tests {
     }
 
     #[test]
+    fn test_existing_but_stale_entry_is_reported_and_repaired() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".gentle-shell/agent")).unwrap();
+        std::fs::write(
+            home.path().join(".gentle-shell/agent/settings.json"),
+            format!(r#"{{"packages":["{PI_PACKAGE}"]}}"#),
+        )
+        .unwrap();
+        // An entry written by an older version: no exposure, and the Engram
+        // field that Pi ignores.
+        std::fs::write(
+            home.path().join(".gentle-shell/agent/mcp.json"),
+            r#"{"mcpServers":{"cogito":{"command":"/old/cogito","args":["mcp"],"lifecycle":"lazy"}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            status(Agent::GentleShell, home.path(), &bin()).unwrap(),
+            Status::Outdated,
+            "a stale entry must not be reported as configured"
+        );
+
+        let change = install(Agent::GentleShell, home.path(), &bin()).unwrap();
+        assert!(
+            matches!(change, Change::Written { .. }),
+            "install must repair a stale entry"
+        );
+
+        let mcp = read_json(&home.path().join(".gentle-shell/agent/mcp.json")).unwrap();
+        let entry = &mcp["mcpServers"][SERVER_KEY];
+        assert_eq!(entry["command"], "/usr/local/bin/cogito", "path refreshed");
+        assert_eq!(entry["exposure"], "direct", "missing field added");
+        assert!(entry.get("lifecycle").is_none(), "stale field removed");
+        assert_eq!(
+            status(Agent::GentleShell, home.path(), &bin()).unwrap(),
+            Status::Configured
+        );
+    }
+
+    #[test]
+    fn test_stale_hook_script_is_detected_and_rewritten() {
+        let home = TempDir::new().unwrap();
+        std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+        std::fs::create_dir_all(home.path().join(".claude/hooks")).unwrap();
+
+        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
+            Status::Configured
+        );
+
+        // Simulate a script left behind by an older version.
+        let script = home.path().join(".claude/hooks/cogito-session-start.sh");
+        std::fs::write(&script, "#!/bin/sh\n# old version\n").unwrap();
+
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
+            Status::Outdated,
+            "an out-of-date hook script must be reported"
+        );
+
+        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        let rewritten = std::fs::read_to_string(&script).unwrap();
+        assert!(
+            rewritten.contains("-e .git"),
+            "script refreshed: {rewritten}"
+        );
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
+            Status::Configured
+        );
+    }
+
+    #[test]
+    fn test_changed_binary_path_is_reported_outdated() {
+        let home = TempDir::new().unwrap();
+        std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+
+        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
+            Status::Configured
+        );
+
+        // Same file, different binary: the entry no longer matches.
+        let other = PathBuf::from("/opt/other/cogito");
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path(), &other).unwrap(),
+            Status::Outdated
+        );
+    }
+
+    #[test]
+    fn test_hook_script_detects_worktrees_and_submodules() {
+        // `.git` is a file in a worktree or submodule, so the guard must use
+        // `-e`, not `-d`.
+        let script = CLAUDE_HOOK_SCRIPT;
+        assert!(
+            script.contains("[ -e .git ]"),
+            "hook must accept .git as a file:\n{script}"
+        );
+        assert!(
+            !script.contains("[ -d .git ]"),
+            "a directory test would reject worktrees"
+        );
+
+        let plugin = OPENCODE_PLUGIN;
+        assert!(
+            plugin.contains("test -e .git"),
+            "opencode plugin must accept .git as a file:\n{plugin}"
+        );
+        assert!(!plugin.contains("test -d .git"));
+    }
+
+    #[test]
     fn test_missing_agent_reports_not_installed() {
         let home = TempDir::new().unwrap();
         assert_eq!(
-            status(Agent::Crush, home.path()).unwrap(),
+            status(Agent::Crush, home.path(), &bin()).unwrap(),
             Status::AgentMissing
         );
     }

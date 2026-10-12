@@ -334,7 +334,7 @@ fn test_setup_is_idempotent() {
 
     let stdout = String::from_utf8_lossy(&second.stdout);
     assert!(
-        stdout.contains("already configured"),
+        stdout.contains("already up to date"),
         "second run should be a no-op: {stdout}"
     );
     assert_eq!(
@@ -410,4 +410,88 @@ fn test_doctor_reports_agent_status() {
     assert!(stdout.contains("cogito configured"), "{stdout}");
     // Codex is present but was never configured.
     assert!(stdout.contains("installed, cogito missing"), "{stdout}");
+}
+
+#[test]
+fn test_stale_entry_is_reported_and_repaired_by_setup() {
+    let home = TempDir::new().unwrap();
+    // An entry as an older Cogito would have written it: stale path, missing
+    // `exposure`, and the Engram-only `lifecycle` field.
+    fs::create_dir_all(home.path().join(".gentle-shell/agent")).unwrap();
+    fs::write(
+        home.path().join(".gentle-shell/agent/settings.json"),
+        r#"{"packages":["npm:pi-cogito"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        home.path().join(".gentle-shell/agent/mcp.json"),
+        r#"{"mcpServers":{"cogito":{"command":"/old/cogito","args":["mcp"],"lifecycle":"lazy"}}}"#,
+    )
+    .unwrap();
+
+    // doctor must not claim a stale entry is fine
+    let output = Command::new(cogito_bin())
+        .arg("doctor")
+        .env("COGITO_HOME", home.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("configured but outdated"),
+        "stale entry must be flagged: {stdout}"
+    );
+    assert!(
+        stdout.contains("Re-run `cogito setup`"),
+        "doctor must say how to fix it: {stdout}"
+    );
+
+    // setup repairs it
+    let output = Command::new(cogito_bin())
+        .args(["setup", "gentle-shell"])
+        .env("COGITO_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let mcp: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(home.path().join(".gentle-shell/agent/mcp.json")).unwrap(),
+    )
+    .unwrap();
+    let entry = &mcp["mcpServers"]["cogito"];
+    assert_eq!(entry["exposure"], "direct", "field added: {entry}");
+    assert!(
+        entry.get("lifecycle").is_none(),
+        "stale field removed: {entry}"
+    );
+    assert_ne!(entry["command"], "/old/cogito", "path refreshed: {entry}");
+
+    // and doctor is happy afterwards
+    let output = Command::new(cogito_bin())
+        .arg("doctor")
+        .env("COGITO_HOME", home.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("cogito configured"), "{stdout}");
+    assert!(!stdout.contains("configured but outdated"), "{stdout}");
+}
+
+#[test]
+fn test_setup_accepts_yes_flag() {
+    let home = fake_home();
+    let output = Command::new(cogito_bin())
+        .args(["setup", "-y"])
+        .env("COGITO_HOME", home.path())
+        .output()
+        .expect("setup -y must be accepted");
+    assert!(
+        output.status.success(),
+        "setup -y failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // It must actually configure, not silently no-op.
+    let claude: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(home.path().join(".claude.json")).unwrap())
+            .unwrap();
+    assert!(claude["mcpServers"]["cogito"].is_object());
 }
