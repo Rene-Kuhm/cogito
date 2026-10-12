@@ -10,7 +10,11 @@ pub mod ast_common;
 pub mod ast_csharp;
 pub mod ast_go;
 pub mod ast_java;
+pub mod ast_kotlin;
+pub mod ast_php;
 pub mod ast_py;
+pub mod ast_ruby;
+pub mod ast_swift;
 pub mod ast_ts;
 
 /// Compress context while preserving meaning
@@ -51,6 +55,22 @@ pub fn compress_with_language(
             Err(_) => apply_compression(content, &options)?,
         },
         Some(Language::Java) => match ast_java::compress_java(content, &options) {
+            Ok(r) => r.content,
+            Err(_) => apply_compression(content, &options)?,
+        },
+        Some(Language::Ruby) => match ast_ruby::compress_ruby(content, &options) {
+            Ok(r) => r.content,
+            Err(_) => apply_compression(content, &options)?,
+        },
+        Some(Language::Php) => match ast_php::compress_php(content, &options) {
+            Ok(r) => r.content,
+            Err(_) => apply_compression(content, &options)?,
+        },
+        Some(Language::Kotlin) => match ast_kotlin::compress_kotlin(content, &options) {
+            Ok(r) => r.content,
+            Err(_) => apply_compression(content, &options)?,
+        },
+        Some(Language::Swift) => match ast_swift::compress_swift(content, &options) {
             Ok(r) => r.content,
             Err(_) => apply_compression(content, &options)?,
         },
