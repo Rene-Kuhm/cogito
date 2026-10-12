@@ -6,7 +6,9 @@ use crate::types::{CompressedContext, CompressionOptions, Language, SourceRef, S
 use anyhow::Result;
 
 pub mod ast;
+pub mod ast_csharp;
 pub mod ast_go;
+pub mod ast_java;
 pub mod ast_py;
 pub mod ast_ts;
 
@@ -40,6 +42,14 @@ pub fn compress_with_language(
             Err(_) => apply_compression(content, &options)?,
         },
         Some(Language::Go) => match ast_go::compress_go(content, &options) {
+            Ok(r) => r.content,
+            Err(_) => apply_compression(content, &options)?,
+        },
+        Some(Language::CSharp) => match ast_csharp::compress_csharp(content, &options) {
+            Ok(r) => r.content,
+            Err(_) => apply_compression(content, &options)?,
+        },
+        Some(Language::Java) => match ast_java::compress_java(content, &options) {
             Ok(r) => r.content,
             Err(_) => apply_compression(content, &options)?,
         },

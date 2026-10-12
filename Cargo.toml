@@ -46,6 +46,8 @@ tree-sitter = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-go = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-java = "0.23"
 whoami = "1"
 clap = { version = "4", features = ["derive", "env"] }
 colored = "2"
