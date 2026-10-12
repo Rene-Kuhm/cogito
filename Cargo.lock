@@ -310,6 +310,7 @@ dependencies = [
  "predicates 3.1.4",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
