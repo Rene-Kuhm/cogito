@@ -170,11 +170,7 @@ fn is_code_file(ext: &std::ffi::OsStr, language: &Language) -> bool {
 }
 
 /// Extract imports from file content
-fn extract_imports(
-    file_path: &Path,
-    content: &str,
-    language: &Language,
-) -> Result<Vec<DataFlow>> {
+fn extract_imports(file_path: &Path, content: &str, language: &Language) -> Result<Vec<DataFlow>> {
     let mut flows = Vec::new();
 
     match language {
@@ -211,21 +207,23 @@ fn extract_imports(
 
             for line in content.lines() {
                 if let Some(cap) = import_re.captures(line)
-                    && let Some(module) = cap.get(1) {
-                        flows.push(DataFlow {
-                            from: file_path.to_path_buf(),
-                            to: PathBuf::from(module.as_str()),
-                            flow_type: FlowType::Import,
-                        });
-                    }
+                    && let Some(module) = cap.get(1)
+                {
+                    flows.push(DataFlow {
+                        from: file_path.to_path_buf(),
+                        to: PathBuf::from(module.as_str()),
+                        flow_type: FlowType::Import,
+                    });
+                }
                 if let Some(cap) = from_re.captures(line)
-                    && let Some(module) = cap.get(1) {
-                        flows.push(DataFlow {
-                            from: file_path.to_path_buf(),
-                            to: PathBuf::from(module.as_str()),
-                            flow_type: FlowType::Import,
-                        });
-                    }
+                    && let Some(module) = cap.get(1)
+                {
+                    flows.push(DataFlow {
+                        from: file_path.to_path_buf(),
+                        to: PathBuf::from(module.as_str()),
+                        flow_type: FlowType::Import,
+                    });
+                }
             }
         }
         Language::Go => {
@@ -243,22 +241,24 @@ fn extract_imports(
                         continue;
                     }
                     if let Some(cap) = import_re.captures(trimmed)
-                        && let Some(module) = cap.get(1) {
-                            flows.push(DataFlow {
-                                from: file_path.to_path_buf(),
-                                to: PathBuf::from(module.as_str()),
-                                flow_type: FlowType::Import,
-                            });
-                        }
+                        && let Some(module) = cap.get(1)
+                    {
+                        flows.push(DataFlow {
+                            from: file_path.to_path_buf(),
+                            to: PathBuf::from(module.as_str()),
+                            flow_type: FlowType::Import,
+                        });
+                    }
                 } else if trimmed.starts_with("import ")
                     && let Some(cap) = import_re.captures(trimmed)
-                        && let Some(module) = cap.get(1) {
-                            flows.push(DataFlow {
-                                from: file_path.to_path_buf(),
-                                to: PathBuf::from(module.as_str()),
-                                flow_type: FlowType::Import,
-                            });
-                        }
+                    && let Some(module) = cap.get(1)
+                {
+                    flows.push(DataFlow {
+                        from: file_path.to_path_buf(),
+                        to: PathBuf::from(module.as_str()),
+                        flow_type: FlowType::Import,
+                    });
+                }
             }
         }
         _ => {}
@@ -293,8 +293,8 @@ fn detect_zones_path(path: &Path) -> Result<Vec<Zone>> {
             continue;
         };
 
-        let commit_time = DateTime::<Utc>::from_timestamp(commit.time().seconds(), 0)
-            .unwrap_or_else(Utc::now);
+        let commit_time =
+            DateTime::<Utc>::from_timestamp(commit.time().seconds(), 0).unwrap_or_else(Utc::now);
 
         let walk_result = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
             let Some(entry_name) = entry.name() else {
@@ -330,7 +330,8 @@ fn detect_zones_path(path: &Path) -> Result<Vec<Zone>> {
             ZoneFrequency::Frozen
         } else if stats.commit_count > HOT_MIN_COMMITS && age < Duration::days(HOT_THRESHOLD_DAYS) {
             ZoneFrequency::Hot
-        } else if stats.commit_count > WARM_MIN_COMMITS && age < Duration::days(WARM_THRESHOLD_DAYS) {
+        } else if stats.commit_count > WARM_MIN_COMMITS && age < Duration::days(WARM_THRESHOLD_DAYS)
+        {
             ZoneFrequency::Warm
         } else {
             ZoneFrequency::Cold

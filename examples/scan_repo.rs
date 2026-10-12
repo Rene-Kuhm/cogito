@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo run --example scan_repo
 
-use cogito_core::{Cogito, Project, Language};
+use cogito_core::{Cogito, Language, Project};
 use std::path::PathBuf;
 
 #[tokio::main]
