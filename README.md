@@ -7,11 +7,18 @@ Cogito optimizes the context AI agents receive — without modifying models or a
 **Storage**: SQLite (FTS5 + generated columns + WAL). Auto-migrates from legacy JSON files.
 
 ```bash
-# Quick Start
-cargo install cogito-cli          # Install
-cogito init                       # Initialize project
-cogito scan                       # Generate fingerprint
-cogito compress context.txt      # Compress context
+# Install
+curl -fsSL https://raw.githubusercontent.com/Rene-Kuhm/cogito/main/install.sh | sh
+
+# Wire it into the agents you use (backs up every file it touches)
+cogito setup
+
+# Check what is configured
+cogito doctor
+
+# Use it
+cogito scan                    # code fingerprint
+cogito query "where is auth?"  # search knowledge
 ```
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org)
@@ -23,20 +30,28 @@ cogito compress context.txt      # Compress context
 
 ## Works with everything
 
-Cogito is **editor- and agent-agnostic**. It speaks CLI, MCP, and REST. Pick what fits your tool:
+Cogito ships one binary and configures your agents for you. `cogito setup`
+writes each agent's config, backing up every file first:
 
-| Tool | Integration |
+| Agent | Integration |
 |---|---|
-| **Gentle Shell (pi)** | First-class skill — see [`skills/cogito/SKILL.md`](skills/cogito/SKILL.md) |
-| **Claude Code** | MCP server (one config block) |
-| **Cursor** | MCP server |
-| **Continue (VSCode)** | MCP server |
-| **Neovim** | CLI + [`mcphub.nvim`](https://github.com/ravitemer/mcphub.nvim) |
-| **Aider** | Shell hook |
-| **Zed** | MCP server |
-| **Any agent** | REST API on `localhost:8080` |
+| **Gentle Shell (pi)** | `pi-cogito` package + lazy MCP — status line, `/cogito`, session-start scan |
+| **Claude Code** | MCP + `SessionStart` hook |
+| **opencode** | MCP + session plugin |
+| **Codex** | MCP (`[mcp_servers.cogito]` in `~/.codex/config.toml`) |
+| **Gemini CLI** | MCP |
+| **Crush** | MCP |
+| **Cursor / Zed / any MCP client** | one config block |
+| **Any agent without MCP** | CLI or REST API on `localhost:8080` |
 
-Full setup instructions for every tool: [`docs/integrations.md`](docs/integrations.md).
+```bash
+cogito setup              # interactive menu of detected agents
+cogito setup --all        # configure everything detected
+cogito setup --dry-run    # show what would change
+cogito uninstall          # remove, keeping backups
+```
+
+Full per-agent detail: [`docs/integrations.md`](docs/integrations.md).
 
 ---
 
