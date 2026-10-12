@@ -28,6 +28,7 @@ pub mod decision;
 pub mod fingerprint;
 pub mod persistence;
 pub mod semantic;
+pub mod storage;
 pub mod types;
 
 use anyhow::Result;
