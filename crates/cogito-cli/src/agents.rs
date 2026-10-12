@@ -328,11 +328,11 @@ pub enum Change {
     AlreadyCorrect,
 }
 
-/// The exact MCP server entry Cogito wants for `agent` at `binary`.
+/// The MCP server entry Cogito wants for `agent` at `binary`.
 ///
 /// Keeping this in one place is what lets `status` detect a stale entry and
-/// `install` rewrite it, instead of treating "a key named cogito exists" as
-/// success.
+/// `install` repair it, instead of treating "a key named cogito exists" as
+/// success. See `OWNED_KEYS` for which of these fields are enforced.
 fn desired_server_entry(agent: Agent, bin: &str) -> Value {
     match agent {
         Agent::GentleShell => json!({
@@ -365,25 +365,72 @@ fn desired_server_entry(agent: Agent, bin: &str) -> Value {
     }
 }
 
-/// The TOML fields Cogito wants for Codex, as `(key, expected literal)`.
-fn desired_codex_fields(bin: &str) -> [(&'static str, String); 3] {
+/// Keys that say how to launch the server. Cogito owns them: a different value
+/// means the entry is stale, and `install` overwrites it.
+///
+/// Every other key in the desired entry (`exposure`, `enabled`, `env`, …) is a
+/// default: written when missing, but a value already there is the user's
+/// choice — for example Pi's `/mcp` writes `"enabled": false` into this same
+/// entry — and is kept.
+const OWNED_KEYS: &[&str] = &["type", "command", "args"];
+
+/// Keys older versions wrote that no agent reads. Their presence means stale.
+const RETIRED_KEYS: &[&str] = &["lifecycle"];
+
+/// Whether an existing JSON server entry already has what Cogito would write.
+fn entry_current(entry: &Value, want: &Value) -> bool {
+    let (Some(have), Some(want)) = (entry.as_object(), want.as_object()) else {
+        return false;
+    };
+    if RETIRED_KEYS.iter().any(|key| have.contains_key(*key)) {
+        return false;
+    }
+    want.iter().all(|(key, value)| match have.get(key) {
+        None => false,
+        Some(existing) => !OWNED_KEYS.contains(&key.as_str()) || existing == value,
+    })
+}
+
+/// Merge the desired entry into an existing one: owned keys are overwritten,
+/// defaults only fill gaps, retired keys go, and anything else stays.
+fn merge_server_entry(existing: Option<&Value>, want: Value) -> Value {
+    let mut merged = existing
+        .and_then(|e| e.as_object())
+        .cloned()
+        .unwrap_or_default();
+    for key in RETIRED_KEYS {
+        merged.remove(*key);
+    }
+    if let Value::Object(want) = want {
+        for (key, value) in want {
+            if OWNED_KEYS.contains(&key.as_str()) || !merged.contains_key(&key) {
+                merged.insert(key, value);
+            }
+        }
+    }
+    Value::Object(merged)
+}
+
+/// The TOML fields Cogito owns for Codex, as `(key, expected literal)`.
+fn desired_codex_fields(bin: &str) -> [(&'static str, String); 2] {
     [
         ("command", format!("\"{bin}\"")),
         ("args", "[\"mcp\"]".to_string()),
-        ("enabled", "true".to_string()),
     ]
 }
 
-/// Compare an existing Codex `[mcp_servers.cogito]` table with the desired fields.
+/// Compare an existing Codex `[mcp_servers.cogito]` table with the desired
+/// fields. `enabled` only has to exist: its value is the user's choice.
 fn codex_entry_matches(existing: &toml_edit::Item, bin: &str) -> bool {
     let Some(table) = existing.as_table_like() else {
         return false;
     };
-    desired_codex_fields(bin).iter().all(|(key, want)| {
-        table
-            .get(key)
-            .is_some_and(|have| normalize_toml(&have.to_string()) == normalize_toml(want))
-    })
+    table.contains_key("enabled")
+        && desired_codex_fields(bin).iter().all(|(key, want)| {
+            table
+                .get(key)
+                .is_some_and(|have| normalize_toml(&have.to_string()) == normalize_toml(want))
+        })
 }
 
 /// Collapse whitespace so `[ "mcp" ]` and `["mcp"]` compare equal.
@@ -398,6 +445,28 @@ fn extras_current(agent: Agent, home: &Path, binary: &Path) -> bool {
             .map(|existing| existing == file.content)
             .unwrap_or(false)
     })
+}
+
+/// Whether the agent's settings still reference Cogito's session hook. The
+/// script existing on disk is not enough: without the entry it never runs.
+fn hook_registered(agent: Agent, home: &Path) -> Result<bool> {
+    if !agent.has_session_hook() {
+        return Ok(true);
+    }
+    let (Some(hook_path), Some(script)) =
+        (hook_config_path(agent, home), agent.hook_script_path(home))
+    else {
+        return Ok(true);
+    };
+    if !hook_path.exists() {
+        return Ok(false);
+    }
+    let settings = read_json(&hook_path)?;
+    Ok(settings
+        .get("hooks")
+        .and_then(|h| h.get("SessionStart"))
+        .and_then(|s| s.as_array())
+        .is_some_and(|entries| entries.iter().any(|e| entry_owns_script(e, &script))))
 }
 
 /// Inspect how `agent` is configured, relative to what `binary` would write.
@@ -433,7 +502,7 @@ pub fn status(agent: Agent, home: &Path, binary: &Path) -> Result<Status> {
         let Some(entry) = mcp.get("mcpServers").and_then(|m| m.get(SERVER_KEY)) else {
             return Ok(Status::NotConfigured);
         };
-        if entry != &want || !extras_current(agent, home, binary) {
+        if !entry_current(entry, &want) || !extras_current(agent, home, binary) {
             return Ok(Status::Outdated);
         }
         return Ok(Status::Configured);
@@ -461,7 +530,10 @@ pub fn status(agent: Agent, home: &Path, binary: &Path) -> Result<Status> {
         return Ok(Status::NotConfigured);
     };
 
-    if entry != &want || !extras_current(agent, home, binary) {
+    if !entry_current(entry, &want)
+        || !extras_current(agent, home, binary)
+        || !hook_registered(agent, home)?
+    {
         return Ok(Status::Outdated);
     }
     Ok(Status::Configured)
@@ -498,11 +570,14 @@ pub fn install(agent: Agent, home: &Path, binary: &Path) -> Result<Change> {
             let _ = backup_file(&mcp_path)?;
             let mut mcp = read_json_or_default(&mcp_path);
             let obj = mcp.as_object_mut().context("mcp.json is not an object")?;
-            obj.entry("mcpServers")
+            let servers = obj
+                .entry("mcpServers")
                 .or_insert_with(|| json!({}))
                 .as_object_mut()
-                .context("`mcpServers` is not an object")?
-                .insert(SERVER_KEY.to_string(), desired_server_entry(agent, &bin));
+                .context("`mcpServers` is not an object")?;
+            let merged =
+                merge_server_entry(servers.get(SERVER_KEY), desired_server_entry(agent, &bin));
+            servers.insert(SERVER_KEY.to_string(), merged);
             write_json(&mcp_path, &mcp)?;
         }
         return Ok(Change::Written { backup });
@@ -525,11 +600,19 @@ pub fn install(agent: Agent, home: &Path, binary: &Path) -> Result<Change> {
         // Render as `[mcp_servers.cogito]` rather than a bare `[mcp_servers]`.
         servers.set_implicit(true);
 
-        let mut server = toml_edit::Table::new();
+        // Edit the existing table in place so fields Cogito does not own (a
+        // user's `enabled = false`, `env`, timeouts) survive a repair.
+        if !servers.get(SERVER_KEY).is_some_and(|item| item.is_table()) {
+            servers.insert(SERVER_KEY, toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        let server = servers[SERVER_KEY]
+            .as_table_mut()
+            .context("`mcp_servers.cogito` is not a table")?;
         server["command"] = toml_edit::value(bin);
         server["args"] = toml_edit::value(toml_edit::Array::from_iter(["mcp"]));
-        server["enabled"] = toml_edit::value(true);
-        servers.insert(SERVER_KEY, toml_edit::Item::Table(server));
+        if !server.contains_key("enabled") {
+            server["enabled"] = toml_edit::value(true);
+        }
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -543,14 +626,14 @@ pub fn install(agent: Agent, home: &Path, binary: &Path) -> Result<Change> {
         Agent::Opencode | Agent::Crush => "mcp",
         _ => "mcpServers",
     };
-    let entry = desired_server_entry(agent, &bin);
-
     let obj = value.as_object_mut().context("config is not an object")?;
-    obj.entry(section)
+    let servers = obj
+        .entry(section)
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .with_context(|| format!("`{section}` is not an object"))?
-        .insert(SERVER_KEY.to_string(), entry);
+        .with_context(|| format!("`{section}` is not an object"))?;
+    let merged = merge_server_entry(servers.get(SERVER_KEY), desired_server_entry(agent, &bin));
+    servers.insert(SERVER_KEY.to_string(), merged);
 
     write_json(&path, &value)?;
 
@@ -1198,6 +1281,106 @@ mod tests {
         assert!(entry.get("lifecycle").is_none(), "stale field removed");
         assert_eq!(
             status(Agent::GentleShell, home.path(), &bin()).unwrap(),
+            Status::Configured
+        );
+    }
+
+    #[test]
+    fn test_user_choices_in_the_entry_survive_status_and_repair() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".gentle-shell/agent")).unwrap();
+        std::fs::write(
+            home.path().join(".gentle-shell/agent/settings.json"),
+            format!(r#"{{"packages":["{PI_PACKAGE}"]}}"#),
+        )
+        .unwrap();
+        install(Agent::GentleShell, home.path(), &bin()).unwrap();
+
+        // What Pi's `/mcp` writes when the user turns the server off and picks
+        // another exposure, plus a field of their own.
+        let mcp_path = home.path().join(".gentle-shell/agent/mcp.json");
+        let mut mcp = read_json(&mcp_path).unwrap();
+        let entry = mcp["mcpServers"][SERVER_KEY].as_object_mut().unwrap();
+        entry.insert("enabled".into(), json!(false));
+        entry.insert("exposure".into(), json!("deferred"));
+        entry.insert("timeout".into(), json!(120));
+        write_json(&mcp_path, &mcp).unwrap();
+
+        assert_eq!(
+            status(Agent::GentleShell, home.path(), &bin()).unwrap(),
+            Status::Configured,
+            "user choices are not staleness"
+        );
+
+        // A moved binary makes it stale; the repair must keep the choices.
+        let other = PathBuf::from("/opt/other/cogito");
+        assert_eq!(
+            status(Agent::GentleShell, home.path(), &other).unwrap(),
+            Status::Outdated
+        );
+        install(Agent::GentleShell, home.path(), &other).unwrap();
+        let entry = &read_json(&mcp_path).unwrap()["mcpServers"][SERVER_KEY];
+        assert_eq!(entry["command"], "/opt/other/cogito");
+        assert_eq!(entry["enabled"], false);
+        assert_eq!(entry["exposure"], "deferred");
+        assert_eq!(entry["timeout"], 120);
+    }
+
+    #[test]
+    fn test_codex_repair_keeps_user_fields() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            "[mcp_servers.cogito]\ncommand = \"/old/cogito\"\nargs = [\"mcp\"]\nenabled = false\nstartup_timeout_sec = 30\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            status(Agent::Codex, home.path(), &bin()).unwrap(),
+            Status::Outdated
+        );
+        install(Agent::Codex, home.path(), &bin()).unwrap();
+
+        let text = std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+        assert!(text.contains("/usr/local/bin/cogito"), "{text}");
+        assert!(text.contains("enabled = false"), "{text}");
+        assert!(text.contains("startup_timeout_sec = 30"), "{text}");
+        assert_eq!(
+            status(Agent::Codex, home.path(), &bin()).unwrap(),
+            Status::Configured
+        );
+    }
+
+    #[test]
+    fn test_missing_claude_hook_entry_is_outdated_and_restored() {
+        let home = TempDir::new().unwrap();
+        std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+
+        // The script is still on disk, but settings no longer run it.
+        let settings_path = home.path().join(".claude/settings.json");
+        std::fs::write(&settings_path, "{}").unwrap();
+
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
+            Status::Outdated,
+            "a hook script nothing runs is not configured"
+        );
+
+        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        let script = Agent::ClaudeCode.hook_script_path(home.path()).unwrap();
+        let settings = read_json(&settings_path).unwrap();
+        assert!(
+            settings["hooks"]["SessionStart"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| entry_owns_script(e, &script)),
+            "hook entry restored: {settings}"
+        );
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
             Status::Configured
         );
     }
