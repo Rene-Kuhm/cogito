@@ -77,12 +77,13 @@ pub enum Error {{
         .current_dir(root)
         .output();
     // Make a first commit on whatever default branch git uses
+    // Use legacy "key value" form which works on both old and new git
     let _ = std::process::Command::new("git")
-        .args(["config", "user.email=bench@bench"])
+        .args(["config", "user.email", "bench@bench"])
         .current_dir(root)
         .output();
     let _ = std::process::Command::new("git")
-        .args(["config", "user.name=Bench"])
+        .args(["config", "user.name", "Bench"])
         .current_dir(root)
         .output();
     let _ = std::process::Command::new("git")
