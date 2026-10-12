@@ -26,6 +26,7 @@
 pub mod compressor;
 pub mod decision;
 pub mod fingerprint;
+pub mod persistence;
 pub mod semantic;
 pub mod types;
 
@@ -58,10 +59,20 @@ impl Cogito {
 
     /// Initialize a new project
     pub fn init_project(&self, path: PathBuf) -> Result<Project> {
-        let language = Language::detect(&path)?;
+        // Detect language: if path is a directory, use project detection; otherwise use file extension
+        let language = if path.is_dir() {
+            Language::detect_project(&path)?
+        } else {
+            Language::detect(&path)?
+        };
+
+        // Use a deterministic project_id based on the absolute path so
+        // decisions/tags persist across CLI invocations.
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let id = Uuid::new_v5(&Uuid::NAMESPACE_OID, canonical.to_string_lossy().as_bytes());
 
         Ok(Project {
-            id: Uuid::new_v4(),
+            id,
             path: path.clone(),
             name: path
                 .file_name()

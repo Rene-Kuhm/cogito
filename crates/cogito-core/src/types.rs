@@ -22,7 +22,55 @@ pub enum Language {
 }
 
 impl Language {
-    /// Detect language from file path
+    /// Detect language from a project directory by checking for marker files
+    pub fn detect_project(path: &Path) -> anyhow::Result<Self> {
+        if path.join("Cargo.toml").exists() {
+            return Ok(Language::Rust);
+        }
+        if path.join("package.json").exists() {
+            if path.join("tsconfig.json").exists() {
+                return Ok(Language::TypeScript);
+            }
+            return Ok(Language::JavaScript);
+        }
+        if path.join("go.mod").exists() {
+            return Ok(Language::Go);
+        }
+        if path.join("pyproject.toml").exists() || path.join("setup.py").exists() {
+            return Ok(Language::Python);
+        }
+        if path.join("Gemfile").exists() {
+            return Ok(Language::Ruby);
+        }
+        if path.join("composer.json").exists() {
+            return Ok(Language::Php);
+        }
+
+        // Fallback: try to detect from code files
+        for entry in walkdir::WalkDir::new(path)
+            .max_depth(3)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.file_type().is_file()
+                && let Some(ext) = entry.path().extension()
+            {
+                let lang = match ext.to_string_lossy().to_lowercase().as_str() {
+                    "rs" => Some(Language::Rust),
+                    "ts" | "tsx" => Some(Language::TypeScript),
+                    "py" => Some(Language::Python),
+                    "go" => Some(Language::Go),
+                    _ => None,
+                };
+                if let Some(l) = lang {
+                    return Ok(l);
+                }
+            }
+        }
+        Ok(Language::Unknown)
+    }
+
+    /// Detect language from file path (extension)
     pub fn detect(path: &Path) -> anyhow::Result<Self> {
         let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
