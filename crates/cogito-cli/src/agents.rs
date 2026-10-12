@@ -138,7 +138,118 @@ impl Agent {
     }
 }
 
-/// Result of inspecting one agent.
+/// A file Cogito needs to create alongside an agent's main config.
+#[derive(Debug, Clone)]
+pub struct ExtraFile {
+    pub path: PathBuf,
+    pub content: String,
+    pub executable: bool,
+}
+
+/// Marker that identifies Cogito-owned hook entries inside a JSON array.
+const HOOK_MARKER: &str = "cogito";
+
+/// The Claude Code SessionStart hook script.
+const CLAUDE_HOOK_SCRIPT: &str = r#"#!/bin/sh
+# Cogito SessionStart hook.
+#
+# Warms the project fingerprint so the first query in the session is fast.
+# Runs in the background and never fails the session: if `cogito` is not on
+# PATH, or the scan fails, this exits quietly.
+
+command -v cogito >/dev/null 2>&1 || exit 0
+
+# `nohup` keeps the scan alive after the hook process exits.
+nohup cogito scan --quiet >/dev/null 2>&1 &
+exit 0
+"#;
+
+/// The opencode plugin.
+const OPENCODE_PLUGIN: &str = r#"// Cogito plugin for opencode.
+//
+// Warms the project fingerprint when a session starts so the first query is
+// fast, and exposes `/cogito` through the plugin's command surface.
+//
+// The MCP tools come from the `mcp.cogito` entry in opencode.json; this
+// plugin only reacts to session lifecycle events.
+
+export const CogitoPlugin = async ({ directory, $ }) => {
+  const scan = async () => {
+    try {
+      await $`cogito scan --quiet`.cwd(directory).quiet();
+    } catch {
+      // Cogito missing or the scan failed: never block the session.
+    }
+  };
+
+  return {
+    event: async ({ event }) => {
+      if (event?.type === "session.created" || event?.type === "session.start") {
+        // Fire and forget.
+        void scan();
+      }
+    },
+  };
+};
+
+export default CogitoPlugin;
+"#;
+
+impl Agent {
+    /// Files Cogito writes besides the agent's main configuration file.
+    pub fn extra_files(self, home: &Path, _binary: &Path) -> Vec<ExtraFile> {
+        match self {
+            Agent::ClaudeCode => vec![ExtraFile {
+                path: home.join(".claude/hooks/cogito-session-start.sh"),
+                content: CLAUDE_HOOK_SCRIPT.to_string(),
+                executable: true,
+            }],
+            Agent::Opencode => vec![ExtraFile {
+                path: home.join(".config/opencode/plugins/cogito.js"),
+                content: OPENCODE_PLUGIN.to_string(),
+                executable: false,
+            }],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether this agent supports a session-start hook in its config file.
+    fn has_session_hook(self) -> bool {
+        matches!(self, Agent::ClaudeCode)
+    }
+}
+
+/// Write (or refresh) every extra file for `agent`.
+fn write_extra_files(agent: Agent, home: &Path, binary: &Path) -> Result<()> {
+    for file in agent.extra_files(home, binary) {
+        if let Some(parent) = file.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        std::fs::write(&file.path, &file.content)
+            .with_context(|| format!("Failed to write {}", file.path.display()))?;
+
+        #[cfg(unix)]
+        if file.executable {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&file.path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&file.path, perms)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove every extra file belonging to `agent`.
+fn remove_extra_files(agent: Agent, home: &Path, binary: &Path) -> Result<()> {
+    for file in agent.extra_files(home, binary) {
+        if file.path.exists() {
+            std::fs::remove_file(&file.path)
+                .with_context(|| format!("Failed to remove {}", file.path.display()))?;
+        }
+    }
+    Ok(())
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     /// The agent is not installed on this machine.
@@ -224,10 +335,18 @@ pub fn status(agent: Agent, home: &Path) -> Result<Status> {
             .and_then(|m| m.get(SERVER_KEY))
             .is_some(),
     };
-    Ok(if present {
-        Status::Configured
-    } else {
+    Ok(if !present {
         Status::NotConfigured
+    } else if !agent
+        .extra_files(home, Path::new("cogito"))
+        .iter()
+        .all(|f| f.path.exists())
+    {
+        // Companion artifacts (hook script, plugin) are part of the install;
+        // without them the harness half would silently be missing.
+        Status::NotConfigured
+    } else {
+        Status::Configured
     })
 }
 
@@ -331,6 +450,28 @@ pub fn install(agent: Agent, home: &Path, binary: &Path) -> Result<Change> {
         .insert(SERVER_KEY.to_string(), entry);
 
     write_json(&path, &value)?;
+
+    // Companion artifacts: hook scripts and plugins that run without the model
+    // asking. Written once the MCP entry is in place so a failure here leaves a
+    // working (if less automatic) setup.
+    write_extra_files(agent, home, binary)?;
+
+    if agent.has_session_hook()
+        && let Some(hook_path) = hook_config_path(agent, home)
+    {
+        let _ = backup_file(&hook_path)?;
+        let mut settings = read_json_or_default(&hook_path);
+        let script = agent
+            .extra_files(home, binary)
+            .into_iter()
+            .next()
+            .map(|f| f.path)
+            .context("session-hook agent has no extra file")?;
+        let command = format!("sh '{}'", script.display());
+        upsert_session_hook(&mut settings, &command)?;
+        write_json(&hook_path, &settings)?;
+    }
+
     Ok(Change::Written { backup })
 }
 
@@ -383,12 +524,98 @@ pub fn uninstall(agent: Agent, home: &Path) -> Result<Change> {
         table.remove(SERVER_KEY);
     }
     write_json(&path, &value)?;
+
+    if agent.has_session_hook()
+        && let Some(hook_path) = hook_config_path(agent, home)
+        && hook_path.exists()
+    {
+        let _ = backup_file(&hook_path)?;
+        let mut settings = read_json(&hook_path)?;
+        remove_session_hook(&mut settings);
+        write_json(&hook_path, &settings)?;
+    }
+
+    remove_extra_files(agent, home, &PathBuf::from("cogito"))?;
     Ok(Change::Written { backup })
 }
 
 // ============================================================
 // Helpers
 // ============================================================
+
+/// Insert a `SessionStart` hook into a Claude-Code-style settings object.
+///
+/// Idempotent: an entry whose command already mentions Cogito is left alone.
+fn upsert_session_hook(value: &mut Value, command: &str) -> Result<()> {
+    let obj = value.as_object_mut().context("settings is not an object")?;
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("`hooks` is not an object")?;
+    let session_start = hooks
+        .entry("SessionStart")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .context("`hooks.SessionStart` is not an array")?;
+
+    let already = session_start.iter().any(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .is_some_and(|arr| {
+                arr.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.contains(HOOK_MARKER))
+                })
+            })
+    });
+
+    if !already {
+        session_start.push(json!({
+            "matcher": "^(startup|resume|clear|compact|fork)$",
+            "hooks": [{
+                "type": "command",
+                "command": command,
+                "timeout": 10,
+                "async": true
+            }]
+        }));
+    }
+    Ok(())
+}
+
+/// Remove Cogito-owned entries from a Claude-Code-style `SessionStart` hook list.
+fn remove_session_hook(value: &mut Value) {
+    if let Some(arr) = value
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut("SessionStart"))
+        .and_then(|s| s.as_array_mut())
+    {
+        arr.retain(|entry| {
+            !entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .is_some_and(|hooks| {
+                    hooks.iter().any(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(|c| c.contains(HOOK_MARKER))
+                    })
+                })
+        });
+    }
+}
+
+/// Configuration file that holds session hooks, when it differs from the file
+/// that holds MCP servers (Claude Code keeps them in two files).
+fn hook_config_path(agent: Agent, home: &Path) -> Option<PathBuf> {
+    match agent {
+        Agent::ClaudeCode => Some(home.join(".claude/settings.json")),
+        _ => None,
+    }
+}
 
 fn read_json(path: &Path) -> Result<Value> {
     let text = std::fs::read_to_string(path)
@@ -622,6 +849,127 @@ mod tests {
         assert_eq!(
             value["mcpServers"]["cogito"]["command"],
             "/usr/local/bin/cogito"
+        );
+    }
+
+    #[test]
+    fn test_claude_install_writes_hook_script_and_registers_it() {
+        let home = TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join(".claude.json"),
+            r#"{"numStartups":1,"mcpServers":{}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            r#"{"model":"opus","hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","command":"bash other.sh"}]}]}}"#,
+        )
+        .unwrap();
+
+        // Nothing configured yet, and the hook script does not exist.
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path()).unwrap(),
+            Status::NotConfigured
+        );
+
+        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+
+        // 1. The hook script exists and is executable.
+        let script = home.path().join(".claude/hooks/cogito-session-start.sh");
+        assert!(script.exists(), "hook script written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "hook script must be executable");
+        }
+
+        // 2. It is registered in settings.json without disturbing the rest.
+        let settings = read_json(&home.path().join(".claude/settings.json")).unwrap();
+        assert_eq!(settings["model"], "opus");
+        let session_start = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session_start.len(), 2, "existing hook kept, cogito added");
+        assert!(
+            session_start
+                .iter()
+                .any(|e| e["hooks"][0]["command"] == "bash other.sh"),
+            "pre-existing hook preserved"
+        );
+        assert!(
+            session_start.iter().any(|e| e["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.contains("cogito-session-start"))),
+            "cogito hook registered"
+        );
+
+        // Both halves present -> configured
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path()).unwrap(),
+            Status::Configured
+        );
+
+        // Idempotent: installing again must not duplicate the hook
+        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        let settings = read_json(&home.path().join(".claude/settings.json")).unwrap();
+        assert_eq!(
+            settings["hooks"]["SessionStart"].as_array().unwrap().len(),
+            2,
+            "no duplicate hook"
+        );
+
+        // Uninstall removes the hook and the script, keeps the other hook
+        uninstall(Agent::ClaudeCode, home.path()).unwrap();
+        assert!(!script.exists(), "hook script removed");
+        let settings = read_json(&home.path().join(".claude/settings.json")).unwrap();
+        let session_start = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session_start.len(), 1);
+        assert_eq!(session_start[0]["hooks"][0]["command"], "bash other.sh");
+    }
+
+    #[test]
+    fn test_opencode_install_writes_plugin() {
+        let home = TempDir::new().unwrap();
+        let cfg = home.path().join(".config/opencode/opencode.json");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, r#"{"$schema":"x"}"#).unwrap();
+
+        install(Agent::Opencode, home.path(), &bin()).unwrap();
+
+        let plugin = home.path().join(".config/opencode/plugins/cogito.js");
+        assert!(plugin.exists(), "opencode plugin written");
+        let source = std::fs::read_to_string(&plugin).unwrap();
+        assert!(source.contains("CogitoPlugin"), "{source}");
+        assert!(source.contains("cogito scan"), "{source}");
+
+        assert_eq!(
+            status(Agent::Opencode, home.path()).unwrap(),
+            Status::Configured
+        );
+
+        uninstall(Agent::Opencode, home.path()).unwrap();
+        assert!(!plugin.exists(), "plugin removed on uninstall");
+    }
+
+    #[test]
+    fn test_status_detects_a_missing_companion_file() {
+        let home = TempDir::new().unwrap();
+        std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"command":"sh cogito-session-start.sh"}]}]}}"#,
+        )
+        .unwrap();
+
+        // MCP entry present but the plugin file is not -> not configured yet.
+        assert_eq!(
+            status(Agent::Opencode, home.path()).unwrap(),
+            Status::AgentMissing
+        );
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path()).unwrap(),
+            Status::NotConfigured
         );
     }
 
