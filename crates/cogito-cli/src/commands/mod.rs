@@ -661,6 +661,16 @@ fn resolve_agents(agents: &[String]) -> Result<Vec<crate::agents::Agent>> {
     Ok(selected)
 }
 
+/// Heuristic: does this binary path look like a real install rather than a
+/// build artifact?
+///
+/// `target/debug/cogito` or `target/release/cogito` will move or vanish, which
+/// would leave every agent pointing at a broken command.
+fn looks_installed(binary: &Path) -> bool {
+    let path = binary.to_string_lossy();
+    !path.contains("/target/debug/") && !path.contains("/target/release/")
+}
+
 /// Install Cogito into the requested (or all detected) agents.
 pub fn setup(agents: Vec<String>, all: bool, dry_run: bool) -> Result<()> {
     let home = crate::agents::home_dir()?;
@@ -684,10 +694,21 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
+    let mut configured: Vec<crate::agents::Agent> = Vec::new();
+    let mut failed: Vec<crate::agents::Agent> = Vec::new();
+
     println!("Home:   {}", home.display());
     println!("Binary: {}", binary.display());
     if dry_run {
         println!("Mode:   dry run (nothing will be written)");
+    }
+    if !looks_installed(&binary) {
+        println!();
+        println!("Warning: this binary is not in a normal install location.");
+        println!("         The agents will be configured with the path above, which");
+        println!("         may be a build artifact that later disappears or changes.");
+        println!("         Install first (`cargo install --path crates/cogito-cli` or");
+        println!("         install.sh) and re-run setup from the installed binary.");
     }
     println!();
 
@@ -722,6 +743,7 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool) -> Result<()> {
         match crate::agents::install(agent, &home, &binary) {
             Ok(crate::agents::Change::AlreadyCorrect) => {
                 println!("  {} — already configured", agent.display());
+                configured.push(agent);
             }
             Ok(crate::agents::Change::Written { backup }) => {
                 println!("  {} — configured", agent.display());
@@ -729,15 +751,45 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool) -> Result<()> {
                 if let Some(b) = backup {
                     println!("    backup: {}", b.display());
                 }
+                configured.push(agent);
             }
             Err(e) => {
-                println!("  {} — failed: {e}", agent.display());
+                failed.push(agent);
+                println!("  {} — failed", agent.display());
+                println!("    file:   {}", agent.config_path(&home).display());
+                // Print the full cause chain: "Is a directory" alone does not
+                // say which file or which step went wrong.
+                for (i, cause) in e.chain().enumerate() {
+                    println!("    {}{cause}", if i == 0 { "error: " } else { "cause: " });
+                }
             }
         }
     }
 
     println!();
-    println!("Restart the agent(s) for the MCP server to load.");
+    if failed.is_empty() {
+        println!("Restart the agent(s) for the MCP server to load.");
+    } else if configured.is_empty() {
+        println!(
+            "Nothing was configured: all {} selected agent(s) failed.",
+            failed.len()
+        );
+    } else {
+        println!(
+            "Configured: {}. Failed: {} — see the errors above.",
+            configured
+                .iter()
+                .map(|a| a.display())
+                .collect::<Vec<_>>()
+                .join(", "),
+            failed
+                .iter()
+                .map(|a| a.display())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!("Restart the configured agent(s) for the MCP server to load.");
+    }
     Ok(())
 }
 

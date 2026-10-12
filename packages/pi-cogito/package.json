@@ -1,7 +1,7 @@
 {
   "name": "pi-cogito",
   "version": "0.1.0",
-  "description": "Context harness for Pi agents: scans the project at session start, exposes /cogito, and registers the cogito MCP server",
+  "description": "Context harness for Pi agents: scans the project at session start, shows a status line, and adds /cogito",
   "type": "module",
   "license": "Apache-2.0",
   "homepage": "https://github.com/Rene-Kuhm/cogito",

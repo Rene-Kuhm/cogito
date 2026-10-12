@@ -7,13 +7,12 @@
  *    fingerprint is warm before the first search. The scan is bounded and
  *    never blocks the session.
  * 2. It sets a status line showing what Cogito knows about the project.
- * 3. It registers `/cogito` with `scan`, `stats`, `query`, `compress` and
- *    `decision` subcommands, so the knowledge base can be used without
- *    leaving the session.
+ * 3. It registers `/cogito` with `status`, `scan`, `query`, `stats` and
+ *    `doctor`, so the knowledge base is usable without leaving the session.
  *
- * Persistence is owned by the `cogito` binary. MCP tools are registered
- * separately through Pi's built-in MCP (`mcp.json` + `cogito mcp`); this
- * extension does not spawn a second server.
+ * Persistence is owned by the `cogito` binary. This extension does **not**
+ * register the MCP server: Pi reads MCP servers from `mcp.json`, which
+ * `cogito setup` writes. Nothing here spawns a second process tree.
  */
 
 import { spawn } from "node:child_process";
@@ -107,6 +106,18 @@ function hasState(cwd: string): boolean {
   return existsSync(join(cwd, ".cogito", "state.db"));
 }
 
+/**
+ * Whether `cwd` looks like a project Cogito should touch.
+ *
+ * `cogito scan` creates `.cogito/` and walks the tree. Running it in `$HOME`,
+ * or in any unrelated directory an agent happens to start in, would leave a
+ * stray database behind and scan the whole tree to build it. Only directories
+ * that are already a git repository or already have a `.cogito/` qualify.
+ */
+function isProject(cwd: string): boolean {
+  return existsSync(join(cwd, ".git")) || existsSync(join(cwd, ".cogito"));
+}
+
 /** Collapse noisy stderr into a single line for the UI. */
 function firstLine(text: string): string {
   return text.split("\n").map((l) => l.trim()).find(Boolean) ?? "";
@@ -121,6 +132,15 @@ export default function registerCogito(pi: ExtensionAPI) {
 
     // Warm the fingerprint in the background. A scan can take a moment on a
     // large repo, and nothing in the session depends on it, so do not await.
+    if (!isProject(cwd)) {
+      try {
+        ctx.ui?.setStatus?.("cogito", "cogito: not a project");
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+
     void (async () => {
       const result = await run(["scan"], cwd, SCAN_TIMEOUT_MS);
       try {
@@ -144,7 +164,7 @@ export default function registerCogito(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("cogito", {
-    description: "Cogito context harness: scan, stats, query, compress, decision",
+    description: "Cogito context harness: status, scan, query, stats, doctor",
     handler: async (args: string, raw: any) => {
       const ctx = raw as CogitoContext;
       const cwd = ctx.cwd;
@@ -164,6 +184,12 @@ export default function registerCogito(pi: ExtensionAPI) {
 
       switch (sub) {
         case "scan": {
+          if (!isProject(cwd)) {
+            report(
+              `${cwd} is not a project (no .git or .cogito). Refusing to create a fingerprint here.`,
+            );
+            return;
+          }
           report("cogito: scanning…");
           const result = await run(["scan"], cwd, SCAN_TIMEOUT_MS);
           report(result.ok ? result.stdout.trim() : `cogito scan failed: ${firstLine(result.stderr)}`);

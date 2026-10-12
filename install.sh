@@ -61,17 +61,30 @@ detect_target() {
 
 # ---------------------------------------------------------------- download
 
+# Print the newest published (non-draft, non-prerelease) release tag.
+#
+# `/releases/latest` is not used: it 404s while every release is still a draft,
+# which is the state a fresh project is in. The list endpoint is filtered
+# instead, and only published releases are considered.
 latest_version() {
-  # Prefer the API; fall back to following the /releases/latest redirect.
+  api="https://api.github.com/repos/${REPO}/releases?per_page=30"
+  json=""
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-      | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' \
-      | head -n 1
+    json="$(curl -fsSL "$api" 2>/dev/null || true)"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-      | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' \
-      | head -n 1
+    json="$(wget -qO- "$api" 2>/dev/null || true)"
   fi
+  [ -n "$json" ] || return 0
+
+  # Each release object is a single line in the compact form the API returns
+  # when piped, but be defensive: extract tag_name only from entries that are
+  # neither draft nor prerelease.
+  printf '%s' "$json" \
+    | tr '{' '\n' \
+    | grep -v '"draft":[[:space:]]*true' \
+    | grep -v '"prerelease":[[:space:]]*true' \
+    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' \
+    | head -n 1
 }
 
 fetch() {
@@ -90,15 +103,15 @@ verify_checksum() {
   archive="$1"
   checksum_file="$2"
   expected="$(sed -n "s/^\([0-9a-f]\{64\}\)[[:space:]]\+$(basename "$archive")$/\1/p" "$checksum_file")"
-  [ -n "$expected" ] || { warn "checksum for $(basename "$archive") not listed; skipping verification"; return 0; }
+  [ -n "$expected" ] \
+    || die "no checksum listed for $(basename "$archive"); refusing to install an unverified binary"
 
   if command -v sha256sum >/dev/null 2>&1; then
     actual="$(sha256sum "$archive" | awk '{print $1}')"
   elif command -v shasum >/dev/null 2>&1; then
     actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
   else
-    warn "no sha256 tool available; skipping verification"
-    return 0
+    die "need sha256sum or shasum to verify the download"
   fi
 
   [ "$expected" = "$actual" ] || die "checksum mismatch for $(basename "$archive")"
@@ -122,7 +135,12 @@ install_from_source() {
 install_prebuilt() {
   target="$1"
   [ -n "$VERSION" ] || VERSION="$(latest_version)"
-  [ -n "$VERSION" ] || die "could not determine the latest version; set COGITO_VERSION"
+  if [ -z "$VERSION" ]; then
+    die "no published release found for ${REPO}.
+       Releases may still be drafts, so nothing is downloadable yet.
+       Build from source instead:  COGITO_FROM_SOURCE=1 sh install.sh
+       Or pin a version:           COGITO_VERSION=0.1.0 sh install.sh"
+  fi
 
   archive_name="${BIN}-${VERSION}-${target}.tar.gz"
   base_url="https://github.com/${REPO}/releases/download/v${VERSION}"
@@ -134,9 +152,9 @@ install_prebuilt() {
   fetch "${base_url}/${archive_name}" "${tmp}/${archive_name}" \
     || die "download failed: ${base_url}/${archive_name}"
 
-  if fetch "${base_url}/cogito-checksums.txt" "${tmp}/checksums.txt" 2>/dev/null; then
-    verify_checksum "${tmp}/${archive_name}" "${tmp}/checksums.txt"
-  fi
+  fetch "${base_url}/cogito-checksums.txt" "${tmp}/checksums.txt" \
+    || die "could not download cogito-checksums.txt; refusing to install an unverified binary"
+  verify_checksum "${tmp}/${archive_name}" "${tmp}/checksums.txt"
 
   tar -xzf "${tmp}/${archive_name}" -C "$tmp"
 

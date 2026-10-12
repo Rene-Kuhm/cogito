@@ -146,21 +146,36 @@ pub struct ExtraFile {
     pub executable: bool,
 }
 
-/// Marker that identifies Cogito-owned hook entries inside a JSON array.
-const HOOK_MARKER: &str = "cogito";
+/// One-line server summary Pi shows in the system prompt, uses for tool
+/// search ranking, and returns from codemode's `describeNamespace()`.
+const SERVER_DESCRIPTION: &str =
+    "Project context harness: code fingerprint, semantic tags and architectural decisions.";
 
 /// The Claude Code SessionStart hook script.
 const CLAUDE_HOOK_SCRIPT: &str = r#"#!/bin/sh
 # Cogito SessionStart hook.
 #
 # Warms the project fingerprint so the first query in the session is fast.
-# Runs in the background and never fails the session: if `cogito` is not on
-# PATH, or the scan fails, this exits quietly.
+#
+# This script always exits 0. A missing `cogito`, a directory that is not a
+# project, or a failed scan are all silent no-ops, so it can never block or
+# fail a session.
 
 command -v cogito >/dev/null 2>&1 || exit 0
 
-# `nohup` keeps the scan alive after the hook process exits.
-nohup cogito scan --quiet >/dev/null 2>&1 &
+# Only touch directories that already look like a project. Scanning
+# unconditionally would create a `.cogito/` in $HOME, or in any unrelated tree
+# an agent happens to start in, and walk the whole thing.
+[ -d .git ] || [ -d .cogito ] || exit 0
+
+# Bounded, so a huge repository cannot leave a scan running forever.
+# `nohup` survives the SIGHUP this shell gets when it exits.
+if command -v timeout >/dev/null 2>&1; then
+  nohup timeout 60 cogito scan --quiet >/dev/null 2>&1 &
+else
+  nohup cogito scan --quiet >/dev/null 2>&1 &
+fi
+
 exit 0
 "#;
 
@@ -176,7 +191,14 @@ const OPENCODE_PLUGIN: &str = r#"// Cogito plugin for opencode.
 export const CogitoPlugin = async ({ directory, $ }) => {
   const scan = async () => {
     try {
-      await $`cogito scan --quiet`.cwd(directory).quiet();
+      // Only touch real projects. Scanning unconditionally would create a
+      // `.cogito/` in $HOME or in any tree opencode happens to start in.
+      const isProject =
+        (await $`test -d .git`.cwd(directory).quiet().nothrow()).exitCode === 0 ||
+        (await $`test -d .cogito`.cwd(directory).quiet().nothrow()).exitCode === 0;
+      if (!isProject) return;
+
+      await $`cogito scan --quiet`.cwd(directory).quiet().nothrow();
     } catch {
       // Cogito missing or the scan failed: never block the session.
     }
@@ -200,7 +222,9 @@ impl Agent {
     pub fn extra_files(self, home: &Path, _binary: &Path) -> Vec<ExtraFile> {
         match self {
             Agent::ClaudeCode => vec![ExtraFile {
-                path: home.join(".claude/hooks/cogito-session-start.sh"),
+                path: self
+                    .hook_script_path(home)
+                    .expect("ClaudeCode has a hook script path"),
                 content: CLAUDE_HOOK_SCRIPT.to_string(),
                 executable: true,
             }],
@@ -216,6 +240,17 @@ impl Agent {
     /// Whether this agent supports a session-start hook in its config file.
     fn has_session_hook(self) -> bool {
         matches!(self, Agent::ClaudeCode)
+    }
+
+    /// Canonical path of this agent's session-hook script.
+    ///
+    /// Independent of the installed binary so that detecting, writing and
+    /// removing the hook entry always agree on the same file.
+    pub fn hook_script_path(self, home: &Path) -> Option<PathBuf> {
+        match self {
+            Agent::ClaudeCode => Some(home.join(".claude/hooks/cogito-session-start.sh")),
+            _ => None,
+        }
     }
 }
 
@@ -387,7 +422,18 @@ pub fn install(agent: Agent, home: &Path, binary: &Path) -> Result<Change> {
                 .context("`mcpServers` is not an object")?
                 .insert(
                     SERVER_KEY.to_string(),
-                    json!({ "command": bin, "args": ["mcp"], "lifecycle": "lazy" }),
+                    json!({
+                        "command": bin,
+                        "args": ["mcp"],
+                        // Pi defaults every MCP server to `codemode` exposure.
+                        // Gentle Shell ships with `-builtin:codemode`, so under
+                        // the default the model could never reach these tools.
+                        // `direct` declares them like built-in tools, which is
+                        // what the Pi docs recommend for a small, frequently
+                        // used tool set.
+                        "exposure": "direct",
+                        "description": SERVER_DESCRIPTION,
+                    }),
                 );
             write_json(&mcp_path, &mcp)?;
         }
@@ -458,17 +504,11 @@ pub fn install(agent: Agent, home: &Path, binary: &Path) -> Result<Change> {
 
     if agent.has_session_hook()
         && let Some(hook_path) = hook_config_path(agent, home)
+        && let Some(hook_script) = agent.hook_script_path(home)
     {
         let _ = backup_file(&hook_path)?;
         let mut settings = read_json_or_default(&hook_path);
-        let script = agent
-            .extra_files(home, binary)
-            .into_iter()
-            .next()
-            .map(|f| f.path)
-            .context("session-hook agent has no extra file")?;
-        let command = format!("sh '{}'", script.display());
-        upsert_session_hook(&mut settings, &command)?;
+        upsert_session_hook(&mut settings, &hook_script)?;
         write_json(&hook_path, &settings)?;
     }
 
@@ -527,11 +567,12 @@ pub fn uninstall(agent: Agent, home: &Path) -> Result<Change> {
 
     if agent.has_session_hook()
         && let Some(hook_path) = hook_config_path(agent, home)
+        && let Some(hook_script) = agent.hook_script_path(home)
         && hook_path.exists()
     {
         let _ = backup_file(&hook_path)?;
         let mut settings = read_json(&hook_path)?;
-        remove_session_hook(&mut settings);
+        remove_session_hook(&mut settings, &hook_script);
         write_json(&hook_path, &settings)?;
     }
 
@@ -546,7 +587,7 @@ pub fn uninstall(agent: Agent, home: &Path) -> Result<Change> {
 /// Insert a `SessionStart` hook into a Claude-Code-style settings object.
 ///
 /// Idempotent: an entry whose command already mentions Cogito is left alone.
-fn upsert_session_hook(value: &mut Value, command: &str) -> Result<()> {
+fn upsert_session_hook(value: &mut Value, script: &Path) -> Result<()> {
     let obj = value.as_object_mut().context("settings is not an object")?;
     let hooks = obj
         .entry("hooks")
@@ -559,25 +600,18 @@ fn upsert_session_hook(value: &mut Value, command: &str) -> Result<()> {
         .as_array_mut()
         .context("`hooks.SessionStart` is not an array")?;
 
-    let already = session_start.iter().any(|entry| {
-        entry
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .is_some_and(|arr| {
-                arr.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.contains(HOOK_MARKER))
-                })
-            })
-    });
-
-    if !already {
+    // Match on the exact script path. A substring match on "cogito" would
+    // also claim an unrelated hook that merely mentions the word, for example
+    // a user script living under a checkout at ~/proyectos/cogito/.
+    if !session_start
+        .iter()
+        .any(|entry| entry_owns_script(entry, script))
+    {
         session_start.push(json!({
             "matcher": "^(startup|resume|clear|compact|fork)$",
             "hooks": [{
                 "type": "command",
-                "command": command,
+                "command": format!("sh '{}'", script.display()),
                 "timeout": 10,
                 "async": true
             }]
@@ -586,25 +620,29 @@ fn upsert_session_hook(value: &mut Value, command: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a `SessionStart` entry is the one Cogito installed for `script`.
+fn entry_owns_script(entry: &Value, script: &Path) -> bool {
+    let wanted = script.display().to_string();
+    entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|h| {
+                h.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains(&wanted))
+            })
+        })
+}
+
 /// Remove Cogito-owned entries from a Claude-Code-style `SessionStart` hook list.
-fn remove_session_hook(value: &mut Value) {
+fn remove_session_hook(value: &mut Value, script: &Path) {
     if let Some(arr) = value
         .get_mut("hooks")
         .and_then(|h| h.get_mut("SessionStart"))
         .and_then(|s| s.as_array_mut())
     {
-        arr.retain(|entry| {
-            !entry
-                .get("hooks")
-                .and_then(|h| h.as_array())
-                .is_some_and(|hooks| {
-                    hooks.iter().any(|h| {
-                        h.get("command")
-                            .and_then(|c| c.as_str())
-                            .is_some_and(|c| c.contains(HOOK_MARKER))
-                    })
-                })
-        });
+        arr.retain(|entry| !entry_owns_script(entry, script));
     }
 }
 
@@ -971,6 +1009,100 @@ mod tests {
             status(Agent::ClaudeCode, home.path()).unwrap(),
             Status::NotConfigured
         );
+    }
+
+    #[test]
+    fn test_foreign_hook_mentioning_cogito_is_not_claimed_or_deleted() {
+        let home = TempDir::new().unwrap();
+        std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+
+        // A user hook that merely mentions "cogito" in its path — for example a
+        // script living in a checkout at ~/proyectos/cogito/. Substring matching
+        // would wrongly treat this as Cogito's own hook.
+        let foreign = "sh /home/me/proyectos/cogito/scripts/my-hook.sh";
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            format!(
+                r#"{{"hooks":{{"SessionStart":[{{"matcher":"*","hooks":[{{"type":"command","command":"{foreign}"}}]}}]}}}}"#
+            ),
+        )
+        .unwrap();
+
+        // Install must ADD ours, not consider the foreign one sufficient.
+        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        let settings = read_json(&home.path().join(".claude/settings.json")).unwrap();
+        let entries = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "cogito hook must be added alongside: {settings}"
+        );
+        assert!(
+            entries.iter().any(|e| {
+                e["hooks"][0]["command"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("cogito-session-start.sh"))
+            }),
+            "our hook present"
+        );
+
+        // Uninstall must remove only ours.
+        uninstall(Agent::ClaudeCode, home.path()).unwrap();
+        let settings = read_json(&home.path().join(".claude/settings.json")).unwrap();
+        let entries = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "foreign hook must survive: {settings}");
+        assert_eq!(entries[0]["hooks"][0]["command"].as_str().unwrap(), foreign);
+    }
+
+    #[test]
+    fn test_pi_mcp_entry_uses_direct_exposure_without_invented_fields() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".gentle-shell/agent")).unwrap();
+        std::fs::write(home.path().join(".gentle-shell/agent/settings.json"), "{}").unwrap();
+
+        install(Agent::GentleShell, home.path(), &bin()).unwrap();
+
+        let mcp = read_json(&home.path().join(".gentle-shell/agent/mcp.json")).unwrap();
+        let entry = &mcp["mcpServers"][SERVER_KEY];
+
+        // Gentle Shell ships `-builtin:codemode`; under Pi's default `codemode`
+        // exposure the model could never reach these tools.
+        assert_eq!(
+            entry["exposure"], "direct",
+            "must use direct exposure so the tools reach the model: {entry}"
+        );
+        assert!(
+            entry["description"].is_string(),
+            "description is used by tool search"
+        );
+        // `lifecycle` is an Engram field; Pi ignores it.
+        assert!(
+            entry.get("lifecycle").is_none(),
+            "must not invent Pi fields"
+        );
+    }
+
+    #[test]
+    fn test_json_key_order_is_preserved() {
+        let home = TempDir::new().unwrap();
+        // Deliberately not alphabetical, as a real ~/.claude.json is.
+        std::fs::write(
+            home.path().join(".claude.json"),
+            r#"{"zeta":1,"alpha":2,"middle":{"b":1,"a":2}}"#,
+        )
+        .unwrap();
+
+        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+
+        let text = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
+        let zeta = text.find("\"zeta\"").expect("zeta present");
+        let alpha = text.find("\"alpha\"").expect("alpha present");
+        assert!(zeta < alpha, "key order must be preserved:\n{text}");
+
+        let b = text.find("\"b\"").expect("b present");
+        let a = text.find("\"a\"").expect("a present");
+        assert!(b < a, "nested key order must be preserved:\n{text}");
     }
 
     #[test]
