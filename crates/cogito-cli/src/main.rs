@@ -108,6 +108,10 @@ enum Commands {
         /// Configure every detected agent without asking
         #[arg(long)]
         all: bool,
+        /// Assume yes: configure every detected agent without prompting
+        /// (same as --all; accepted so `setup -y` behaves as expected)
+        #[arg(short = 'y', long)]
+        yes: bool,
         /// Show what would change without writing anything
         #[arg(long)]
         dry_run: bool,
@@ -278,8 +282,9 @@ async fn main() -> Result<()> {
         Some(Commands::Setup {
             agents,
             all,
+            yes,
             dry_run,
-        }) => commands::setup(agents, all, dry_run)?,
+        }) => commands::setup(agents, all || yes, dry_run)?,
         Some(Commands::Uninstall { agents, yes }) => commands::uninstall(agents, yes)?,
         Some(Commands::Serve { port, mcp }) => commands::serve(port, mcp).await?,
         Some(Commands::Stats) => commands::stats(args.json).await?,

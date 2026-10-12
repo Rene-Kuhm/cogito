@@ -115,6 +115,8 @@ function hasState(cwd: string): boolean {
  * that are already a git repository or already have a `.cogito/` qualify.
  */
 function isProject(cwd: string): boolean {
+  // `existsSync` covers both cases: `.git` is a directory in a normal
+  // checkout and a file (`gitdir: …`) in a worktree or submodule.
   return existsSync(join(cwd, ".git")) || existsSync(join(cwd, ".cogito"));
 }
 
