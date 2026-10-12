@@ -6,6 +6,7 @@ members = [
     "crates/cogito-api",
     "crates/cogito-mcp",
     "examples",
+    "skills/cogito",
 ]
 
 [workspace.package]
