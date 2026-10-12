@@ -64,8 +64,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run benchmarks
+        with:
+          components: rustfmt, clippy
+      - name: Build benchmarks
         run: cargo bench --no-run
+      - name: Run quick benchmarks
+        run: cargo bench --workspace -- --quick
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-results
+          path: target/criterion
+          retention-days: 30
 
   security:
     name: Security Audit
