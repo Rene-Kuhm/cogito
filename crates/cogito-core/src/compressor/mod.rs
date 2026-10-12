@@ -6,6 +6,7 @@ use crate::types::{CompressedContext, CompressionOptions, Language, SourceRef, S
 use anyhow::Result;
 
 pub mod ast;
+pub mod ast_common;
 pub mod ast_csharp;
 pub mod ast_go;
 pub mod ast_java;
