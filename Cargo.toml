@@ -4,6 +4,7 @@ members = [
     "crates/cogito-core",
     "crates/cogito-cli",
     "crates/cogito-api",
+    "crates/cogito-mcp",
     "examples",
 ]
 
