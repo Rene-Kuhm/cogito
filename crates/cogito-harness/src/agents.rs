@@ -822,11 +822,12 @@ pub fn install_agents_md_block(project_root: &Path, dry_run: bool) -> Result<Cha
         return Ok(Change::AlreadyCorrect);
     }
 
+    // No backup for AGENTS.md: the block is reversible via remove_agents_md_block,
+    // and timestamped backups would pollute the user's tracked working tree.
     let backup = if path.exists() {
         backup_file(&path)?
     } else {
-        std::fs::write(&path, "")?;
-        backup_file(&path)?
+        None
     };
     std::fs::write(&path, &new_content)?;
     Ok(Change::Written { backup })

@@ -2,6 +2,7 @@
 name = "cogito-harness"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,6 +11,10 @@ description = "Context harness for AI coding agents: MCP server and one-command 
 keywords.workspace = true
 categories.workspace = true
 readme = "../../README.md"
+
+# Exclude the test harness; it is not part of the published crate but
+# include_str! needs assets/opencode/cogito.js at build time.
+exclude = ["assets/opencode/cogito.test.mjs"]
 
 [[bin]]
 name = "cogito"

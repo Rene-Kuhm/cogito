@@ -167,10 +167,12 @@ fn fake_home() -> TempDir {
 #[test]
 fn test_setup_configures_agents_and_preserves_existing_keys() {
     let home = fake_home();
+    let project = setup_test_project();
 
     let output = Command::new(cogito_bin())
         .args(["setup", "claude-code", "codex"])
         .env("COGITO_HOME", home.path())
+        .current_dir(project.path())
         .output()
         .expect("Failed to run setup");
 
@@ -209,10 +211,12 @@ fn test_setup_configures_agents_and_preserves_existing_keys() {
 #[test]
 fn test_setup_is_idempotent() {
     let home = fake_home();
+    let project = setup_test_project();
     let run = || {
         Command::new(cogito_bin())
             .args(["setup", "claude-code"])
             .env("COGITO_HOME", home.path())
+            .current_dir(project.path())
             .output()
             .unwrap()
     };
@@ -237,11 +241,13 @@ fn test_setup_is_idempotent() {
 #[test]
 fn test_setup_dry_run_writes_nothing() {
     let home = fake_home();
+    let project = setup_test_project();
     let before = fs::read_to_string(home.path().join(".claude.json")).unwrap();
 
     let output = Command::new(cogito_bin())
         .args(["setup", "claude-code", "--dry-run"])
         .env("COGITO_HOME", home.path())
+        .current_dir(project.path())
         .output()
         .unwrap();
 
@@ -257,16 +263,19 @@ fn test_setup_dry_run_writes_nothing() {
 #[test]
 fn test_uninstall_removes_only_cogito() {
     let home = fake_home();
+    let project = setup_test_project();
 
     Command::new(cogito_bin())
         .args(["setup", "claude-code"])
         .env("COGITO_HOME", home.path())
+        .current_dir(project.path())
         .output()
         .unwrap();
 
     let output = Command::new(cogito_bin())
         .args(["uninstall", "claude-code", "--yes"])
         .env("COGITO_HOME", home.path())
+        .current_dir(project.path())
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -282,9 +291,11 @@ fn test_uninstall_removes_only_cogito() {
 #[test]
 fn test_doctor_reports_agent_status() {
     let home = fake_home();
+    let project = setup_test_project();
     Command::new(cogito_bin())
         .args(["setup", "claude-code"])
         .env("COGITO_HOME", home.path())
+        .current_dir(project.path())
         .output()
         .unwrap();
 
@@ -335,10 +346,12 @@ fn test_stale_entry_is_reported_and_repaired_by_setup() {
         "doctor must say how to fix it: {stdout}"
     );
 
+    let project = setup_test_project();
     // setup repairs it
     let output = Command::new(cogito_bin())
         .args(["setup", "gentle-shell"])
         .env("COGITO_HOME", home.path())
+        .current_dir(project.path())
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -369,9 +382,11 @@ fn test_stale_entry_is_reported_and_repaired_by_setup() {
 #[test]
 fn test_setup_accepts_yes_flag() {
     let home = fake_home();
+    let project = setup_test_project();
     let output = Command::new(cogito_bin())
         .args(["setup", "-y"])
         .env("COGITO_HOME", home.path())
+        .current_dir(project.path())
         .output()
         .expect("setup -y must be accepted");
     assert!(
@@ -396,6 +411,7 @@ fn test_claude_hook_prints_the_project_card() {
     let setup = Command::new(cogito_bin())
         .args(["setup", "claude-code"])
         .env("COGITO_HOME", home.path())
+        .current_dir(project.path())
         .output()
         .expect("Failed to run setup");
     assert!(
@@ -512,5 +528,82 @@ fn test_claude_guardrail_outlines_a_large_read_once() {
         !String::from_utf8_lossy(&status.stdout).contains(".cogito"),
         "{}",
         String::from_utf8_lossy(&status.stdout)
+    );
+}
+
+/// Regression test: `cogito setup` must not leave timestamped backups in the
+/// user's project directory for the AGENTS.md block, and must not leak any
+/// cogito-backup file into the project unless it was a pre-existing agent
+/// configuration file.
+#[test]
+fn test_setup_does_not_leave_backup_files_in_project() {
+    let home = fake_home();
+    let project = setup_test_project();
+
+    // Run setup for an agent that writes the AGENTS.md block (Codex, Opencode).
+    let output = Command::new(cogito_bin())
+        .args(["setup", "codex"])
+        .env("COGITO_HOME", home.path())
+        .current_dir(project.path())
+        .output()
+        .expect("Failed to run setup");
+    assert!(output.status.success(), "setup should succeed");
+
+    // Collect all cogito-backup files that exist in the project.
+    let backup_files: Vec<_> = fs::read_dir(project.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains("cogito-backup"))
+        .collect();
+
+    // Agent config files in COGITO_HOME may have backups; project dir must not.
+    assert!(
+        backup_files.is_empty(),
+        "no cogito-backup files should exist in the project directory: {:?}",
+        backup_files
+            .iter()
+            .map(|e| e.path().display().to_string())
+            .collect::<Vec<_>>()
+    );
+
+    // Installing AGENTS.md block into a project with no AGENTS.md should leave
+    // exactly one new file: AGENTS.md, and no backup.
+    let agents_md = project.path().join("AGENTS.md");
+    assert!(agents_md.exists(), "AGENTS.md should be created");
+
+    // Verify no backup was created alongside it. The project already has Cargo.toml and src/
+    // from setup_test_project(); AGENTS.md is the only new file.
+    let entries: Vec<_> = fs::read_dir(project.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    let non_hidden: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            let name = e.file_name();
+            !name.to_string_lossy().starts_with('.')
+        })
+        .collect();
+    assert_eq!(
+        non_hidden.len(),
+        3,
+        "project should have Cargo.toml, src/, and AGENTS.md: {:?}",
+        non_hidden
+    );
+    // Confirm AGENTS.md is one of the entries.
+    let agent_files: Vec<_> = non_hidden
+        .iter()
+        .filter(|e| e.file_name().to_string_lossy() == "AGENTS.md")
+        .collect();
+    assert_eq!(agent_files.len(), 1, "AGENTS.md should exist");
+    // And no backup alongside it.
+    let backup_entries: Vec<_> = non_hidden
+        .iter()
+        .filter(|e| e.file_name().to_string_lossy().contains("cogito-backup"))
+        .collect();
+    assert!(
+        backup_entries.is_empty(),
+        "no backup files should exist: {:?}",
+        backup_entries
     );
 }

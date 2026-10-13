@@ -11,6 +11,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# Minimum Rust version required by edition 2024.
+rust-version = "1.85"
 # `cogito.ai` is not ours -- it is a parked domain for sale, and a security
 # address there would deliver reports to whoever buys it. Everything published
 # to crates.io is permanent, so the metadata points at the repository instead.
