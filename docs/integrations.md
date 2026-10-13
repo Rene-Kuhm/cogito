@@ -86,11 +86,20 @@ Two halves, both written by setup:
 Three files:
 
 - `~/.claude.json` gets `mcpServers.cogito`.
-- `~/.claude/hooks/cogito-session-start.sh` refreshes the stored fingerprint. It exits 0
-  when `cogito` is missing and backgrounds the scan with `nohup`, so it can
-  never fail or slow a session.
+- `~/.claude/hooks/cogito-session-start.sh` prints the project card (modules,
+  key docs, busiest files, how to look code up) wrapped in
+  `<cogito_project>`. Claude Code adds a `SessionStart` hook's output to the
+  session context, so each session starts oriented without a `project_map`
+  call. The card comes from the stored index in milliseconds; it rescans only
+  when `HEAD` moved. The script prints nothing and exits 0 outside a project
+  or when `cogito` is missing.
 - `~/.claude/settings.json` gets a `SessionStart` entry running that script
-  with `async: true`.
+  synchronously (an `async` hook's output never reaches the session; `cogito
+  setup` repairs entries written that way by older versions).
+
+`setup` leaves a file untouched when its content would not change, so
+repairing the hook does not rewrite `~/.claude.json` while Claude Code is
+running.
 
 Claude Code keeps MCP servers and settings in separate files, which is why it
 is the only agent that touches two config files.

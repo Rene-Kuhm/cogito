@@ -495,3 +495,54 @@ fn test_setup_accepts_yes_flag() {
             .unwrap();
     assert!(claude["mcpServers"]["cogito"].is_object());
 }
+
+#[test]
+#[cfg(unix)]
+fn test_claude_hook_prints_the_project_card() {
+    // What Claude Code runs at session start: the installed hook script, in the
+    // project directory, with `cogito` on PATH. Its output becomes context.
+    let home = fake_home();
+    let project = setup_test_project();
+    let setup = Command::new(cogito_bin())
+        .args(["setup", "claude-code"])
+        .env("COGITO_HOME", home.path())
+        .output()
+        .expect("Failed to run setup");
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    let script = home.path().join(".claude/hooks/cogito-session-start.sh");
+    let bin_dir = cogito_bin().parent().unwrap().to_path_buf();
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("sh")
+        .arg(&script)
+        .env("PATH", path)
+        .env("CLAUDE_PROJECT_DIR", project.path())
+        .current_dir(home.path())
+        .output()
+        .expect("Failed to run the hook");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("<cogito_project>\n"), "{stdout}");
+    assert!(stdout.contains("code files"), "{stdout}");
+    assert!(stdout.contains("search_code"), "{stdout}");
+    assert!(stdout.trim_end().ends_with("</cogito_project>"), "{stdout}");
+
+    // Outside a project the hook prints nothing.
+    let elsewhere = TempDir::new().unwrap();
+    let output = Command::new("sh")
+        .arg(&script)
+        .env("CLAUDE_PROJECT_DIR", elsewhere.path())
+        .output()
+        .expect("Failed to run the hook");
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+}

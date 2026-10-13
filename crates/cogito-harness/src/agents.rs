@@ -299,14 +299,18 @@ const SERVER_DESCRIPTION: &str =
 const CLAUDE_HOOK_SCRIPT: &str = r#"#!/bin/sh
 # Cogito SessionStart hook.
 #
-# Refreshes the project's stored fingerprint, so the session starts with
-# Cogito's view of the project up to date.
+# Prints the project card. Claude Code adds a SessionStart hook's output to the
+# session context, so every session starts knowing the project's modules,
+# key docs and how to look code up with Cogito, without spending a tool call
+# on orientation. `cogito map --card` reuses the stored index and rescans only
+# when HEAD moved, so the index is kept current as a side effect.
 #
 # This script always exits 0. A missing `cogito`, a directory that is not a
-# project, or a failed scan are all silent no-ops, so it can never block or
-# fail a session.
+# project, or a failure all print nothing, so it can never block or fail a
+# session.
 
 command -v cogito >/dev/null 2>&1 || exit 0
+cd "${CLAUDE_PROJECT_DIR:-.}" 2>/dev/null || exit 0
 
 # Only touch directories that already look like a project. Scanning
 # unconditionally would create a `.cogito/` in $HOME, or in any unrelated tree
@@ -317,14 +321,15 @@ command -v cogito >/dev/null 2>&1 || exit 0
 # most likely to be large.
 [ -e .git ] || [ -d .cogito ] || exit 0
 
-# Bounded, so a huge repository cannot leave a scan running forever.
-# `nohup` survives the SIGHUP this shell gets when it exits.
+# Bounded, so a first scan of a huge repository cannot hold the session.
 if command -v timeout >/dev/null 2>&1; then
-  nohup timeout 60 cogito scan --quiet >/dev/null 2>&1 &
+  card=$(timeout 20 cogito map --card 2>/dev/null)
 else
-  nohup cogito scan --quiet >/dev/null 2>&1 &
+  card=$(cogito map --card 2>/dev/null)
 fi
+[ -n "$card" ] || exit 0
 
+printf '<cogito_project>\n%s\n</cogito_project>\n' "$card"
 exit 0
 "#;
 
@@ -607,11 +612,24 @@ fn hook_registered(agent: Agent, home: &Path) -> Result<bool> {
         return Ok(false);
     }
     let settings = read_json(&hook_path)?;
+    // Registered and synchronous: an `async` hook's output never reaches the
+    // session, so an entry from an earlier version counts as outdated.
     Ok(settings
         .get("hooks")
         .and_then(|h| h.get("SessionStart"))
         .and_then(|s| s.as_array())
-        .is_some_and(|entries| entries.iter().any(|e| entry_owns_script(e, &script))))
+        .is_some_and(|entries| {
+            entries.iter().any(|e| {
+                e.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            owns_command(h, &script)
+                                && h.get("async").and_then(|a| a.as_bool()) != Some(true)
+                        })
+                    })
+            })
+        }))
 }
 
 /// Inspect how `agent` is configured, relative to what `binary` would write.
@@ -910,21 +928,47 @@ fn upsert_session_hook(value: &mut Value, script: &Path) -> Result<()> {
     // Match on the exact script path. A substring match on "cogito" would
     // also claim an unrelated hook that merely mentions the word, for example
     // a user script living under a checkout at ~/proyectos/cogito/.
-    if !session_start
-        .iter()
-        .any(|entry| entry_owns_script(entry, script))
+    let wanted = format!("sh '{}'", script.display());
+    match session_start
+        .iter_mut()
+        .find(|entry| entry_owns_script(entry, script))
     {
-        session_start.push(json!({
+        // Repair our entry in place: earlier versions ran the hook `async`,
+        // and Claude Code ignores an async hook's output, which is now the
+        // whole point of the hook.
+        Some(entry) => {
+            if let Some(hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                for hook in hooks.iter_mut().filter(|h| owns_command(h, script)) {
+                    if let Some(hook) = hook.as_object_mut() {
+                        hook.remove("async");
+                        hook.insert("timeout".into(), json!(HOOK_TIMEOUT_SECS));
+                        hook.insert("command".into(), json!(wanted));
+                    }
+                }
+            }
+        }
+        None => session_start.push(json!({
             "matcher": "^(startup|resume|clear|compact|fork)$",
             "hooks": [{
                 "type": "command",
-                "command": format!("sh '{}'", script.display()),
-                "timeout": 10,
-                "async": true
+                "command": wanted,
+                "timeout": HOOK_TIMEOUT_SECS,
             }]
-        }));
+        })),
     }
     Ok(())
+}
+
+/// Seconds Claude Code waits for the hook. The card prints in milliseconds
+/// from a stored index; this covers a first scan of a large repository.
+const HOOK_TIMEOUT_SECS: u64 = 30;
+
+/// Whether one hook object runs Cogito's script.
+fn owns_command(hook: &Value, script: &Path) -> bool {
+    let wanted = script.display().to_string();
+    hook.get("command")
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| c.contains(&wanted))
 }
 
 /// Whether a `SessionStart` entry is the one Cogito installed for `script`.
@@ -978,6 +1022,12 @@ fn read_json_or_default(path: &Path) -> Value {
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<()> {
+    // Leave an unchanged file untouched. Agents rewrite some of these files
+    // while running (Claude Code and ~/.claude.json), so every write Cogito
+    // skips is a race it cannot lose.
+    if path.exists() && read_json(path).is_ok_and(|current| current == *value) {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
@@ -1624,6 +1674,86 @@ mod tests {
                 .any(|e| entry_owns_script(e, &script)),
             "hook entry restored: {settings}"
         );
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
+            Status::Configured
+        );
+    }
+
+    #[test]
+    fn test_repairing_the_hook_leaves_claude_json_untouched() {
+        let home = TempDir::new().unwrap();
+        std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
+        let claude_json = home.path().join(".claude.json");
+        let before = std::fs::metadata(&claude_json).unwrap().modified().unwrap();
+
+        // Only the hook script is stale; the MCP entry is current.
+        std::fs::write(
+            Agent::ClaudeCode.hook_script_path(home.path()).unwrap(),
+            "old",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
+
+        let after = std::fs::metadata(&claude_json).unwrap().modified().unwrap();
+        assert_eq!(
+            before, after,
+            "an unchanged ~/.claude.json must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn test_async_hook_entry_from_an_older_version_is_repaired() {
+        let home = TempDir::new().unwrap();
+        std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
+
+        // What earlier versions wrote: the same script, but `async`, whose
+        // output Claude Code never adds to the session.
+        let settings_path = home.path().join(".claude/settings.json");
+        let mut settings = read_json(&settings_path).unwrap();
+        settings["hooks"]["SessionStart"][0]["hooks"][0]["async"] = json!(true);
+        settings["hooks"]["SessionStart"][0]["hooks"][0]["timeout"] = json!(10);
+        write_json(&settings_path, &settings).unwrap();
+
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
+            Status::Outdated
+        );
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
+
+        let settings = read_json(&settings_path).unwrap();
+        let entries = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "repaired in place, not duplicated");
+        let hook = &entries[0]["hooks"][0];
+        assert!(hook.get("async").is_none(), "{hook}");
+        assert_eq!(hook["timeout"], HOOK_TIMEOUT_SECS);
         assert_eq!(
             status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
             Status::Configured
