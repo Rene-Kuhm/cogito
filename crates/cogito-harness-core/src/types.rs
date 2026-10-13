@@ -30,7 +30,7 @@ impl Language {
             return Ok(Language::Rust);
         }
         if path.join("package.json").exists() {
-            if path.join("tsconfig.json").exists() {
+            if has_tsconfig(path) {
                 return Ok(Language::TypeScript);
             }
             return Ok(Language::JavaScript);
@@ -117,6 +117,34 @@ impl Language {
             Language::Unknown => vec![],
         }
     }
+}
+
+/// Whether a JS project is written in TypeScript.
+///
+/// A monorepo usually has no `tsconfig.json` at its root, only one per
+/// package (`packages/*/tsconfig.json`), so the root alone is not enough.
+/// The search is shallow and skips `node_modules` and dot-directories.
+fn has_tsconfig(path: &Path) -> bool {
+    walkdir::WalkDir::new(path)
+        .max_depth(3)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name != "node_modules" && !name.starts_with('.'))
+        })
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("tsconfig") && name.ends_with(".json"))
+        })
 }
 
 impl std::fmt::Display for Language {
@@ -319,5 +347,36 @@ impl CompressedContext {
         }
         ((self.original_tokens - self.compressed_tokens) as f32 / self.original_tokens as f32)
             * 100.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_monorepo_with_per_package_tsconfig_is_typescript() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.join("packages/core")).unwrap();
+        std::fs::write(root.join("packages/core/tsconfig.json"), "{}").unwrap();
+        assert_eq!(
+            Language::detect_project(root).unwrap(),
+            Language::TypeScript
+        );
+    }
+
+    #[test]
+    fn test_tsconfig_inside_node_modules_does_not_count() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.join("node_modules/lib")).unwrap();
+        std::fs::write(root.join("node_modules/lib/tsconfig.json"), "{}").unwrap();
+        assert_eq!(
+            Language::detect_project(root).unwrap(),
+            Language::JavaScript
+        );
     }
 }

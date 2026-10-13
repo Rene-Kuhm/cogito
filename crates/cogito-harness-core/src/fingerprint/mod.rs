@@ -86,14 +86,31 @@ fn find_entry_points(path: &Path, language: &Language) -> Result<Vec<PathBuf>> {
         Language::Unknown => &[],
     };
 
-    for pattern in patterns {
-        for entry in glob::glob(&path.join(pattern).to_string_lossy())
-            .with_context(|| format!("Invalid glob pattern: {pattern}"))?
+    // Patterns are matched against paths relative to the project while walking
+    // it, instead of with `glob::glob`: that follows symlinks and descends into
+    // `node_modules`, where pnpm/yarn workspaces link packages into each other,
+    // so a monorepo sends it round a cycle until the OS reports ELOOP.
+    let matchers = patterns
+        .iter()
+        .map(|pattern| {
+            glob::Pattern::new(pattern).with_context(|| format!("Invalid glob pattern: {pattern}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // `*` stays within one path segment, as it did with `glob::glob`.
+    let options = glob::MatchOptions {
+        require_literal_separator: true,
+        ..glob::MatchOptions::default()
+    };
+
+    for entry in project_files(path) {
+        let Ok(relative) = entry.path().strip_prefix(path) else {
+            continue;
+        };
+        if matchers
+            .iter()
+            .any(|m| m.matches_path_with(relative, options))
         {
-            let entry = entry?;
-            if entry.is_file() {
-                entry_points.push(entry);
-            }
+            entry_points.push(entry.into_path());
         }
     }
 
@@ -108,20 +125,8 @@ fn find_entry_points(path: &Path, language: &Language) -> Result<Vec<PathBuf>> {
 fn analyze_data_flows(path: &Path, language: &Language) -> Result<Vec<DataFlow>> {
     let mut flows = Vec::new();
 
-    for entry in WalkDir::new(path)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-
+    for entry in project_files(path) {
         let file_path = entry.path().to_path_buf();
-
-        if should_skip(&file_path) {
-            continue;
-        }
 
         let Some(ext) = file_path.extension() else {
             continue;
@@ -140,29 +145,54 @@ fn analyze_data_flows(path: &Path, language: &Language) -> Result<Vec<DataFlow>>
     Ok(flows)
 }
 
-/// Skip common ignored directories
-fn should_skip(path: &Path) -> bool {
-    let skip_dirs = [
-        "node_modules",
-        "target",
-        "dist",
-        "build",
-        ".git",
-        ".next",
-        "vendor",
-        "venv",
-        "__pycache__",
-        ".venv",
-        "out",
-        "coverage",
-    ];
+/// Directories that hold dependencies, build output or VCS data, never the
+/// project's own code.
+const SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".git",
+    ".next",
+    "vendor",
+    "venv",
+    "__pycache__",
+    ".venv",
+    "out",
+    "coverage",
+];
 
+/// Whether `path` lies inside one of the ignored directories.
+#[cfg(test)]
+fn should_skip(path: &Path) -> bool {
     path.components().any(|c| {
         c.as_os_str()
             .to_str()
-            .map(|s| skip_dirs.contains(&s))
-            .unwrap_or(false)
+            .is_some_and(|s| SKIP_DIRS.contains(&s))
     })
+}
+
+/// The project's own files.
+///
+/// Symlinks are not followed, and ignored directories are pruned rather than
+/// walked and filtered afterwards: a JS monorepo's `node_modules` can hold more
+/// files than the project, and its workspace links form cycles. Entries that
+/// cannot be read are skipped, so one bad path never fails the whole scan.
+fn project_files(path: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+    WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            // The root is always walked, whatever it is called.
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || !entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| SKIP_DIRS.contains(&name))
+        })
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
 }
 
 /// Check if file extension matches language
@@ -286,43 +316,52 @@ fn detect_zones_path(path: &Path) -> Result<Vec<Zone>> {
     let mut revwalk = repo.revwalk()?;
     revwalk.push_head()?;
 
+    // A file's activity is the commits that *changed* it, so each commit is
+    // diffed against its parent. Walking each commit's whole tree instead would
+    // count every commit in which the file merely exists, and date every file
+    // to HEAD.
     for oid in revwalk {
         let Ok(oid) = oid else { continue };
         let Ok(commit) = repo.find_commit(oid) else {
             continue;
         };
+        // A merge repeats changes its parents already made; counting it too
+        // would double every change that came in through a branch.
+        if commit.parent_count() > 1 {
+            continue;
+        }
         let Ok(tree) = commit.tree() else {
             continue;
+        };
+        let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+        let diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) {
+            Ok(diff) => diff,
+            Err(e) => {
+                tracing::debug!("[cogito] Diff error: {}", e);
+                continue;
+            }
         };
 
         let commit_time =
             DateTime::<Utc>::from_timestamp(commit.time().seconds(), 0).unwrap_or_else(Utc::now);
 
-        let walk_result = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-            let Some(entry_name) = entry.name() else {
-                return git2::TreeWalkResult::Ok;
+        for delta in diff.deltas() {
+            let Some(changed) = delta.new_file().path().or_else(|| delta.old_file().path()) else {
+                continue;
             };
-            let rel_path = if root.is_empty() {
-                PathBuf::from(entry_name)
-            } else {
-                PathBuf::from(root).join(entry_name)
-            };
-            let Ok(obj) = entry.to_object(&repo) else {
-                return git2::TreeWalkResult::Ok;
-            };
-            if obj.as_blob().is_some() {
-                let stats = zone_map.entry(rel_path).or_insert(ZoneStats::new());
-                stats.commit_count += 1;
-                if commit_time > stats.last_modified {
-                    stats.last_modified = commit_time;
-                }
+            let stats = zone_map
+                .entry(changed.to_path_buf())
+                .or_insert_with(ZoneStats::new);
+            stats.commit_count += 1;
+            if commit_time > stats.last_modified {
+                stats.last_modified = commit_time;
             }
-            git2::TreeWalkResult::Ok
-        });
-
-        if let Err(e) = walk_result {
-            tracing::debug!("[cogito] Walk error: {}", e);
         }
+    }
+
+    // Only files that still exist are zones of the project.
+    if let Ok(head_tree) = repo.head().and_then(|head| head.peel_to_tree()) {
+        zone_map.retain(|file, _| head_tree.get_path(file).is_ok());
     }
 
     let mut zones = Vec::new();
@@ -374,6 +413,137 @@ mod tests {
         let language = Language::Rust;
         let result = find_entry_points(&path, &language).unwrap();
         let _ = result;
+    }
+
+    /// A pnpm-style workspace: two packages linked into each other's
+    /// `node_modules`, which is a symlink cycle.
+    #[cfg(unix)]
+    fn monorepo_with_symlink_cycle() -> tempfile::TempDir {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        for pkg in ["shared", "evidence"] {
+            std::fs::create_dir_all(root.join(format!("packages/{pkg}/src"))).unwrap();
+            std::fs::create_dir_all(root.join(format!("packages/{pkg}/node_modules/@app")))
+                .unwrap();
+            std::fs::write(
+                root.join(format!("packages/{pkg}/src/index.ts")),
+                "import { x } from './util';\n",
+            )
+            .unwrap();
+        }
+        symlink(
+            root.join("packages/evidence"),
+            root.join("packages/shared/node_modules/@app/evidence"),
+        )
+        .unwrap();
+        symlink(
+            root.join("packages/shared"),
+            root.join("packages/evidence/node_modules/@app/shared"),
+        )
+        .unwrap();
+        // Dependency code must never be reported as the project's.
+        std::fs::create_dir_all(root.join("node_modules/lib")).unwrap();
+        std::fs::write(root.join("node_modules/lib/index.ts"), "export {};\n").unwrap();
+        std::fs::write(root.join("index.ts"), "import a from 'a';\n").unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_entry_points_survive_workspace_symlink_cycles() {
+        let dir = monorepo_with_symlink_cycle();
+        let root = dir.path();
+
+        let found: Vec<_> = find_entry_points(root, &Language::TypeScript)
+            .expect("a symlink cycle in node_modules must not fail the scan")
+            .into_iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+
+        assert_eq!(
+            found,
+            vec![
+                PathBuf::from("index.ts"),
+                PathBuf::from("packages/evidence/src/index.ts"),
+                PathBuf::from("packages/shared/src/index.ts"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_data_flows_skip_node_modules_and_cycles() {
+        let dir = monorepo_with_symlink_cycle();
+        let flows = analyze_data_flows(dir.path(), &Language::TypeScript).unwrap();
+        assert_eq!(flows.len(), 3, "one import per project file: {flows:?}");
+        assert!(
+            flows
+                .iter()
+                .all(|f| !f.from.components().any(|c| c.as_os_str() == "node_modules")),
+            "no flow may come from node_modules: {flows:?}"
+        );
+    }
+
+    #[test]
+    fn test_entry_point_patterns_keep_star_within_one_segment() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("cmd/tool/nested")).unwrap();
+        std::fs::write(root.join("cmd/run.go"), "package main\n").unwrap();
+        std::fs::write(root.join("cmd/tool/nested/deep.go"), "package main\n").unwrap();
+
+        let found: Vec<_> = find_entry_points(root, &Language::Go)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+        assert_eq!(found, vec![PathBuf::from("cmd/run.go")]);
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn test_zone_counts_are_commits_that_changed_the_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+
+        std::fs::write(root.join("busy.ts"), "1").unwrap();
+        std::fs::write(root.join("quiet.ts"), "1").unwrap();
+        std::fs::write(root.join("gone.ts"), "1").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-q", "-m", "init"]);
+        for n in 2..=4 {
+            std::fs::write(root.join("busy.ts"), n.to_string()).unwrap();
+            git(root, &["commit", "-q", "-am", "touch busy"]);
+        }
+        std::fs::remove_file(root.join("gone.ts")).unwrap();
+        git(root, &["commit", "-q", "-am", "remove gone"]);
+
+        let zones = detect_zones_path(root).unwrap();
+        let count = |name: &str| {
+            zones
+                .iter()
+                .find(|z| z.path == Path::new(name))
+                .map(|z| z.change_count)
+        };
+        // quiet.ts exists in all five commits but changed in one.
+        assert_eq!(count("busy.ts"), Some(4));
+        assert_eq!(count("quiet.ts"), Some(1));
+        assert_eq!(count("gone.ts"), None, "deleted files are not zones");
     }
 
     #[test]
