@@ -61,9 +61,11 @@ fn is_busy(error: &anyhow::Error) -> bool {
 ///
 /// `busy_timeout` comes first: the `journal_mode = WAL` switch takes a write
 /// lock, and without the timeout already in force that switch fails at once
-/// under contention instead of waiting for the lock.
+/// under contention instead of waiting for the lock. It is 30 s because a
+/// cold sync of 100k files holds the write lock for about 13 s, and a second
+/// writer arriving at the start should wait for it, not fail.
 const PRAGMAS: &str = "
-    PRAGMA busy_timeout = 10000;
+    PRAGMA busy_timeout = 30000;
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
     PRAGMA temp_store = MEMORY;

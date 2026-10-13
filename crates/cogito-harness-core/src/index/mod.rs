@@ -230,9 +230,9 @@ pub fn sync(
     }
     drop(indexed_stmt);
 
-    // Batch size for committing transactions. Smaller batches reduce commit time
-    // but more batches mean more transaction overhead. 5000 is a good balance for
-    // large projects.
+    // Files per batch of statements. The whole sync is one transaction (see
+    // above), so the batch size only bounds the work done between cursor
+    // resets; it does not decide what is committed together.
     const BATCH_SIZE: usize = 5000;
 
     // The whole sync is one transaction, as `reparse_file` documents: a sync
