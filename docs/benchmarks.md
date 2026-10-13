@@ -90,35 +90,40 @@ remaining repositories. No single network failure stops the entire run.
 ## Results Table
 
 Produced by running `cogito bench` against the pinned manifest with
-`tiktoken-rs` and the `cl100k_base` vocabulary. The manifest pins each
-repository to a full commit SHA, and the terms are the ones listed for that
-repository in `benchmarks/repos.json`.
+`tiktoken-rs` and the `cl100k_base` vocabulary, at commit `0e3eebc` (2026-10-13).
+The manifest pins each repository to a full commit SHA, and the terms are the
+ones listed for that repository in `benchmarks/repos.json`.
+
+The baseline lists and searches what an agent would see: tracked files and
+untracked files that `.gitignore` does not exclude. Earlier runs walked the
+directory tree instead, which inflated the baseline on repositories with
+ignored output. These are the corrected numbers.
 
 ### ripgrep (BurntSushi/ripgrep) at `3fce3b5b`
 
 | term | bl_find | bl_read | co_find | co_read | savings | pct% |
 |------|--------:|--------:|--------:|--------:|--------:|-----:|
-| regex (5) | 17,919 | 35,710 | 350 | 6,778 | 46,501 | 86.7 |
-| Matcher (5) | 10,690 | 24,455 | 335 | 5,354 | 29,456 | 83.8 |
-| search (5) | 43,952 | 44,252 | 384 | 14,755 | 73,065 | 82.8 |
-| flags (5) | 5,338 | 50,228 | 397 | 4,171 | 50,998 | 91.8 |
-| **TOTAL** | **77,899** | **154,645** | **1,466** | **31,058** | **200,020** | **86.0** |
+| regex (5) | 18,747 | 35,710 | 349 | 6,787 | 47,321 | 86.9 |
+| Matcher (5) | 11,801 | 24,455 | 334 | 5,383 | 30,539 | 84.2 |
+| search (5) | 43,680 | 44,252 | 383 | 14,765 | 72,784 | 82.8 |
+| flags (5) | 6,643 | 50,228 | 396 | 4,185 | 52,290 | 91.9 |
+| **TOTAL** | **80,871** | **154,645** | **1,462** | **31,120** | **202,934** | **86.2** |
 
 ### bat (sharkdp/bat) at `d9559c69`
 
 | term | bl_find | bl_read | co_find | co_read | savings | pct% |
 |------|--------:|--------:|--------:|--------:|--------:|-----:|
-| syntax (5) | 174,355 | 28,934 | 1,385 | 19,445 | 182,459 | 89.8 |
-| Theme (5) | 12,466 | 40,106 | 233 | 4,556 | 47,783 | 90.9 |
-| highlighter (5) | 4,829 | 71,217 | 207 | 8,347 | 67,492 | 88.8 |
-| assets (5) | 119,961 | 28,853 | 275 | 8,878 | 139,661 | 93.8 |
-| **TOTAL** | **311,611** | **169,110** | **2,100** | **41,226** | **437,395** | **91.0** |
+| syntax (5) | 179,645 | 28,934 | 1,385 | 19,457 | 187,737 | 90.0 |
+| Theme (5) | 20,115 | 40,106 | 233 | 4,570 | 55,418 | 92.0 |
+| highlighter (5) | 12,687 | 71,217 | 207 | 8,362 | 75,335 | 89.8 |
+| assets (5) | 126,367 | 28,853 | 275 | 8,890 | 146,055 | 94.1 |
+| **TOTAL** | **338,814** | **169,110** | **2,100** | **41,279** | **464,545** | **91.5** |
 
 ### Combined
 
 | | baseline | cogito | savings | pct% |
 |--|---------:|-------:|--------:|-----:|
-| Both repositories, all eight terms | 713,265 | 75,850 | 637,415 | 89.4 |
+| Both repositories, all eight terms | 743,440 | 75,961 | 667,479 | 89.8 |
 
 Each row is a full run of the two strategies over the same matched files, so
 the comparison isolates how the code is read, not how it is found.
@@ -126,16 +131,16 @@ the comparison isolates how the code is read, not how it is found.
 ### Interpretation
 
 - **Finding cost varies with how common the term is.** For a term that appears
-  in many files, the baseline's recursive search prints every matching line,
-  which is where bat's `syntax` and `assets` rows spend most of their budget
-  (174,355 and 119,961 tokens to find, against 1,385 and 275 with Cogito). For
+  in many files, the baseline's search prints every matching line, which is
+  where bat's `syntax` and `assets` rows spend most of their budget (179,645
+  and 126,367 tokens to find, against 1,385 and 275 with Cogito). For
   a term that appears in few files, listing and searching is cheap either way.
 - **Reading cost is where the gap is stable.** Reading matched files whole
   costs 154,645 tokens on ripgrep and 169,110 on bat; outlines plus the matched
-  line ranges cost 31,058 and 41,226. That is the part the product actually
+  line ranges cost 31,120 and 41,279. That is the part the product actually
   changes, and it holds across every term measured.
-- **Combined: 89.4% fewer tokens** across both repositories and all eight
-  terms, from 713,265 down to 75,850.
+- **Combined: 89.8% fewer tokens** across both repositories and all eight
+  terms, from 743,440 down to 75,961.
 
 ### Caveats
 
