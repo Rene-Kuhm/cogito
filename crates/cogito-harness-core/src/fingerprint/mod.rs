@@ -29,10 +29,13 @@ pub async fn generate(project: &Project) -> Result<Fingerprint> {
         .filter_map(|entry| entry.path().strip_prefix(root).ok().map(Path::to_path_buf))
         .collect();
     let modules = crate::map::layout::find_modules(root, &all_files);
-    let resolver = crate::map::layout::Resolver::new(&all_files, &modules);
+    let resolver = crate::map::layout::Resolver::new(root, &all_files, &modules);
     for flow in &mut data_flows {
         let from = flow.from.strip_prefix(root).unwrap_or(&flow.from);
-        flow.resolved = resolver.resolve(from, &flow.to.to_string_lossy(), project.language);
+        // Resolve using the importing file's language, not the project language.
+        // Per-file detection was already applied during extraction; use it here too.
+        let file_language = Language::detect(from).unwrap_or(project.language);
+        flow.resolved = resolver.resolve(from, &flow.to.to_string_lossy(), file_language);
     }
     let mut docs: Vec<PathBuf> = all_files
         .iter()
@@ -217,17 +220,22 @@ fn find_entry_points(path: &Path, language: &Language) -> Result<Vec<PathBuf>> {
     Ok(entry_points)
 }
 
-/// Analyze data flows between modules via import/require analysis
-fn analyze_data_flows(path: &Path, language: &Language) -> Result<Vec<DataFlow>> {
+/// Analyze data flows between modules via import/require analysis.
+/// Uses per-file language detection so polyglot repositories extract imports
+/// from every file regardless of the project's detected primary language.
+fn analyze_data_flows(path: &Path, project_language: &Language) -> Result<Vec<DataFlow>> {
     let mut flows = Vec::new();
 
     for entry in project_files(path) {
         let file_path = entry.path().to_path_buf();
 
+        // Detect language per-file, falling back to project language for unknown extensions
+        let language = Language::detect(&file_path).unwrap_or(*project_language);
+
         let Some(ext) = file_path.extension() else {
             continue;
         };
-        if !is_code_file(ext, language) {
+        if !is_code_file(ext, &language) {
             continue;
         }
 
@@ -235,7 +243,7 @@ fn analyze_data_flows(path: &Path, language: &Language) -> Result<Vec<DataFlow>>
             continue;
         };
 
-        flows.extend(extract_imports(&file_path, &content, language)?);
+        flows.extend(extract_imports(&file_path, &content, &language)?);
     }
 
     Ok(flows)
@@ -390,9 +398,12 @@ fn extract_imports(file_path: &Path, content: &str, language: &Language) -> Resu
             }
         }
         Language::Python => {
+            // `import pkg` and `import pkg.sub`
             let import_re = regex::Regex::new(r"^\s*import\s+([a-zA-Z0-9_.]+)")?;
+            // `from pkg import x`, `from .sibling import x`, `from ..parent import x`
+            // Allow leading dots for relative imports.
             let from_re =
-                regex::Regex::new(r"^\s*from\s+([a-zA-Z0-9_.]+)\s+import\s+([a-zA-Z0-9_*, ]+)")?;
+                regex::Regex::new(r"^\s*from\s+([.a-zA-Z0-9_]+)\s+import\s+([a-zA-Z0-9_*, ]+)")?;
 
             for line in content.lines() {
                 if let Some(cap) = import_re.captures(line)
@@ -451,6 +462,53 @@ fn extract_imports(file_path: &Path, content: &str, language: &Language) -> Resu
                         flow_type: FlowType::Import,
                         resolved: None,
                     });
+                }
+            }
+        }
+        Language::Java => {
+            // `import a.b.C;`, `import static a.b.C.member;`, `import a.b.*;`
+            // Strip trailing `.member` or `.*` down to the type or package path.
+            for line in content.lines() {
+                let trimmed = line.trim();
+                // Wildcard import: `import a.b.*;`
+                if let Some(import_content) = trimmed.strip_prefix("import ") {
+                    let is_static = import_content.starts_with("static ");
+                    let content = if is_static {
+                        import_content.strip_prefix("static ").unwrap()
+                    } else {
+                        import_content
+                    };
+                    // Strip trailing `;`
+                    let Some(without_semicolon) = content.strip_suffix(';') else {
+                        continue;
+                    };
+                    if let Some(package) = without_semicolon.strip_suffix(".*") {
+                        // Wildcard import: `a.b.*` → keep `a.b`
+                        flows.push(DataFlow {
+                            from: file_path.to_path_buf(),
+                            to: PathBuf::from(package),
+                            flow_type: FlowType::Import,
+                            resolved: None,
+                        });
+                    } else if is_static {
+                        // Static import: `a.b.C.member` → keep `a.b.C`
+                        if let Some((pkg, _member)) = without_semicolon.rsplit_once('.') {
+                            flows.push(DataFlow {
+                                from: file_path.to_path_buf(),
+                                to: PathBuf::from(pkg),
+                                flow_type: FlowType::Import,
+                                resolved: None,
+                            });
+                        }
+                    } else {
+                        // Plain import: `a.b.C;` → keep `a.b.C`
+                        flows.push(DataFlow {
+                            from: file_path.to_path_buf(),
+                            to: PathBuf::from(without_semicolon),
+                            flow_type: FlowType::Import,
+                            resolved: None,
+                        });
+                    }
                 }
             }
         }

@@ -105,18 +105,28 @@ pub(crate) struct Resolver {
     files: HashSet<PathBuf>,
     /// Workspace package name → its directory, for `@scope/pkg` imports.
     packages: HashMap<String, PathBuf>,
+    /// Go module path from go.mod, e.g. `example.com/app`.
+    go_module: Option<String>,
 }
 
 impl Resolver {
-    pub(crate) fn new(files: &[PathBuf], modules: &[ModuleInfo]) -> Self {
+    pub(crate) fn new(root: &Path, files: &[PathBuf], modules: &[ModuleInfo]) -> Self {
         let packages = modules
             .iter()
             .filter(|m| m.manifest == "package.json")
             .map(|m| (m.name.clone(), m.path.clone()))
             .collect();
+        // Extract Go module path from the root-level go.mod if present.
+        // `find_modules` skips root-level manifests, so we check the files list directly.
+        let go_module = files
+            .iter()
+            .find(|f| f.as_os_str() == "go.mod")
+            .map(|f| root.join(f))
+            .and_then(|f| manifest_name(&f, "go.mod"));
         Self {
             files: files.iter().cloned().collect(),
             packages,
+            go_module,
         }
     }
 
@@ -128,6 +138,9 @@ impl Resolver {
         match language {
             Language::TypeScript | Language::JavaScript => self.resolve_js(from, spec),
             Language::Rust => self.resolve_rust(from, spec),
+            Language::Python => self.resolve_python(from, spec),
+            Language::Go => self.resolve_go(from, spec),
+            Language::Java => self.resolve_java(from, spec),
             _ => None,
         }
     }
@@ -264,6 +277,211 @@ impl Resolver {
         }
         None
     }
+
+    /// Python resolution for:
+    /// - `from pkg.auth import x` / `from pkg.auth import x as y`
+    /// - `import pkg.auth`
+    /// - relative: `from .auth import x`, `from ..pkg import y`
+    ///
+    /// Candidate files for a dotted path `a.b.c`:
+    /// 1. `a/b/c.py`
+    /// 2. `a/b/c/__init__.py`
+    ///
+    /// Tried first from the importing file's package directory, then from
+    /// `src/`, then from the project root.
+    fn resolve_python(&self, from: &Path, spec: &str) -> Option<PathBuf> {
+        // For relative imports, use the file's parent directory directly.
+        // For absolute imports, use the project root.
+        let base = if spec.starts_with('.') {
+            // Relative import: leading dots indicate upward traversal from the
+            // importing file's package. `.pkg` means current package's `pkg`,
+            // `..pkg` means parent package's `pkg`, etc.
+            let rest = spec.trim_start_matches('.');
+            let dots = spec.len() - rest.len();
+            let from_dir = from.parent().unwrap_or(Path::new(""));
+            let mut base = from_dir.to_path_buf();
+            // Always go up (dots - 1) levels. `.x` goes up 0, `..x` goes up 1.
+            for _ in 0..dots.saturating_sub(1) {
+                base = base.parent().map(Path::to_path_buf)?;
+            }
+            if rest.is_empty() {
+                base // e.g., `from .. import x`
+            } else {
+                base.join(rest.replace('.', "/"))
+            }
+        } else {
+            PathBuf::from(spec.replace('.', "/"))
+        };
+
+        // Candidate paths tried in order: a/b/c.py, a/b/c/__init__.py.
+        for candidate in [base.with_extension("py"), base.join("__init__.py")] {
+            if self.files.contains(&candidate) {
+                return Some(candidate);
+            }
+        }
+
+        // Try from `src/` if not already under it.
+        if !base.starts_with("src") {
+            for candidate in [
+                PathBuf::from("src").join(&base).with_extension("py"),
+                PathBuf::from("src").join(&base).join("__init__.py"),
+            ] {
+                if self.files.contains(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Go resolution for:
+    /// - `import "example.com/app/internal/auth"` → `internal/auth/` package
+    /// - `./x` and `../x` relative imports
+    ///
+    /// Go imports address packages (directories). The resolved path is a `.go`
+    /// file within that package:
+    /// 1. `<dir>/<basename-of-dir>.go` (preferred, e.g. `auth/auth.go`)
+    /// 2. the single `.go` file in that directory
+    /// 3. lexicographically first `.go` file
+    fn resolve_go(&self, from: &Path, spec: &str) -> Option<PathBuf> {
+        let Some(module) = &self.go_module else {
+            return None;
+        };
+
+        let dir = if spec == module {
+            PathBuf::from(".")
+        } else if let Some(rest) = spec.strip_prefix(module) {
+            let rest = rest.trim_start_matches('/');
+            if rest.is_empty() {
+                PathBuf::from(".")
+            } else {
+                PathBuf::from(rest.replace('.', "/"))
+            }
+        } else if spec.starts_with("./") || spec.starts_with("../") {
+            // Relative import: resolve against the file's directory.
+            // Go relative imports are relative to the directory containing the
+            // source file. `../lib` means the `lib` package in the parent
+            // directory of the file's own directory.
+            let from_dir = from.parent().unwrap_or(Path::new(""));
+            // Count leading `..` or `.` to determine levels to go up.
+            // `../` = 1 level up, `../../` = 2 levels up, etc.
+            let mut levels = 0usize;
+            let mut chars = spec.chars().peekable();
+            while chars.peek() == Some(&'.') {
+                chars.next();
+                levels += 1;
+            }
+            // The path after leading dots (skip the `/` separator if present).
+            let after_dots: String = chars.collect();
+            let rest = after_dots.trim_start_matches('/');
+            let mut dir = from_dir.to_path_buf();
+            // Go up `levels` levels.
+            for _ in 0..levels {
+                let parent = dir.parent()?;
+                dir = parent.to_path_buf();
+            }
+            if rest.is_empty() {
+                dir
+            } else {
+                dir.join(rest.replace('.', "/"))
+            }
+        } else {
+            // External package — not resolvable
+            return None;
+        };
+
+        self.go_package_file(&dir)
+    }
+
+    /// Find the primary `.go` file for a Go package directory.
+    fn go_package_file(&self, dir: &Path) -> Option<PathBuf> {
+        // Prefer <dir>/<basename>.go
+        if let Some(basename) = dir.file_name().and_then(|n| n.to_str()) {
+            let preferred = dir.join(format!("{basename}.go"));
+            if self.files.contains(&preferred) {
+                return Some(preferred);
+            }
+        }
+
+        // Find all .go files in the directory
+        let mut go_files: Vec<PathBuf> = self
+            .files
+            .iter()
+            .filter(|f| {
+                f.parent() == Some(dir) && f.extension().map(|e| e == "go").unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+
+        go_files.sort();
+        go_files.into_iter().next()
+    }
+
+    /// Java resolution for:
+    /// - `import com.acme.Auth;` → `com/acme/Auth.java`
+    /// - `import com.acme.util.*;` → any `.java` file in `com/acme/util/`
+    ///
+    /// Source roots are discovered from the file set: directories ending in
+    /// `src/main/java`, `src/test/java`, or a `src` path component, plus the
+    /// project root (`.`).
+    #[allow(clippy::collapsible_if)]
+    fn resolve_java(&self, _from: &Path, spec: &str) -> Option<PathBuf> {
+        // Discover source roots from known files.
+        let mut source_roots: Vec<PathBuf> = vec![PathBuf::from(".")];
+        for file in &self.files {
+            let components: Vec<_> = file.components().collect();
+            for i in 0..components.len() {
+                let path = components[..=i].iter().collect::<PathBuf>();
+                let path_str = path.display().to_string();
+                // `ends_with("src")` on a string would also match `my_src`, so
+                // the bare `src` root is matched on the last path component.
+                let is_bare_src = path.file_name().and_then(|n| n.to_str()) == Some("src");
+                if path_str.ends_with("src/main/java")
+                    || path_str.ends_with("src/test/java")
+                    || (is_bare_src && !source_roots.contains(&path))
+                {
+                    if !source_roots.contains(&path) {
+                        source_roots.push(path);
+                    }
+                }
+            }
+        }
+
+        // Convert import spec like `com.acme.Auth` to path `com/acme/Auth.java`
+        let spec = spec.replace('.', "/");
+        let java_file = format!("{spec}.java");
+
+        for root in &source_roots {
+            // First try: specific class file
+            let candidate = root.join(&java_file);
+            if self.files.contains(&candidate) {
+                return Some(candidate);
+            }
+        }
+
+        // Second try: for package-level imports, find any .java file in the package directory
+        // `spec` is already converted from dots to slashes above.
+        for root in &source_roots {
+            let pkg_path = root.join(&spec);
+            // Find all .java files in this package directory
+            let mut java_files: Vec<PathBuf> = self
+                .files
+                .iter()
+                .filter(|f| {
+                    f.parent() == Some(&pkg_path)
+                        && f.extension().map(|e| e == "java").unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            if !java_files.is_empty() {
+                java_files.sort();
+                return Some(java_files.into_iter().next().unwrap());
+            }
+        }
+
+        None
+    }
 }
 
 /// The directory holding a Rust file's child modules: `src/a/` for
@@ -305,6 +523,18 @@ mod tests {
                 .iter()
                 .map(|(n, d)| (n.to_string(), PathBuf::from(d)))
                 .collect(),
+            go_module: None,
+        }
+    }
+
+    fn resolver_with_go(files: &[&str], packages: &[(&str, &str)], go_module: &str) -> Resolver {
+        Resolver {
+            files: files.iter().map(PathBuf::from).collect(),
+            packages: packages
+                .iter()
+                .map(|(n, d)| (n.to_string(), PathBuf::from(d)))
+                .collect(),
+            go_module: Some(go_module.to_string()),
         }
     }
 
@@ -398,6 +628,122 @@ mod tests {
             rs("core/src/storage/sqlite.rs", "super::super::types").as_deref(),
             None,
             "super::super is not followed"
+        );
+    }
+
+    #[test]
+    fn test_python_imports_resolve_to_module_files() {
+        let r = resolver(
+            &[
+                "pkg/__init__.py",
+                "pkg/auth.py",
+                "pkg/utils/__init__.py",
+                "pkg/utils/helpers.py",
+                "app/main.py",
+            ],
+            &[],
+        );
+        let py = |from: &str, spec: &str| {
+            r.resolve(Path::new(from), spec, Language::Python)
+                .map(|p| p.display().to_string())
+        };
+        // Absolute import from pkg.auth
+        assert_eq!(
+            py("app/main.py", "pkg.auth").as_deref(),
+            Some("pkg/auth.py")
+        );
+        // from import
+        assert_eq!(
+            py("app/main.py", "pkg.utils.helpers").as_deref(),
+            Some("pkg/utils/helpers.py")
+        );
+        // External package must not resolve
+        assert_eq!(py("app/main.py", "os"), None, "stdlib is external");
+    }
+
+    #[test]
+    fn test_python_relative_imports_resolve() {
+        let r = resolver(
+            &[
+                "pkg/__init__.py",
+                "pkg/a.py",
+                "pkg/b.py",
+                "pkg/sub/__init__.py",
+                "pkg/sub/c.py",
+            ],
+            &[],
+        );
+        let py = |from: &str, spec: &str| {
+            r.resolve(Path::new(from), spec, Language::Python)
+                .map(|p| p.display().to_string())
+        };
+        // from .b import x
+        assert_eq!(py("pkg/a.py", ".b").as_deref(), Some("pkg/b.py"));
+        // from .sub.c import x
+        assert_eq!(py("pkg/a.py", ".sub.c").as_deref(), Some("pkg/sub/c.py"));
+        // from .. import x (from pkg/sub/c.py)
+        assert_eq!(py("pkg/sub/c.py", "..").as_deref(), Some("pkg/__init__.py"));
+    }
+
+    #[test]
+    fn test_go_imports_resolve_to_package_files() {
+        let r = resolver_with_go(
+            &[
+                "go.mod",
+                "internal/auth/auth.go",
+                "internal/auth/types.go",
+                "cmd/main.go",
+                "lib/utils.go",
+            ],
+            &[],
+            "example.com/app",
+        );
+        let go = |from: &str, spec: &str| {
+            r.resolve(Path::new(from), spec, Language::Go)
+                .map(|p| p.display().to_string())
+        };
+        // Absolute import under the module
+        assert_eq!(
+            go("cmd/main.go", "example.com/app/internal/auth").as_deref(),
+            Some("internal/auth/auth.go")
+        );
+        // Relative import
+        assert_eq!(
+            go("internal/auth/types.go", "../lib").as_deref(),
+            Some("lib/utils.go")
+        );
+        // External package must not resolve
+        assert_eq!(go("cmd/main.go", "fmt"), None, "stdlib is external");
+    }
+
+    #[test]
+    fn test_java_imports_resolve_to_source_files() {
+        let r = resolver(
+            &[
+                "src/main/java/com/acme/Auth.java",
+                "src/main/java/com/acme/App.java",
+                "src/main/java/com/acme/util/Helper.java",
+                "src/test/java/com/acme/AuthTest.java",
+            ],
+            &[],
+        );
+        let java = |from: &str, spec: &str| {
+            r.resolve(Path::new(from), spec, Language::Java)
+                .map(|p| p.display().to_string())
+        };
+        assert_eq!(
+            java("src/main/java/com/acme/App.java", "com.acme.Auth").as_deref(),
+            Some("src/main/java/com/acme/Auth.java")
+        );
+        assert_eq!(
+            java("src/main/java/com/acme/App.java", "com.acme.util.Helper").as_deref(),
+            Some("src/main/java/com/acme/util/Helper.java")
+        );
+        // External package must not resolve
+        assert_eq!(
+            java("src/main/java/com/acme/App.java", "java.util.List"),
+            None,
+            "stdlib is external"
         );
     }
 }
