@@ -30,6 +30,7 @@
   "files": [
     "index.ts",
     "README.md",
+    "LICENSE",
     "package.json"
   ],
   "publishConfig": {

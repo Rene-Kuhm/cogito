@@ -6,7 +6,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Cogito CLI tool"
+description = "Context harness for AI coding agents: MCP server and one-command setup for Claude Code, Gentle Shell, opencode, Codex, Gemini CLI and Crush"
+keywords.workspace = true
+categories.workspace = true
 readme = "../../README.md"
 
 [[bin]]

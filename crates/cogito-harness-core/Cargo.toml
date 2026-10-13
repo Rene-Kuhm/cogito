@@ -6,7 +6,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Core engine for Cogito context optimization"
+description = "Context engine for AI coding agents: git-based code fingerprints, a SQLite knowledge store, and AST-aware compression for 10 languages"
+keywords.workspace = true
+categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]

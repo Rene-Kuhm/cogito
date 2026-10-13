@@ -6,7 +6,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Cogito REST API server"
+description = "HTTP API for the Cogito context harness: context compression, code fingerprints, tags and architectural decisions"
+keywords.workspace = true
+categories.workspace = true
 readme = "../../README.md"
 
 [[bin]]
