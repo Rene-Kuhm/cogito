@@ -12,12 +12,15 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-authors = ["Cogito Team <hello@cogito.ai>"]
+# `cogito.ai` is not ours -- it is a parked domain for sale, and a security
+# address there would deliver reports to whoever buys it. Everything published
+# to crates.io is permanent, so the metadata points at the repository instead.
+authors = ["Rene Kuhm <157995252+Rene-Kuhm@users.noreply.github.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/Rene-Kuhm/cogito-harness"
-homepage = "https://cogito.ai"
-description = "Intelligent context harness for AI coding agents"
-keywords = ["ai", "agents", "context", "optimization", "coding"]
+homepage = "https://github.com/Rene-Kuhm/cogito-harness"
+description = "Context harness for AI coding agents"
+keywords = ["ai", "agents", "llm", "mcp", "context"]
 categories = ["development-tools", "artificial-intelligence"]
 
 [workspace.dependencies]
