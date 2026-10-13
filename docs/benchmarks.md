@@ -6,8 +6,8 @@ ordinary way.
 
 ## What the Benchmark Measures
 
-The benchmark compares two strategies for answering the question
-"find this term and read the code around it":
+The benchmark compares two strategies for the question "find this term and read
+the code around it":
 
 ### Baseline (an agent without Cogito)
 
@@ -89,15 +89,10 @@ remaining repositories. No single network failure stops the entire run.
 
 ## Results Table
 
-Produced by running the pinned manifest, with `tiktoken-rs` and the
-`cl100k_base` vocabulary:
-
-```
-cogito bench
-```
-
-The manifest pins each repository to a full commit SHA, and the terms are the
-ones listed for that repository in `benchmarks/repos.json`.
+Produced by running `cogito bench` against the pinned manifest with
+`tiktoken-rs` and the `cl100k_base` vocabulary. The manifest pins each
+repository to a full commit SHA, and the terms are the ones listed for that
+repository in `benchmarks/repos.json`.
 
 ### ripgrep (BurntSushi/ripgrep) at `3fce3b5b`
 
@@ -144,8 +139,9 @@ the comparison isolates how the code is read, not how it is found.
 
 ### Caveats
 
-- These numbers are specific to this repository and these terms. Other
-  repositories and terms will produce different savings percentages.
+- These numbers are specific to the two pinned repositories (ripgrep and bat)
+  and the eight terms listed. Other repositories and terms will produce
+  different savings percentages.
 - A term that matches thousands of files may show lower savings because
   the baseline reads more files. Use `--limit` to cap this.
 - The baseline reading strategy (whole-file reads) is intentionally naive.

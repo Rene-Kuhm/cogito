@@ -1,7 +1,7 @@
 # Editor & Agent Integrations
 
-Cogito is agent-agnostic. One binary, `cogito`, speaks MCP over stdio, HTTP,
-and the command line.
+Cogito is agent-agnostic. One binary, `cogito`, speaks MCP over stdio and
+the command line.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Rene-Kuhm/cogito-harness/main/install.sh | sh
@@ -16,17 +16,17 @@ file it touches, merges instead of overwriting, and is safe to run twice.
 
 ## What setup does per agent
 
-| Agent | Config file | Shape |
+| Agent | Config file(s) | Shape |
 |---|---|---|
-| **Gentle Shell / Pi** | `~/.gentle-shell/agent/settings.json`<br>`~/.gentle-shell/agent/mcp.json` | `packages: ["npm:cogito-harness"]`<br>`mcpServers.cogito` (direct exposure) |
-| **Claude Code** | `~/.claude.json`<br>`~/.claude/settings.json`<br>`~/.claude/hooks/cogito-session-start.sh` | `mcpServers.cogito`<br>`hooks.SessionStart` entry<br>hook script (0755) |
+| **Gentle Shell / Pi** | `~/.gentle-shell/agent/settings.json`<br>`~/.gentle-shell/agent/mcp.json` | `packages: ["npm:cogito-harness"]`<br>`mcpServers.cogito` with `"exposure": "direct"` |
+| **Claude Code** | `~/.claude.json`<br>`~/.claude/settings.json`<br>`~/.claude/hooks/cogito-session-start.sh`<br>`~/.claude/hooks/cogito-pre-tool-use.sh` | `mcpServers.cogito`<br>`hooks.SessionStart` + `hooks.PreToolUse` (sync)<br>0755 session-start script<br>0755 guardrail script |
 | **Codex** | `~/.codex/config.toml` | `[mcp_servers.cogito]` |
 | **Gemini CLI** | `~/.gemini/settings.json` | `mcpServers.cogito` |
-| **opencode** | `~/.config/opencode/opencode.json`<br>`~/.config/opencode/plugins/cogito.js` | `mcp.cogito`<br>session-start plugin |
+| **opencode** | `~/.config/opencode/opencode.json`<br>`~/.config/opencode/plugins/cogito.js` | `mcp.cogito`<br>session plugin |
 | **Crush** | `~/.config/crush/crush.json` | `mcp.cogito` |
 
-An entry is marked `✓ configured` by `cogito doctor` only when **every** file
-for that agent is present. A half-installed agent is reported as missing.
+An entry is marked `✓ configured` by `cogito doctor` only when **every**
+file for that agent is present. A half-installed agent is reported as missing.
 
 ---
 
@@ -52,19 +52,19 @@ Agent aliases: `pi` = `gentle-shell`, `claude` = `claude-code`,
 
 Two halves, both written by setup:
 
-1. **`npm:cogito-harness`** in `settings.json` — a Pi package. On `session_start` it
-   scans the project in the background and sets a status line, and it adds
-   `/cogito` with `status`, `map`, `scan`, `query`, `stats` and `doctor`.
+1. **`npm:cogito-harness`** in `settings.json` — a Pi package. On
+   `session_start` it scans the project in the background and sets a status
+   line, and it adds `/cogito` with `status`, `map`, `scan`, `stats` and `doctor`.
 
    ```
    /cogito status
-   /cogito query where is authentication handled?
+   /cogito map
    ```
 
 2. **`mcpServers.cogito`** in `mcp.json` — the MCP tools, with
    `"exposure": "direct"`. Pi's default exposure is `codemode`, and Gentle
    Shell disables codemode, so under the default the model could not reach
-   the tools.
+   the tools without `direct`.
 
 > **`npm:cogito-harness` is not on npm yet.** Pi runs `npm install` for every
 > entry in `packages`, and a 404 there aborts package resolution — so Pi does
@@ -83,7 +83,7 @@ Two halves, both written by setup:
 
 ### Claude Code
 
-Three files:
+Four files:
 
 - `~/.claude.json` gets `mcpServers.cogito`.
 - `~/.claude/hooks/cogito-session-start.sh` prints the project card (modules,
@@ -98,7 +98,7 @@ Three files:
   blocked and Claude gets the file's outline instead; the first time it greps
   for a plain name, it gets Cogito's search result. Repeating the exact same
   call runs normally, ranged reads and regex greps are never touched, and any
-  error lets the call through. The decision is `cogito hook
+  error lets the call through. The decision logic is in `cogito hook
   claude-pre-tool-use`; the script only hands it Claude Code's JSON.
 - `~/.claude/settings.json` gets a `SessionStart` entry for the card and a
   `PreToolUse` entry (matcher `^(Read|Grep)$`) for the guardrail, both
@@ -164,6 +164,10 @@ card=$(cogito map --card 2>/dev/null)
 printf '<cogito_project>\n%s\n</cogito_project>\n' "$card"
 ```
 
+> **Codex hooks are not yet verified.** Codex has a hooks system, but its
+> contract was not verified against a live Codex CLI session. The `AGENTS.md`
+> block is the only integration implemented.
+
 ### Gemini CLI
 
 `~/.gemini/settings.json` gains `mcpServers.cogito`.
@@ -203,26 +207,19 @@ Any MCP-capable client works if you add the server yourself:
 }
 ```
 
-Cogito exposes five tools, each taking an explicit `path` to the project root.
-They give the agent the project's layout so it can find its way without
-reading the code:
+Cogito exposes four tools, each taking an explicit `path` to the project root:
 
 | Tool | Purpose |
 |---|---|
 | `project_map` | Modules with entry point, size, most changed files and which modules they use. Read it before exploring the repository |
 | `related_files` | What one file imports, what imports it, and its external packages |
-| `search_code` | Find code by words: symbols (functions, types, classes) with `file:line`, file paths, module names and tags |
-| `file_outline` | A file's declarations with line ranges, so only the needed range is read |
-| `add_tag` | Label code locations so `search_code` finds them by that word |
+| `search_code` | Find code by words: symbols (functions, types, classes) with `file:line`, file paths, module names and doc sections |
+| `file_outline` | A file's declarations (code) or sections (Markdown) with line ranges, so only the needed range is read |
 
 The map is stored after each scan and reused until `HEAD` moves, so these calls
 read no source files. Documentation is indexed too: `search_code` finds
 Markdown sections by title, and `file_outline` on a `.md` file lists its
-sections with line ranges. Cogito is not a memory: decisions and session notes
-belong to the agent's memory tool (for example Engram), and Cogito exposes no
-tools for them. On FTTH-Copilot (a 661-file pnpm monorepo) the map costs about
-1,150 tokens, against roughly 11,000 for reading every `package.json` and
-listing the source files.
+sections with line ranges.
 
 State lives in `<project>/.cogito/state.db`. One server process can serve many
 projects; each tool call opens the database for the `path` it was given.
@@ -231,13 +228,13 @@ projects; each tool call opens the database for the `path` it was given.
 
 ## Any agent without MCP
 
-Use the CLI or the REST API.
+Use the CLI directly:
 
 ```bash
 cogito scan
-cogito query "where is billing?"
-cogito compress < big.rs --language rust
-cogito-api            # REST on :8080
+cogito search "useAuth"
+cogito outline src/auth.rs
+cogito map --card
 ```
 
 ---
@@ -246,14 +243,14 @@ cogito-api            # REST on :8080
 
 ### Neovim
 
-Telescope over `cogito scan --json`, or an MCP client such as
+Telescope over `cogito map --json`, or an MCP client such as
 [`mcphub.nvim`](https://github.com/ravitemer/mcphub.nvim).
 
 ### Aider
 
 ```
 /run cogito scan
-/run cogito query "where is the auth code?"
+/run cogito search "where is the auth code?"
 ```
 
 ### CI
@@ -267,17 +264,17 @@ Telescope over `cogito scan --json`, or an MCP client such as
 
 ## Editor matrix
 
-| Editor / Agent | MCP | Adapter | Skill | CLI | API |
-|---|---|---|---|---|---|
-| Gentle Shell (pi) | ✓ direct | ✓ cogito-harness | ✓ | ✓ | ✓ |
-| Claude Code | ✓ | ✓ SessionStart hook | — | ✓ | ✓ |
-| opencode | ✓ | ✓ session plugin | — | ✓ | ✓ |
-| Codex | ✓ | — | — | ✓ | ✓ |
-| Gemini CLI | ✓ | — | — | ✓ | ✓ |
-| Crush | ✓ | — | — | ✓ | ✓ |
-| Cursor | ✓ | — | — | ✓ | ✓ |
-| Zed | ✓ | — | — | ✓ | ✓ |
-| Aider / Neovim | via mcp | — | — | ✓ | ✓ |
+| Editor / Agent | MCP | Session-start card | Read/grep guardrail | `AGENTS.md` block |
+|---|---|---|---|---|
+| Gentle Shell (pi) | ✅ direct | ✅ | — | — |
+| Claude Code | ✅ | ✅ | ✅ | — |
+| opencode | ✅ | ✅ | ✅ | ✅ |
+| Codex | ✅ | — | — | ✅ |
+| Gemini CLI | ✅ | — | — | — |
+| Crush | ✅ | — | — | — |
+| Cursor | ✅ | — | — | — |
+| Zed | ✅ | — | — | — |
+| Aider / Neovim | via MCP | — | — | — |
 
 Missing an agent? Add a row to `Agent` in
 `crates/cogito-harness/src/agents.rs` — it needs a config path and a shape.

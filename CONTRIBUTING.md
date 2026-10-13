@@ -6,7 +6,7 @@ Thank you for your interest in contributing to Cogito!
 
 ### Prerequisites
 
-- Rust 1.75+ (we use 2024 edition)
+- Rust 1.75+ (2024 edition)
 - Git
 - A text editor with Rust support (VS Code + rust-analyzer recommended)
 
@@ -24,7 +24,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 cargo build
 
 # Run tests
-cargo test
+cargo test --all
 
 # Run with logging
 RUST_LOG=debug cargo run -- scan
@@ -34,7 +34,7 @@ RUST_LOG=debug cargo run -- scan
 
 **VS Code**
 1. Install [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
-2. Install [CodeLLDB](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb) for debugging
+2. Install [CodeLLDB](https://marketplace.visualstudio.com/items?itemName=vadimcn.vsdbg-lldb) for debugging
 
 **Neovim**
 ```vim
@@ -58,7 +58,7 @@ cargo fmt --check
 cargo clippy
 
 # Run all checks before committing
-cargo fmt && cargo clippy && cargo test
+cargo fmt && cargo clippy && cargo test --all
 ```
 
 ### Formatting Rules
@@ -70,26 +70,17 @@ cargo fmt && cargo clippy && cargo test
 
 ### Documentation
 
-Public APIs must have doc comments:
+Public APIs must have doc comments. Example from the public `Cogito` API:
 
 ```rust
-/// Compress context while preserving meaning.
+/// Open a Cogito instance bound to a project directory.
 ///
-/// # Arguments
-///
-/// * `content` - The input context to compress
-/// * `options` - Compression configuration
-///
-/// # Example
-///
-/// ```
-/// use cogito_harness_core::{Cogito, CompressionOptions};
-///
-/// let cogito = Cogito::new();
-/// let result = cogito.compress_context("...", options).await?;
-/// ```
-pub async fn compress_context(&self, content: &str, options: CompressionOptions) -> Result<CompressedContext> {
-    // ...
+/// Opens (creating if needed) `<project>/.cogito/state.db`. This is the
+/// correct constructor when the path is supplied by a caller — for
+/// example an MCP tool argument — rather than inherited from the process
+/// working directory.
+pub fn for_project(project: &std::path::Path) -> Result<Self> {
+    Self::with_project_sqlite(&project.join(".cogito"))
 }
 ```
 
@@ -98,12 +89,12 @@ pub async fn compress_context(&self, content: &str, options: CompressionOptions)
 We use [Conventional Commits](https://www.conventionalcommits.org/):
 
 ```
-feat: add semantic tag auto-detection
-fix: correct token estimation for Unicode
-docs: update SPEC.md with new API endpoints
-refactor: extract compression strategies into separate module
-test: add benchmarks for fingerprint generation
-chore: update dependencies
+feat: add Kotlin symbol extraction to tree-sitter parser
+fix: correct import resolution for Go multi-import statements
+docs: update benchmarks.md with ripgrep results
+refactor: extract FTS5 query construction into index module
+test: add import-resolution tests for Python and Java
+chore: update tree-sitter dependencies
 ```
 
 ### Types
@@ -120,16 +111,13 @@ chore: update dependencies
 
 ```bash
 # Run all tests
-cargo test
+cargo test --all
 
 # Run tests with output
 cargo test -- --nocapture
 
 # Run specific test
 cargo test test_name
-
-# Run benchmarks
-cargo bench
 
 # Run doc tests
 cargo test --doc
@@ -139,7 +127,7 @@ cargo test --doc
 
 We aim for meaningful tests, not coverage metrics. Tests should:
 
-1. Test behavior, not implementation
+1. Test behaviour, not implementation
 2. Cover edge cases
 3. Be independent and idempotent
 
@@ -163,8 +151,7 @@ git checkout -b feat/my-new-feature
 ```bash
 cargo fmt
 cargo clippy
-cargo test
-cargo doc --no-deps
+cargo test --all
 ```
 
 ### 4. Submit PR
@@ -185,18 +172,30 @@ cargo doc --no-deps
 ```
 cogito/
 ├── crates/
-│   ├── cogito-harness-core/     # Core engine
+│   ├── cogito-harness-core/        # Core engine library
 │   │   └── src/
-│   │       ├── lib.rs         # Main entry
-│   │       ├── types.rs        # Shared types
-│   │       ├── fingerprint/   # Code fingerprinting
-│   │       ├── compressor/     # Context compression
-│   │       ├── semantic/       # Semantic tags
-│   │       └── decision/       # Decision log
-│   ├── cogito-harness/      # CLI tool
-│   └── cogito-harness-api/      # REST API
-├── SPEC.md              # Project specification
-└── README.md            # Documentation
+│   │       ├── lib.rs             # Public API (Cogito struct)
+│   │       ├── types.rs           # Shared types (Language, Project, Fingerprint, Symbol…)
+│   │       ├── fingerprint/       # Code fingerprint generation
+│   │       ├── index/             # SQLite/FTS5 symbol and file index
+│   │       ├── map/               # Map rendering, outline, symbols, import layout
+│   │       └── storage/           # SQLite connection, schema, migrations
+│   └── cogito-harness/            # CLI binary
+│       └── src/
+│           ├── main.rs            # Entrypoint
+│           ├── mcp.rs             # MCP server (4 tools over stdio)
+│           ├── agents.rs          # Agent registry and config shapes
+│           ├── claude_hook.rs     # PreToolUse guardrail decision logic
+│           └── commands/          # CLI subcommands (mod.rs, bench.rs)
+├── docs/
+│   ├── integrations.md            # Per-agent setup and behaviour
+│   ├── benchmarks.md              # Token savings benchmark details
+│   └── publishing.md              # Release process (crates.io, npm, Homebrew)
+├── examples/                      # Standalone usage examples
+├── packages/cogito-harness/       # npm package for Gentle Shell
+├── skills/cogito/                 # Pi skill
+├── SPEC.md                        # Product specification
+└── README.md                      # Top-level documentation
 ```
 
 ## Issues
@@ -204,16 +203,16 @@ cogito/
 ### Bug Reports
 
 Please include:
-- Cogito version
+- `cogito --version` or git commit
 - Rust version
 - Operating system
 - Minimal reproduction case
-- Expected vs actual behavior
+- Expected vs actual behaviour
 
 ### Feature Requests
 
 Please include:
-- Problem you're trying to solve
+- Problem you are trying to solve
 - Proposed solution
 - Alternatives considered
 
