@@ -235,9 +235,14 @@ pub fn sync(
     // large projects.
     const BATCH_SIZE: usize = 5000;
 
-    // Remove vanished files in one transaction
+    // The whole sync is one transaction, as `reparse_file` documents: a sync
+    // that fails part-way must leave the index as it was, not a mix of the old
+    // and the new state across batches. Batching only bounds the work per
+    // step; it no longer decides what is committed together.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+
+    // Remove vanished files
     {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
         let mut delete_symbols =
             tx.prepare_cached("DELETE FROM indexed_symbols WHERE project_id = ?1 AND path = ?2")?;
         let mut delete_imports =
@@ -256,7 +261,6 @@ pub fn sync(
         drop(delete_symbols);
         drop(delete_imports);
         drop(delete_files);
-        tx.commit()?;
     }
 
     // Process current files in batches
@@ -269,9 +273,6 @@ pub fn sync(
     let resolver = Resolver::new(&root_abs, &files_vec, &modules);
 
     for batch in files_refs.chunks(BATCH_SIZE) {
-        // Each batch is its own transaction for commit efficiency
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-
         // Prepared statements for this batch
         let mut select_metadata = tx.prepare_cached(
             "SELECT size, mtime_ns, content_hash FROM indexed_files WHERE project_id = ?1 AND path = ?2",
@@ -361,9 +362,9 @@ pub fn sync(
         drop(select_metadata);
         drop(update_metadata);
         drop(reparse_stmts);
-        tx.commit()?;
     }
 
+    tx.commit()?;
     Ok(report)
 }
 
