@@ -2,7 +2,7 @@
 
 **Intelligent context harness for AI coding agents.**
 
-Cogito gives AI coding agents the project context they need — structure, symbols, references — without sending the entire codebase. It indexes files and declarations with tree-sitter, keeps an incremental SQLite/FTS5 store in sync with the working tree, and exposes four MCP tools (`project_map`, `search_code`, `file_outline`, `related_files`) that agents can call on demand. Token savings on benchmark: 89.4% on ripgrep and bat — from 713,265 tokens to 75,850 over eight search terms.
+Cogito gives AI coding agents the project context they need — structure, symbols, references — without sending the entire codebase. It indexes files and declarations with tree-sitter, keeps an incremental SQLite/FTS5 store in sync with the working tree, and exposes five MCP tools (`context_pack`, `project_map`, `search_code`, `file_outline`, `related_files`) that agents can call on demand. Token savings on benchmark: 89.4% on ripgrep and bat — from 713,265 tokens to 75,850 over eight search terms.
 
 **Storage**: SQLite with FTS5 full-text index over files and symbols. Incremental sync: a new uncommitted file is visible without a commit or a manual refresh.
 
@@ -215,8 +215,15 @@ On ripgrep and bat combined: 713,265 → 75,850 tokens (89.4% savings).
 cogito mcp
 ```
 
-Four tools: `project_map`, `search_code`, `file_outline`, `related_files`.
-Each tool takes an explicit `path` to the project root.
+Five tools: `context_pack`, `project_map`, `search_code`, `file_outline`,
+`related_files`. Each tool takes an explicit `path` to the project root.
+
+`context_pack` is the one to start with when you know what you are about to do:
+give it the task in your own words and it returns the fragments that matter,
+ranked, with the reason each was chosen and inside a token budget (2000 by
+default, 8000 maximum). Measured recall over ten labelled tasks on ripgrep and
+bat: 66.7%. The table and its limits are in
+[`docs/benchmarks.md`](docs/benchmarks.md).
 
 ---
 

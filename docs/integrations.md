@@ -207,10 +207,11 @@ Any MCP-capable client works if you add the server yourself:
 }
 ```
 
-Cogito exposes four tools, each taking an explicit `path` to the project root:
+Cogito exposes five tools, each taking an explicit `path` to the project root:
 
 | Tool | Purpose |
 |---|---|
+| `context_pack` | The context for a task in one call: ranked fragments with the reason each was chosen, inside a token budget. The first thing to call when you know what you are about to do |
 | `project_map` | Modules with entry point, size, most changed files and which modules they use. Read it before exploring the repository |
 | `related_files` | What one file imports, what imports it, and its external packages |
 | `search_code` | Find code by words: symbols (functions, types, classes) with `file:line`, file paths, module names and doc sections |
@@ -220,6 +221,11 @@ The map is stored after each scan and reused until `HEAD` moves, so these calls
 read no source files. Documentation is indexed too: `search_code` finds
 Markdown sections by title, and `file_outline` on a `.md` file lists its
 sections with line ranges.
+
+`context_pack` is also the tool an agent should reach for first when it already
+knows what it is about to do, because it replaces the sequence of `search_code`,
+`file_outline` and ranged reads that would otherwise be needed to get to the same
+place.
 
 State lives in `<project>/.cogito/state.db`. One server process can serve many
 projects; each tool call opens the database for the `path` it was given.

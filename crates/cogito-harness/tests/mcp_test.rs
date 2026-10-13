@@ -58,6 +58,10 @@ fn test_mcp_initialize() {
         output.contains("capabilities"),
         "Should include capabilities"
     );
+    assert!(
+        output.contains("context_pack"),
+        "the server instructions must name context_pack as the first option for a task: {output}"
+    );
 }
 
 /// The tools a `tools/list` response advertises, by name.

@@ -182,7 +182,7 @@ pub enum ZoneFrequency { Hot, Warm, Cold, Frozen }
 
 Entrypoint: `main.rs` + `commands/mod.rs` (subcommands). `agents.rs` defines
 the agent registry and config shapes. `claude_hook.rs` implements the
-`PreToolUse` guardrail decision logic. `mcp.rs` exposes four tools over stdio.
+`PreToolUse` guardrail decision logic. `mcp.rs` exposes five tools over stdio.
 
 ### Command reference
 
@@ -212,12 +212,13 @@ Global flags: `--verbose`, `--quiet`, `--json`.
 
 **Location**: `crates/cogito-harness/src/mcp.rs`
 
-Transport: stdio subprocess. Four tools, each taking an explicit `path`
-(project root). All four open the SQLite index, run `sync_index` to bring it
+Transport: stdio subprocess. Five tools, each taking an explicit `path`
+(project root). All five open the SQLite index, run `sync_index` to bring it
 up to date with the working tree, then read rows.
 
 | Tool | Input | Output |
 |---|---|---|
+| `context_pack` | `path`, `task`, `budget?` | Ranked fragments inside the budget, each with its reason: a name match, a path match, or one import hop (`imported by X`) |
 | `project_map` | `path`, `refresh?` | Full project map (modules, entry points, zones, busy files) |
 | `search_code` | `path`, `query` | Up to 12 FTS5 hits with bm25 score, file:line, kind |
 | `file_outline` | `path`, `file` | Declarations (code) or sections (Markdown) with line ranges |

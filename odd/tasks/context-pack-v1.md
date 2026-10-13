@@ -40,47 +40,82 @@ Today the same result costs four or five round trips (`search_code`, then
 symbols a person would consider necessary. Deliberately mixed: some tasks name
 the identifier, some only describe behaviour, because the second kind is what
 tests the ranking.
-- [ ] Acceptance: every expected path and symbol verified to exist at the pinned commit.
-- [ ] Evidence: commit `____`
+- [x] Acceptance: every expected path and symbol verified to exist at the pinned commit (13 file paths, 11 declarations).
+- [x] Evidence: commit `58c2b2b`
 
 ### WU2 — One token counter, shared
 `TokenCounter` lives in `commands/bench.rs` where `mcp.rs` cannot reach it.
 Extract it to a small crate-level module used by both, with no behaviour change.
-- [ ] Acceptance: `cogito bench` output unchanged; tests untouched.
-- [ ] Evidence: commit `____`
+- [x] Acceptance: `cogito bench` output unchanged; tests untouched. Correcting the plan's stated reason: `mcp.rs` can reach `commands::bench`; the move is for layering.
+- [x] Evidence: commit `1dfa566`
 
 ### WU3 — Selection and rendering, in core, with an injected counter
 New core module that turns `(task, budget)` into a ranked, budgeted pack. It takes
 the token counter as a parameter, so `tiktoken` stays in the CLI crate and the
 logic is unit-testable without it.
-- [ ] Acceptance: determinism test; budget never exceeded, forced with a tiny budget; every fragment has `start <= end` within the file's real line count; a no-match task returns the empty message; a project without git behaves the same.
-- [ ] Evidence: commit `____`
+- [x] Acceptance: determinism test; budget never exceeded at ten sizes including one and five tokens; every fragment has `start <= end` within the file's real line count; a no-match task returns the empty message; a project without git behaves the same.
+- [x] Evidence: commit `417b120`
 
 ### WU4 — The MCP tool
 `context_pack` registered with its request struct; `INSTRUCTIONS` names it as the
 first option for a task; `test_mcp_lists_the_map_tools_only` updated.
-- [ ] Acceptance: the tool appears in `tools/list`, returns fragments inside the budget for a real workspace, and the instructions mention it first.
-- [ ] Evidence: commit `____`
+- [x] Acceptance: the tool appears in `tools/list`, returns fragments inside the budget for a real workspace, and the instructions mention it first.
+- [x] Evidence: commit `8782872`
 
 ### WU5 — Recall, measured
 Harness over the pinned repositories producing recall@budget per task, with the
 table committed to `docs/benchmarks.md`. The average is reported only with that
 table behind it.
-- [ ] Acceptance: the table is reproducible from the committed harness and the gold set.
-- [ ] Evidence: commit `____`
+- [x] Acceptance: the table is reproducible from the committed harness and the gold set. Measured 66.7% average; first measurement was 59.2% before the term weighting and 66.7% after.
+- [x] Evidence: commit `f1aec9a`
 
 ### WU6 — Docs and report
 README, SPEC and the integration tool tables describe `context_pack`; the closing
 report states the numbers, the limits, and any departure from the brief.
 - [ ] Evidence: commit `____`
 
+## Measured
+
+Average **recall@budget 66.7%** over the ten labelled tasks (59.2% before the
+term weighting, 66.7% after). The three tasks that name the identifier score
+100%; the four misses are `rg-05` (needs the flags-to-HiArgs semantic step),
+`bat-02` and `bat-04` (Spanish descriptions of English code sharing no token),
+and `rg-03` (finds the gitignore matcher but not the walker). Full table and the
+measured explanation of each miss: `docs/benchmarks.md`.
+
+## Departures from the brief, with reasons
+
+1. **`search_paths` no longer exists.** The brief names it as available; it was
+   replaced by `index::search` in `1945db8`. Candidates come from the index
+   module.
+2. **The pack carries each fragment's text.** The brief says "one line per
+   fragment"; returning only pointers would not save the round trips the tool
+   exists to save, so each header line is followed by the fragment's own source.
+   Budget accounting covers the whole answer either way.
+3. **The tier multiplies the term rarity instead of gating it.** Measured: an
+   absolute gate took `rg-05` from 25% to 0% and left `rg-02` at 0%. The brief's
+   `name > path > neighbour` order holds for comparable evidence; a strong match
+   in a lower tier now survives a weak one in a higher tier. Multipliers are ten,
+   three and one.
+4. **A third ranking signal was added: how much a term narrows the project.** The
+   brief lists the precedence order but not relevance between terms, and without
+   it a task phrased with common words filled its budget with whatever sorted
+   first alphabetically.
+5. **A fragment that does not fit is skipped, not fatal,** so a small fragment
+   after a large one still uses the space; the brief says "until the limit".
+6. **Reason strings are English** (`name match`, `imported by X`) although the
+   brief's examples are Spanish, because every other tool output is English.
+7. **Two index additions:** `index::files` and `index::is_test_path` (made
+   public), plus `index::count_matches` for the exact term frequency.
+
+
 ## Risks
 
-- The brief names `search_paths` as available. It no longer exists: it was
-  replaced by `index::search` in `1945db8`. The candidates come from the index
-  module instead. This is a deliberate departure to report.
-- "Return the fragments" and "one line per fragment" pull in different
-  directions. The pack carries each fragment's text, because returning only
-  pointers would not save the round trips the tool exists to save.
-- A lexical ranker cannot find code from behaviour alone. The eval set measures
-  that honestly instead of hiding it.
+- A lexical ranker cannot find code from behaviour alone, and the measured set
+  shows both failure modes: no shared vocabulary at all, and a semantic step the
+  words do not contain. Closing either needs embeddings or the reference graph,
+  not more tuning of this ranking.
+- The term weighting is a proxy. A word can look rare while matching a thousand
+  rows, which is exactly what happened to `flags`, where one large definitions
+  file shares a directory name. Document frequencies are computed per index, so
+  the proxy is honest, but it is still a proxy for relevance.
