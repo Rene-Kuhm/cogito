@@ -39,6 +39,21 @@ use uuid::Uuid;
 
 pub use types::*;
 
+/// Keep `.cogito/` out of git in any repository: it holds a local index and
+/// per-session state, never project content. A `.gitignore` of `*` inside the
+/// directory ignores everything in it, itself included, without touching the
+/// project's own `.gitignore`. Best effort: a failure only means `git status`
+/// may list the directory.
+fn ignore_in_git(cogito_dir: &std::path::Path) {
+    let ignore = cogito_dir.join(".gitignore");
+    if !ignore.exists() {
+        let _ = std::fs::write(
+            &ignore,
+            "# Written by Cogito: this directory is a local index.\n*\n",
+        );
+    }
+}
+
 /// Main Cogito engine
 ///
 /// A `Cogito` instance is bound to **one project's `.cogito` directory**.
@@ -81,6 +96,7 @@ impl Cogito {
     pub fn with_project_sqlite(cogito_dir: &std::path::Path) -> Result<Self> {
         let db_path = crate::storage::db_path(cogito_dir);
         let conn = crate::storage::open(&db_path)?;
+        ignore_in_git(cogito_dir);
         Ok(Self {
             sqlite: Some(std::sync::Arc::new(parking_lot::Mutex::new(conn))),
             cogito_dir: cogito_dir.to_path_buf(),

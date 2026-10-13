@@ -93,9 +93,20 @@ Three files:
   call. The card comes from the stored index in milliseconds; it rescans only
   when `HEAD` moved. The script prints nothing and exits 0 outside a project
   or when `cogito` is missing.
-- `~/.claude/settings.json` gets a `SessionStart` entry running that script
-  synchronously (an `async` hook's output never reaches the session; `cogito
+- `~/.claude/hooks/cogito-pre-tool-use.sh` is a guardrail for `Read` and
+  `Grep`. The first time Claude reads a file of 250+ lines whole, the call is
+  blocked and Claude gets the file's outline instead; the first time it greps
+  for a plain name, it gets Cogito's search result. Repeating the exact same
+  call runs normally, ranged reads and regex greps are never touched, and any
+  error lets the call through. The decision is `cogito hook
+  claude-pre-tool-use`; the script only hands it Claude Code's JSON.
+- `~/.claude/settings.json` gets a `SessionStart` entry for the card and a
+  `PreToolUse` entry (matcher `^(Read|Grep)$`) for the guardrail, both
+  synchronous (an `async` hook's output never reaches the session; `cogito
   setup` repairs entries written that way by older versions).
+
+Cogito writes a `.gitignore` of `*` inside each `.cogito/` it creates, so its
+index and per-session state never show up in `git status`.
 
 `setup` leaves a file untouched when its content would not change, so
 repairing the hook does not rewrite `~/.claude.json` while Claude Code is

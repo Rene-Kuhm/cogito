@@ -546,3 +546,81 @@ fn test_claude_hook_prints_the_project_card() {
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
 }
+
+/// Run `cogito hook claude-pre-tool-use` with `event` on stdin.
+fn claude_guard(project: &std::path::Path, event: &serde_json::Value) -> (i32, String) {
+    use std::io::Write;
+    let mut child = Command::new(cogito_bin())
+        .args(["hook", "claude-pre-tool-use"])
+        .env("CLAUDE_PROJECT_DIR", project)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(event.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn test_claude_guardrail_outlines_a_large_read_once() {
+    let project = setup_test_project();
+    let big: String = (0..300).map(|i| format!("pub fn f{i}() {{}}\n")).collect();
+    fs::write(project.path().join("src/big.rs"), big).unwrap();
+    let file = project.path().join("src/big.rs");
+
+    let whole = serde_json::json!({
+        "session_id": "t1",
+        "tool_name": "Read",
+        "tool_input": { "file_path": file },
+    });
+    let (code, stderr) = claude_guard(project.path(), &whole);
+    assert_eq!(code, 2, "first whole read is blocked: {stderr}");
+    assert!(stderr.contains("src/big.rs has 300 lines"), "{stderr}");
+    assert!(
+        stderr.contains("1 pub fn f0()"),
+        "outline in the message: {stderr}"
+    );
+
+    let (code, _) = claude_guard(project.path(), &whole);
+    assert_eq!(code, 0, "the same read again goes through");
+
+    let ranged = serde_json::json!({
+        "session_id": "t2",
+        "tool_name": "Read",
+        "tool_input": { "file_path": file, "offset": 10, "limit": 20 },
+    });
+    assert_eq!(
+        claude_guard(project.path(), &ranged).0,
+        0,
+        "ranged reads are free"
+    );
+
+    let regex = serde_json::json!({
+        "session_id": "t2",
+        "tool_name": "Grep",
+        "tool_input": { "pattern": "fn\\s+f1" },
+    });
+    assert_eq!(claude_guard(project.path(), &regex).0, 0, "regex greps run");
+
+    // `.cogito/` never shows up in git.
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&status.stdout).contains(".cogito"),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
