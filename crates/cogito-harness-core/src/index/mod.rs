@@ -136,7 +136,12 @@ fn file_mtime_ns(path: &Path) -> std::io::Result<u64> {
 /// A test path is one where any path component matches (case-insensitively)
 /// `tests`, `test`, `spec`, `specs`, `__tests__`, or where the file name
 /// contains `.test.`, `_test.`, `.spec.`, `_spec.`, or starts with `test_`.
-fn is_test_path(path: &Path) -> bool {
+/// Whether a path looks like a test file.
+///
+/// Used to rank source before tests: for the same match, a test file is a
+/// worse answer to "where is this implemented" than the code it exercises.
+/// Public because the context pack applies the same rule.
+pub fn is_test_path(path: &Path) -> bool {
     let components: Vec<String> = path
         .components()
         .filter_map(|c| c.as_os_str().to_string_lossy().into_owned().into())
@@ -874,6 +879,21 @@ pub fn search(
 // ---------------------------------------------------------------------------
 // Outline
 // ---------------------------------------------------------------------------
+
+/// Every file path the index holds for a project, sorted.
+///
+/// `imports` returns resolved paths *and* raw specs that never resolved, so a
+/// caller that needs to know whether something is a project file has to ask the
+/// index rather than trust an import string.
+pub fn files(conn: &Connection, project_id: Uuid) -> Result<Vec<PathBuf>> {
+    let mut stmt =
+        conn.prepare("SELECT path FROM indexed_files WHERE project_id = ?1 ORDER BY path")?;
+    let rows = stmt.query_map(params![project_id.to_string()], |row| {
+        Ok(PathBuf::from(row.get::<_, String>(0)?))
+    })?;
+    let result: Result<Vec<_>, _> = rows.collect();
+    Ok(result?)
+}
 
 /// All declarations indexed from a file.
 pub fn outline(

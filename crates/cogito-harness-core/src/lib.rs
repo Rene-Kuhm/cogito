@@ -25,6 +25,7 @@
 pub mod fingerprint;
 pub mod index;
 pub mod map;
+pub mod pack;
 pub mod storage;
 pub mod types;
 
