@@ -338,11 +338,69 @@ fn ensure_clone(url: &str, commit: &str, cache_dir: &Path) -> Result<PathBuf> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Return all file paths under `root`, relative to it, sorted.
+///
+/// In a git repository this is what an agent would see: tracked files plus
+/// untracked files that `.gitignore` does not exclude. Walking the directory
+/// instead would count `node_modules` and generated output, which no agent
+/// lists, and inflate the baseline by orders of magnitude.
 fn list_all_files(root: &Path) -> Vec<PathBuf> {
+    if let Some(files) = git_lines(
+        root,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    ) {
+        let mut files: Vec<PathBuf> = files.into_iter().map(PathBuf::from).collect();
+        files.sort();
+        return files;
+    }
     let mut files = Vec::new();
     walkdir(root, &mut files);
     files.sort();
     files
+}
+
+/// Whether `root` is the top of a git working tree (not merely inside one).
+fn is_git_top(root: &Path) -> bool {
+    let top = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
+    let (Some(top), Ok(root)) = (top, root.canonicalize()) else {
+        return false;
+    };
+    Path::new(&top) == root
+}
+
+/// Lines of a git command run in `root`, NUL-separated when `-z` is in `args`.
+/// `None` when `root` is not a git working tree or git fails.
+fn git_lines(root: &Path, args: &[&str]) -> Option<Vec<String>> {
+    if !is_git_top(root) {
+        return None;
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let sep = if args.contains(&"-z") { '\0' } else { '\n' };
+    Some(
+        text.split(sep)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
 fn walkdir(root: &Path, out: &mut Vec<PathBuf>) {
@@ -368,8 +426,27 @@ fn walkdir(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Run `grep -rn <term>` in `root`. Returns stdout lines (file:line:content).
+/// Search `root` for `term` as a text grep does. Returns stdout lines
+/// (file:line:content). In a git repository the search covers the same files
+/// as `list_all_files`, so the baseline never reads ignored output.
 fn grep_sync(root: &Path, term: &str) -> Vec<String> {
+    if is_git_top(root) {
+        // Exit 1 from git grep means "no match", which is an answer, not a
+        // failure: falling back here would search node_modules after all.
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["grep", "-n", "--untracked", "-e", term])
+            .output();
+        if let Ok(o) = output
+            && matches!(o.status.code(), Some(0) | Some(1))
+        {
+            return String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect();
+        }
+    }
     let root_str = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let output = std::process::Command::new("grep")
         .args([
@@ -377,6 +454,7 @@ fn grep_sync(root: &Path, term: &str) -> Vec<String> {
             "--line-number",
             "--exclude-dir=target",
             "--exclude-dir=.git",
+            "--exclude-dir=node_modules",
             term,
             ".",
         ])
@@ -828,4 +906,83 @@ pub fn print_results(result: &BenchmarkResult, json: bool) -> Result<()> {
         println!("{}", result.render_human());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod baseline_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// A repo with a tracked file, an untracked file, and an ignored
+    /// `node_modules` that also contains the term.
+    fn repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("node_modules/lib")).unwrap();
+        fs::write(root.join("src/tracked.ts"), "onu tracked\n").unwrap();
+        fs::write(root.join("src/untracked.ts"), "onu untracked\n").unwrap();
+        fs::write(root.join("node_modules/lib/dep.js"), "onu ignored\n").unwrap();
+        git(root, &["add", ".gitignore", "src/tracked.ts"]);
+        dir
+    }
+
+    #[test]
+    fn test_baseline_lists_only_what_an_agent_sees_in_a_repo() {
+        let dir = repo();
+        let files: Vec<String> = list_all_files(dir.path())
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert!(files.contains(&"src/tracked.ts".to_string()), "{files:?}");
+        assert!(files.contains(&"src/untracked.ts".to_string()), "{files:?}");
+        assert!(
+            files.iter().all(|f| !f.starts_with("node_modules")),
+            "ignored files are not listed: {files:?}"
+        );
+    }
+
+    #[test]
+    fn test_baseline_grep_skips_ignored_matches() {
+        let dir = repo();
+        let mut hits = grep_sync(dir.path(), "onu");
+        hits.sort();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits.iter().all(|h| !h.contains("node_modules")), "{hits:?}");
+    }
+
+    #[test]
+    fn test_a_term_only_in_ignored_files_is_no_match_not_a_fallback() {
+        // Exit 1 from git grep is "no match". If it fell back to the directory
+        // walk, the ignored node_modules copy would be counted.
+        let dir = repo();
+        assert!(grep_sync(dir.path(), "dep_only_here").is_empty());
+        assert!(grep_sync(dir.path(), "ignored").is_empty());
+    }
+
+    #[test]
+    fn test_outside_git_the_fallback_still_skips_node_modules() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/lib")).unwrap();
+        fs::write(dir.path().join("node_modules/lib/dep.js"), "onu ignored\n").unwrap();
+        fs::write(dir.path().join("a.ts"), "onu here\n").unwrap();
+        let hits = grep_sync(dir.path(), "onu");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            hits[0].starts_with("./a.ts") || hits[0].starts_with("a.ts"),
+            "{hits:?}"
+        );
+    }
 }
