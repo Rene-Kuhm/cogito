@@ -66,9 +66,20 @@ Two halves, both written by setup:
    Shell disables codemode, so under the default the model could not reach
    the tools.
 
-> `npm:cogito-harness` is not published yet. Pi will skip an unresolvable package,
-> so the MCP half still works; the extension half starts working the day it is
-> published.
+> **`npm:cogito-harness` is not on npm yet.** Pi runs `npm install` for every
+> entry in `packages`, and a 404 there aborts package resolution — so Pi does
+> *not* skip an unresolvable package, it fails. `cogito setup` therefore checks
+> the registry first and, when the package is absent, configures only the MCP
+> half and says so. Run `cogito setup` again after the package is published and
+> it will declare it.
+>
+> Only an `E404` from npm counts as "absent", and then setup also removes a
+> declaration an earlier run left behind (`cogito doctor` flags it with `!`).
+> When npm cannot be reached at all (offline, DNS, proxy), setup leaves the
+> declaration exactly as it is.
+>
+> If you know it is available and the check cannot see it (an offline machine,
+> a private registry), pass `--with-pi-package` to declare it anyway.
 
 ### Claude Code
 
