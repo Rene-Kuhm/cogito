@@ -138,7 +138,7 @@ fn index_symbols(root: &Path, files: &[PathBuf]) -> Vec<Symbol> {
 
 /// Extensions of every language Cogito knows, so a polyglot repository's map
 /// shows all of its code and not only the main language's.
-const CODE_EXTENSIONS: &[&str] = &[
+pub const CODE_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "go", "java", "cs", "rb",
     "php", "kt", "kts", "swift", "vue", "svelte", "sql", "prisma", "graphql", "proto",
 ];
@@ -302,7 +302,7 @@ fn should_skip(path: &Path) -> bool {
 /// repository, paths `.gitignore` excludes (generated clients, build output)
 /// are skipped too. Entries that cannot be read are skipped, so one bad path
 /// never fails the whole scan.
-fn project_files(path: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+pub fn project_files(path: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
     let repo = git2::Repository::discover(path).ok();
     let workdir = repo
         .as_ref()
@@ -330,6 +330,47 @@ fn project_files(path: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
         })
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_file())
+}
+
+/// The project's own files as relative paths.
+///
+/// Same discovery as `project_files` but returns `PathBuf` directly.
+pub fn project_file_paths(path: &Path) -> impl Iterator<Item = std::path::PathBuf> {
+    let repo = git2::Repository::discover(path).ok();
+    let workdir = repo
+        .as_ref()
+        .and_then(|r| r.workdir())
+        .and_then(|w| w.canonicalize().ok());
+    let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let root_for_ignore = root.clone();
+    let path_for_ignore = path.to_path_buf();
+
+    WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(move |entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            if entry.file_type().is_dir()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| SKIP_DIRS.contains(&name))
+            {
+                return false;
+            }
+            !is_git_ignored(
+                repo.as_ref(),
+                workdir.as_deref(),
+                &root_for_ignore,
+                &path_for_ignore,
+                entry.path(),
+            )
+        })
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(move |entry| entry.path().strip_prefix(&root).map(PathBuf::from).ok())
 }
 
 /// Whether git ignores `entry` (a path under `walk_root`).
@@ -362,8 +403,12 @@ fn is_code_file(ext: &std::ffi::OsStr, language: &Language) -> bool {
     language.extensions().iter().any(|e| *e == ext_str)
 }
 
-/// Extract imports from file content
-fn extract_imports(file_path: &Path, content: &str, language: &Language) -> Result<Vec<DataFlow>> {
+/// Extract imports from file content.
+pub fn extract_imports(
+    file_path: &Path,
+    content: &str,
+    language: &Language,
+) -> Result<Vec<DataFlow>> {
     let mut flows = Vec::new();
 
     match language {

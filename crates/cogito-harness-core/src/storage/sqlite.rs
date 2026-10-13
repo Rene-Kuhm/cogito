@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Schema version, bumped on every migration.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// Open a connection with all PRAGMAs applied.
 pub fn open(path: &Path) -> Result<Connection> {
@@ -89,6 +89,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     if current < 2 {
         migrate_v2(conn)?;
     }
+    if current < 3 {
+        migrate_v3(conn)?;
+    }
 
     Ok(())
 }
@@ -156,6 +159,128 @@ fn migrate_v2(conn: &Connection) -> Result<()> {
         "#,
     )
     .context("Failed to run migration v2")?;
+
+    // Record schema version
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .context("Failed to set user_version")?;
+
+    Ok(())
+}
+
+/// Migration v3: File and symbol index with FTS5 search.
+///
+/// - `indexed_files`: per-file metadata (size, mtime, content hash)
+/// - `indexed_symbols`: declarations extracted from each file
+/// - `indexed_symbols_fts`: FTS5 over symbols (name, path)
+/// - `indexed_files_fts`: FTS5 over file paths
+/// - `indexed_imports`: import specs and resolved paths
+fn migrate_v3(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        -- =====================
+        -- Indexed files
+        -- =====================
+        CREATE TABLE IF NOT EXISTS indexed_files (
+            project_id  TEXT NOT NULL,
+            path        TEXT NOT NULL,
+            is_doc      INTEGER NOT NULL,
+            language    TEXT NOT NULL,
+            size        INTEGER NOT NULL,
+            mtime_ns    INTEGER NOT NULL,
+            content_hash INTEGER NOT NULL,
+            indexed_at  TEXT NOT NULL,
+            PRIMARY KEY (project_id, path)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_indexed_files_project
+            ON indexed_files(project_id);
+
+        -- =====================
+        -- Indexed symbols
+        -- =====================
+        CREATE TABLE IF NOT EXISTS indexed_symbols (
+            project_id  TEXT NOT NULL,
+            path        TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            name        TEXT NOT NULL,
+            start_line  INTEGER NOT NULL,
+            end_line    INTEGER NOT NULL,
+            signature   TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_indexed_symbols_project_path
+            ON indexed_symbols(project_id, path);
+
+        -- =====================
+        -- FTS5: symbols (external-content)
+        -- =====================
+        CREATE VIRTUAL TABLE IF NOT EXISTS indexed_symbols_fts USING fts5(
+            name,
+            path,
+            content='indexed_symbols',
+            content_rowid='rowid',
+            tokenize='unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS indexed_symbols_ai AFTER INSERT ON indexed_symbols BEGIN
+            INSERT INTO indexed_symbols_fts(rowid, name, path)
+            VALUES (new.rowid, new.name, new.path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS indexed_symbols_ad AFTER DELETE ON indexed_symbols BEGIN
+            INSERT INTO indexed_symbols_fts(indexed_symbols_fts, rowid, name, path)
+            VALUES ('delete', old.rowid, old.name, old.path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS indexed_symbols_au AFTER UPDATE ON indexed_symbols BEGIN
+            INSERT INTO indexed_symbols_fts(indexed_symbols_fts, rowid, name, path)
+            VALUES ('delete', old.rowid, old.name, old.path);
+            INSERT INTO indexed_symbols_fts(rowid, name, path)
+            VALUES (new.rowid, new.name, new.path);
+        END;
+
+        -- =====================
+        -- FTS5: files (external-content)
+        -- =====================
+        CREATE VIRTUAL TABLE IF NOT EXISTS indexed_files_fts USING fts5(
+            path,
+            content='indexed_files',
+            content_rowid='rowid',
+            tokenize='unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS indexed_files_ai AFTER INSERT ON indexed_files BEGIN
+            INSERT INTO indexed_files_fts(rowid, path)
+            VALUES (new.rowid, new.path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS indexed_files_ad AFTER DELETE ON indexed_files BEGIN
+            INSERT INTO indexed_files_fts(indexed_files_fts, rowid, path)
+            VALUES ('delete', old.rowid, old.path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS indexed_files_au AFTER UPDATE ON indexed_files BEGIN
+            INSERT INTO indexed_files_fts(indexed_files_fts, rowid, path)
+            VALUES ('delete', old.rowid, old.path);
+            INSERT INTO indexed_files_fts(rowid, path)
+            VALUES (new.rowid, new.path);
+        END;
+
+        -- =====================
+        -- Indexed imports
+        -- =====================
+        CREATE TABLE IF NOT EXISTS indexed_imports (
+            project_id  TEXT NOT NULL,
+            path        TEXT NOT NULL,
+            spec        TEXT NOT NULL,
+            resolved    TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_indexed_imports_project_resolved
+            ON indexed_imports(project_id, resolved);
+        "#,
+    )
+    .context("Failed to run migration v3")?;
 
     // Record schema version
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)

@@ -43,11 +43,7 @@ enum Commands {
     Init,
 
     /// Scan project and generate fingerprint
-    Scan {
-        /// Watch mode for live updates
-        #[arg(long)]
-        watch: bool,
-    },
+    Scan,
 
     /// Show current fingerprint
     Fingerprint {
@@ -188,7 +184,7 @@ async fn main() -> Result<()> {
             // An unknown hook must never block the agent.
             _ => std::process::exit(0),
         },
-        Some(Commands::Scan { watch }) => commands::scan(watch).await?,
+        Some(Commands::Scan) => commands::scan().await?,
         Some(Commands::Fingerprint { verbose }) => commands::fingerprint(verbose).await?,
         Some(Commands::Project { subcommand }) => {
             commands::project(subcommand).await?;

@@ -23,6 +23,7 @@
 //! ```
 
 pub mod fingerprint;
+pub mod index;
 pub mod map;
 pub mod storage;
 pub mod types;
@@ -212,14 +213,26 @@ impl Cogito {
     /// was never scanned, the stored one predates the current format, or
     /// `HEAD` moved since it was taken. Returns whether a scan ran.
     ///
-    /// Uncommitted edits do not trigger a rescan; pass `refresh` after large
-    /// local changes.
+    /// Working-tree changes invalidate the stored fingerprint: the index is
+    /// synced first and any change (added, modified, removed file) forces a
+    /// regeneration so `fingerprint.files` and `fingerprint.symbols` always
+    /// reflect the current working tree.
     pub async fn fingerprint(
         &self,
         project: &Project,
         refresh: bool,
     ) -> Result<(Fingerprint, bool)> {
+        // Sync the index first. Even when the git HEAD matches, a working-tree
+        // change makes the fingerprint stale.
+        let index_changed = if let Some(conn) = self.connection() {
+            let report = crate::index::sync(&conn, project.id, &project.path)?;
+            report.changed()
+        } else {
+            false
+        };
+
         if !refresh
+            && !index_changed
             && let Some(stored) = self.stored_fingerprint(project.id)?
             && stored.format >= fingerprint::FINGERPRINT_FORMAT
             && stored.head == fingerprint::current_head(&project.path)

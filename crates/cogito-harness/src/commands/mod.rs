@@ -52,12 +52,35 @@ pub async fn init() -> Result<()> {
 }
 
 /// Scan project and generate fingerprint
-pub async fn scan(_watch: bool) -> Result<()> {
+pub async fn scan() -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
     println!("Scanning: {} ({})", project.name, project.language);
+
+    // Sync the index and report what changed
+    if let Some(conn) = cogito.sqlite() {
+        let conn_guard = conn.lock();
+        let report = cogito_harness_core::index::sync(&conn_guard, project.id, &project.path)?;
+        println!();
+        println!("📁 Index: {} files scanned", report.scanned);
+        if report.added > 0 {
+            println!("   + {} added", report.added);
+        }
+        if report.modified > 0 {
+            println!("   ~ {} modified", report.modified);
+        }
+        if report.removed > 0 {
+            println!("   - {} removed", report.removed);
+        }
+        if report.reparsed > 0 {
+            println!("   🔄 {} reparsed", report.reparsed);
+        }
+        if report.unchanged > 0 {
+            println!("   ✓ {} unchanged", report.unchanged);
+        }
+    }
     println!();
 
     let fingerprint = cogito
@@ -135,7 +158,7 @@ pub async fn scan(_watch: bool) -> Result<()> {
 /// Show current fingerprint (stub - reuses scan for now)
 pub async fn fingerprint(verbose: bool) -> Result<()> {
     if verbose {
-        scan(false).await
+        scan().await
     } else {
         println!("Use 'cogito scan' to regenerate the fingerprint.");
         Ok(())
