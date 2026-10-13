@@ -199,6 +199,24 @@ pub struct Fingerprint {
     /// repository. A different `HEAD` means the stored fingerprint is stale.
     #[serde(default)]
     pub head: Option<String>,
+    /// Top-level declarations of every code file, for finding a symbol by name.
+    #[serde(default)]
+    pub symbols: Vec<Symbol>,
+    /// Layout version of this fingerprint. A stored fingerprint with an older
+    /// version lacks data newer tools rely on, so it is regenerated.
+    #[serde(default)]
+    pub format: u32,
+}
+
+/// A named declaration in the project (function, type, class…).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Symbol {
+    pub name: String,
+    pub kind: String,
+    /// File relative to the project root.
+    pub file: PathBuf,
+    /// 1-based line of the declaration.
+    pub line: usize,
 }
 
 /// A sub-project inside the scanned project, identified by its manifest.

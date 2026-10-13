@@ -521,13 +521,17 @@ pub async fn serve(port: u16, mcp: bool) -> Result<()> {
 
 /// Show statistics
 /// Print the project map, scanning only if the stored one is stale.
-pub async fn map(refresh: bool) -> Result<()> {
+pub async fn map(refresh: bool, card: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
     let (fingerprint, _) = cogito.fingerprint(&project, refresh).await?;
     let map = cogito_harness_core::map::build(&project.path, &project.name, &fingerprint);
-    print!("{}", cogito_harness_core::map::render(&map));
+    if card {
+        print!("{}", cogito_harness_core::map::render_card(&map));
+    } else {
+        print!("{}", cogito_harness_core::map::render(&map));
+    }
     Ok(())
 }
 

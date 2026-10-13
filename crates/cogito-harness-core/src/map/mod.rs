@@ -7,6 +7,7 @@
 //! context, so every line has to save more reading than it costs.
 
 pub(crate) mod layout;
+pub mod outline;
 
 use crate::types::{Fingerprint, ModuleInfo};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -17,6 +18,10 @@ const HOT_PER_MODULE: usize = 3;
 const HOT_OVERALL: usize = 10;
 /// Cap on each list in `related` and `search` output.
 const LIST_LIMIT: usize = 25;
+/// Caps on `search` output: enough to locate code, small enough that a
+/// search costs less than the grep it replaces.
+const SYMBOL_LIMIT: usize = 12;
+const SEARCH_FILE_LIMIT: usize = 15;
 /// A file changed once is not "hot"; listing it would only spend tokens.
 const MIN_HOT_CHANGES: usize = 2;
 
@@ -252,6 +257,49 @@ pub fn render(map: &ProjectMap) -> String {
     out
 }
 
+/// A few-line summary of the project for an agent's system prompt.
+///
+/// It is meant to sit in the prompt for a whole session, so it stays small
+/// (about 250 tokens on a 600-file monorepo) and identical between turns,
+/// which keeps it in the provider's prompt cache. Details stay one tool call
+/// away.
+pub fn render_card(map: &ProjectMap) -> String {
+    let modules: Vec<String> = map
+        .modules
+        .iter()
+        .map(|m| format!("{} ({})", m.path.display(), m.files))
+        .collect();
+    let busiest: Vec<String> = map
+        .hot_files
+        .iter()
+        .take(5)
+        .map(|(p, _)| p.display().to_string())
+        .collect();
+    let mut out = format!(
+        "{} · {} · {} code files{}\n",
+        map.name,
+        map.fingerprint_language,
+        map.total_files,
+        map.head
+            .as_ref()
+            .map(|h| format!(" · indexed at {h}"))
+            .unwrap_or_default(),
+    );
+    if !modules.is_empty() {
+        out.push_str(&format!("Modules: {}\n", modules.join(", ")));
+    }
+    if !busiest.is_empty() {
+        out.push_str(&format!("Busiest files: {}\n", busiest.join(", ")));
+    }
+    out.push_str(
+        "Cogito has this project indexed. To find code, call search_code (symbols with file:line, \
+         files, modules); before reading a file, call file_outline and read only the line range \
+         you need; related_files shows imports and importers; project_map gives module details. \
+         Do not list directories, grep or read whole files to find your way.\n",
+    );
+    out
+}
+
 /// Find the file `query` names: an exact project path, or a unique suffix
 /// such as `auth/server.ts`.
 pub fn find_file(root: &Path, fp: &Fingerprint, query: &str) -> Result<PathBuf, String> {
@@ -350,14 +398,14 @@ fn is_test(path: &str) -> bool {
 /// Every whitespace-separated term is matched case-insensitively against the
 /// path; a file ranks by how many terms it matches, then by how often it
 /// changed.
-pub fn search_paths(root: &Path, fp: &Fingerprint, query: &str) -> (Vec<String>, Vec<String>) {
+pub fn search_paths(root: &Path, fp: &Fingerprint, query: &str) -> SearchResults {
     let terms: Vec<String> = query
         .split_whitespace()
         .map(str::to_lowercase)
         .filter(|t| t.len() >= 2)
         .collect();
     if terms.is_empty() {
-        return (Vec::new(), Vec::new());
+        return SearchResults::default();
     }
     let changes = change_counts(root, fp);
 
@@ -386,7 +434,7 @@ pub fn search_paths(root: &Path, fp: &Fingerprint, query: &str) -> (Vec<String>,
     });
     let files = scored
         .iter()
-        .take(LIST_LIMIT)
+        .take(SEARCH_FILE_LIMIT)
         .map(|(_, _, c, f)| {
             if *c > 0 {
                 format!("{} ({c} changes)", f.display())
@@ -404,7 +452,143 @@ pub fn search_paths(root: &Path, fp: &Fingerprint, query: &str) -> (Vec<String>,
         })
         .map(|m| format!("{} ({})", m.path.display(), m.name))
         .collect();
-    (files, modules)
+
+    // Symbols: source before tests; then an exact name, a prefix, a
+    // substring; then the busier file.
+    let mut symbols: Vec<(u8, bool, usize, &crate::types::Symbol)> = fp
+        .symbols
+        .iter()
+        .filter_map(|sym| {
+            let name = sym.name.to_lowercase();
+            let rank = terms
+                .iter()
+                .filter_map(|t| {
+                    if name == *t {
+                        Some(0)
+                    } else if name.starts_with(t.as_str()) {
+                        Some(1)
+                    } else if name.contains(t.as_str()) {
+                        Some(2)
+                    } else {
+                        None
+                    }
+                })
+                .min()?;
+            let path = sym.file.display().to_string().to_lowercase();
+            Some((
+                rank,
+                is_test(&path),
+                changes.get(&sym.file).copied().unwrap_or(0),
+                sym,
+            ))
+        })
+        .collect();
+    symbols.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.3.file.cmp(&b.3.file))
+            .then_with(|| a.3.line.cmp(&b.3.line))
+    });
+    let symbols = symbols
+        .iter()
+        .take(SYMBOL_LIMIT)
+        .map(|(_, _, _, s)| format!("{} {} {}:{}", s.kind, s.name, s.file.display(), s.line))
+        .collect();
+
+    SearchResults {
+        files,
+        modules,
+        symbols,
+    }
+}
+
+/// What `search_paths` found, each list best first.
+#[derive(Debug, Default)]
+pub struct SearchResults {
+    pub files: Vec<String>,
+    pub modules: Vec<String>,
+    pub symbols: Vec<String>,
+}
+
+/// One file's declarations with their line ranges, read from disk now so the
+/// outline matches the file even with uncommitted edits.
+pub fn render_outline(root: &Path, fp: &Fingerprint, file: &Path) -> Result<String, String> {
+    let content = std::fs::read_to_string(root.join(file))
+        .map_err(|e| format!("Cannot read {}: {e}", file.display()))?;
+    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let declarations = outline::declarations(&content, ext);
+
+    let modules = effective_modules(fp);
+    let importers = fp
+        .data_flows
+        .iter()
+        .filter(|f| f.resolved.as_deref() == Some(file) && rel(root, &f.from) != file)
+        .map(|f| rel(root, &f.from))
+        .collect::<BTreeSet<_>>()
+        .len();
+
+    let mut out = format!("{} · {} lines", file.display(), content.lines().count());
+    if let Some(m) = module_of(&modules, file) {
+        out.push_str(&format!(" · module {}", m.path.display()));
+    }
+    if let Some(c) = change_counts(root, fp).get(file) {
+        out.push_str(&format!(" · {c} changes"));
+    }
+    if importers > 0 {
+        out.push_str(&format!(" · imported by {importers}"));
+    }
+    out.push('\n');
+
+    if declarations.is_empty() {
+        out.push_str("No declarations recognised; read the file directly.\n");
+        return Ok(out);
+    }
+
+    // Consecutive one-line declarations of the same kind collapse into one
+    // line ("16-37 const ×10: A, B, …"): a block of constants or type aliases
+    // costs one line instead of ten.
+    let mut i = 0;
+    while i < declarations.len() {
+        let d = &declarations[i];
+        let mut j = i;
+        while j + 1 < declarations.len()
+            && d.signature.is_none()
+            && declarations[j].start == declarations[j].end
+            && declarations[j + 1].start == declarations[j + 1].end
+            && declarations[j + 1].kind == d.kind
+            && declarations[j + 1].signature.is_none()
+        {
+            j += 1;
+        }
+        if j > i {
+            let names: Vec<&str> = declarations[i..=j]
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect();
+            out.push_str(&format!(
+                "  {}-{} {} ×{}: {}\n",
+                d.start,
+                declarations[j].end,
+                d.kind,
+                names.len(),
+                names.join(", ")
+            ));
+        } else {
+            let range = if d.start == d.end {
+                d.start.to_string()
+            } else {
+                format!("{}-{}", d.start, d.end)
+            };
+            match &d.signature {
+                Some(sig) => out.push_str(&format!("  {range} {sig}\n")),
+                None => out.push_str(&format!("  {range} {} {}\n", d.kind, d.name)),
+            }
+        }
+        i = j + 1;
+    }
+    out.push_str("Read only the line range you need.\n");
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -465,6 +649,13 @@ mod tests {
                 },
             ],
             head: None,
+            symbols: vec![crate::types::Symbol {
+                name: "requireSession".into(),
+                kind: "function".into(),
+                file: "apps/web/lib/auth/server.ts".into(),
+                line: 10,
+            }],
+            format: crate::fingerprint::FINGERPRINT_FORMAT,
         }
     }
 
@@ -502,15 +693,21 @@ mod tests {
 
     #[test]
     fn test_search_ranks_source_before_tests() {
-        let (files, modules) = search_paths(Path::new(""), &fingerprint(), "auth");
+        let found = search_paths(Path::new(""), &fingerprint(), "auth");
         assert_eq!(
-            files,
+            found.files,
             [
                 "apps/web/lib/auth/server.ts (9 changes)",
                 "apps/web/tests/auth.test.ts (12 changes)"
             ]
         );
-        assert!(modules.is_empty());
+        assert!(found.modules.is_empty());
+
+        let found = search_paths(Path::new(""), &fingerprint(), "requiresession");
+        assert_eq!(
+            found.symbols,
+            ["function requireSession apps/web/lib/auth/server.ts:10"]
+        );
     }
 
     #[test]

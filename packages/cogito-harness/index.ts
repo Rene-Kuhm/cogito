@@ -3,9 +3,9 @@
  *
  * What this adds to Pi:
  *
- * 1. On `session_start` it scans the project in the background, refreshing
- *    the fingerprint Cogito stores for it. The scan is bounded and never
- *    blocks the session.
+ * 1. On `session_start` it loads the project card (rescanning only if `HEAD`
+ *    moved) and puts it in the system prompt of every turn, so the model
+ *    starts each answer already knowing the layout and how to look code up.
  * 2. It sets a status line showing what Cogito knows about the project.
  * 3. It registers `/cogito` with `status`, `map`, `scan`, `query`, `stats`
  *    and `doctor`, so the map is usable without leaving the session.
@@ -125,7 +125,46 @@ function firstLine(text: string): string {
   return text.split("\n").map((l) => l.trim()).find(Boolean) ?? "";
 }
 
+/**
+ * The project card for each working directory, computed once per session.
+ *
+ * It goes into the system prompt of every turn, so it must not change between
+ * turns: an identical prefix is what lets the provider serve it from its
+ * prompt cache. A new session is what refreshes it.
+ */
+const cards = new Map<string, Promise<string | undefined>>();
+
+/** Longest a turn waits for the card before going ahead without it. */
+const CARD_WAIT_MS = 5_000;
+
+function loadCard(cwd: string): Promise<string | undefined> {
+  let card = cards.get(cwd);
+  if (!card) {
+    // `map --card` reuses the stored index and rescans only if HEAD moved.
+    card = run(["map", "--card"], cwd, SCAN_TIMEOUT_MS).then((r) =>
+      r.ok && r.stdout.trim() ? r.stdout.trim() : undefined,
+    );
+    cards.set(cwd, card);
+  }
+  return card;
+}
+
 export default function registerCogito(pi: ExtensionAPI) {
+  // Put the project card in the system prompt, so the model knows the
+  // project's layout and how to look things up without spending a tool call
+  // on orientation.
+  pi.on("before_agent_start", async (event: any, raw: any) => {
+    const cwd = (raw as CogitoContext)?.cwd;
+    if (!cwd || !isProject(cwd) || !event?.systemPromptOptions) return;
+    const card = await Promise.race([
+      loadCard(cwd),
+      new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), CARD_WAIT_MS)),
+    ]);
+    if (!card) return;
+    const options = event.systemPromptOptions;
+    options.sections = { ...(options.sections ?? {}), cogito_project: card };
+  });
+
   pi.on("session_start", (event: unknown, raw: any) => {
     void event;
     const ctx = raw as CogitoContext;
@@ -144,15 +183,12 @@ export default function registerCogito(pi: ExtensionAPI) {
       return;
     }
 
+    // A new session starts from a fresh card.
+    cards.delete(cwd);
     void (async () => {
-      const result = await run(["scan"], cwd, SCAN_TIMEOUT_MS);
+      const card = await loadCard(cwd);
       try {
-        if (!result.ok) {
-          const reason = firstLine(result.stderr) || "unavailable";
-          ctx.ui?.setStatus?.("cogito", `cogito: ${reason}`);
-          return;
-        }
-        ctx.ui?.setStatus?.("cogito", `cogito: ${hasState(cwd) ? "ready" : "scanned"}`);
+        ctx.ui?.setStatus?.("cogito", card ? "cogito: ready" : "cogito: unavailable");
       } catch {
         /* A disposed UI must not break the session. */
       }

@@ -151,6 +151,9 @@ enum Commands {
         /// Rescan even if the stored map is current
         #[arg(long)]
         refresh: bool,
+        /// Print the short project card agents get in their system prompt
+        #[arg(long)]
+        card: bool,
     },
 
     /// Show a file's imports and importers (the `related_files` tool)
@@ -317,7 +320,7 @@ async fn main() -> Result<()> {
         Some(Commands::Uninstall { agents, yes }) => commands::uninstall(agents, yes)?,
         Some(Commands::Serve { port, mcp }) => commands::serve(port, mcp).await?,
         Some(Commands::Stats) => commands::stats(args.json).await?,
-        Some(Commands::Map { refresh }) => commands::map(refresh).await?,
+        Some(Commands::Map { refresh, card }) => commands::map(refresh, card).await?,
         Some(Commands::Related { file }) => commands::related(&file).await?,
         Some(Commands::Doctor) => commands::doctor().await?,
         Some(Commands::Export { output, format }) => {

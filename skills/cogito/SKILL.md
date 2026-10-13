@@ -95,7 +95,8 @@ the `cogito mcp` server is configured, prefer the MCP tools over the CLI:
 |---|---|
 | `project_map` | Modules with entry point, size, most changed files and which modules they use. Read it before exploring the repository |
 | `related_files` | What one file imports, what imports it, and its external packages |
-| `search_code` | Find code by words in file paths, module names and tags |
+| `search_code` | Find code by words: symbols (functions, types, classes) with `file:line`, file paths, module names and tags |
+| `file_outline` | A file's declarations with line ranges, so only the needed range is read |
 | `add_tag` | Label code locations so `search_code` finds them by that word |
 
 The MCP server is `cogito mcp` (same binary, `mcp` subcommand). It uses the
