@@ -9,6 +9,7 @@ mod mcp;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
+use std::path::PathBuf;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 /// Cogito - Intelligent context optimization for AI coding agents
@@ -132,6 +133,21 @@ enum Commands {
 
     /// Diagnose configuration
     Doctor,
+
+    /// Measure token savings when using Cogito vs. a baseline explorer.
+    Bench {
+        /// Local repository to benchmark. When omitted, uses the pinned manifest
+        /// at benchmarks/repos.json and clones repositories into .cogito/bench-cache/.
+        #[arg(short = 'r', long)]
+        repo: Option<String>,
+        /// Comma-separated search terms (e.g. "search_code,project_map").
+        /// When omitted, uses the terms from the manifest for that repository.
+        #[arg(short = 't', long, value_delimiter = ',', num_args = 1..)]
+        terms: Vec<String>,
+        /// Maximum matched files to read per term (default 5).
+        #[arg(short, long, default_value = "5")]
+        limit: usize,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -204,6 +220,9 @@ async fn main() -> Result<()> {
         Some(Commands::Outline { file }) => commands::outline(&file).await?,
         Some(Commands::Search { query }) => commands::search(&query).await?,
         Some(Commands::Doctor) => commands::doctor().await?,
+        Some(Commands::Bench { repo, terms, limit }) => {
+            commands::bench(repo.map(PathBuf::from), terms, args.json, limit).await?;
+        }
         None => {
             // No subcommand, show help
             let mut cmd = Args::command();

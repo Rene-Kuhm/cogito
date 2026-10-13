@@ -32,6 +32,7 @@ uuid.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 toml_edit.workspace = true
+tiktoken-rs = "0.12.1"
 
 [dev-dependencies]
 assert_cmd = "1"

@@ -1,259 +1,175 @@
-# Benchmarks & Real-World Measurements
+# Token Savings Benchmark
 
-This document reports **real, reproducible measurements** of Cogito's core
-engines. All numbers come from `cargo bench` runs on a single machine
-(Intel/AMD, Linux), but the test setup is in-tree and runs in CI.
+This document describes the `cogito bench` command, which measures the token
+savings when an agent uses Cogito's tools versus exploring a repository the
+ordinary way.
 
-## Reproducing
+## What the Benchmark Measures
 
-```bash
-# All benchmarks (fast mode, ~1 minute)
-cargo bench --workspace -- --quick
+The benchmark compares two strategies for answering the question
+"find this term and read the code around it":
 
-# Full benchmarks (statistical, ~5 minutes)
-cargo bench --workspace
+### Baseline (an agent without Cogito)
 
-# Specific benchmark
-cargo bench --bench compress
-cargo bench --bench fingerprint
-cargo bench --bench search
-cargo bench --bench storage_compare
-```
+1. List every project file path
+2. Run a recursive text search (`grep -rn <term>`) for the term
+3. Read each matched file in full
 
-Benchmark sources:
-- `crates/cogito-harness-core/benches/fingerprint.rs`
-- `crates/cogito-harness-core/benches/compress.rs`
-- `crates/cogito-harness-core/benches/search.rs`
-- `crates/cogito-harness-core/benches/storage_compare.rs`
+### Cogito
 
-## Test Environment
+1. Print the project card (`cogito map --card`)
+2. Call `search_code` with the term
+3. Call `file_outline` on each matched file
+4. Read only the line ranges that the match actually occupies
 
-- Machine: GitHub Actions runner (`ubuntu-latest`, 2-core)
-- Rust: stable, 2024 edition, optimized profile
-- Backend: rustc 1.99.0, criterion 0.5.1
-- SQLite: 3.53.4 (via `rusqlite` bundled, FTS5 enabled)
-- Date: 2026-10-12
+### What it does not measure
 
-## Compressor Performance
+- The quality of search results (relevance ranking)
+- Round-trip latency to the LLM
+- Cost of thinking or planning before calling tools
+- Any costs after the first read (e.g., when the agent continues exploring)
 
-### Throughput
+## Token Counting
 
-Synthetic code with realistic comment density (40% comments, 60% code):
+Tokens are counted with **tiktoken-rs** using the `cl100k_base` vocabulary,
+which is the closest available match to current coding-agent tokenizers
+(Claude, GPT-4, etc.). If tiktoken-rs fails to initialise, the benchmark
+falls back to `byte_count / 4`, and the output notes which counter was used.
 
-| Lines | Bytes | Time | Throughput |
-|------:|------:|-----:|-----------:|
-|   100 |  3.5 KB |   6.5 µs | 277 MiB/s |
-|   500 |  18 KB  |    91 µs | 101 MiB/s |
-|  2000 |  72 KB  |  1.20 ms |  31 MiB/s |
-| 10000 | 360 KB  |   29 ms  | 6.5 MiB/s |
+Both raw bytes and token counts are reported, so readers can verify the
+token-to-byte ratio independently.
 
-The compressor sustains **6-300 MiB/s** depending on size.
+## Output Format
 
-### Savings (real numbers)
+The benchmark reports three numbers per term:
 
-| Source | Lines | Original tokens | Compressed tokens | Savings |
-|--------|------:|----------------:|------------------:|--------:|
-| Synthetic 100   |   100 |   627 |   550 | 12.3% |
-| Synthetic 500   |   500 |  3207 |  2815 | 12.2% |
-| Synthetic 2000  |  2000 | 12969 | 11414 | 12.0% |
-| Synthetic 10000 | 10000 | 65938 | 58161 | 11.8% |
-| `fingerprint/mod.rs` (real) | 360 | 4113 | 2996 | **27.2%** |
+| Column | Description |
+|--------|-------------|
+| `bl_find` | Baseline finding cost: listing files + grep output |
+| `bl_read` | Baseline reading cost: reading matched files in full |
+| `co_find` | Cogito finding cost: card + search_code output |
+| `co_read` | Cogito reading cost: file_outline + matched line ranges |
+| `savings` | Token reduction from using Cogito |
+| `pct%` | Savings as a percentage of baseline total |
 
-**Real-world savings is significantly higher than synthetic** because real
-code has more redundancy, multi-line doc comments, and boilerplate
-patterns.
+The "no matches" case is reported separately and does not cause errors or
+division by zero.
 
-### Real-world compress: 12,340 bytes → 18 µs
+## How to Run
 
-The actual `crates/cogito-harness-core/src/fingerprint/mod.rs` file
-(12,340 bytes, 360 lines, real Rust code) compresses in **18.2 µs** with
-a **27.2% reduction** (4113 → 2996 tokens).
-
-## Fingerprint Generation
-
-### Synthetic projects (varying size)
-
-| Files | Time | Throughput | Notes |
-|------:|-----:|-----------:|-------|
-|    10 | 929 µs | 40 MiB/s | single commit history |
-|    50 | 3.17 ms | 23 MiB/s | |
-|   200 | 11.5 ms | 18 MiB/s | |
-|   500 | 21.2 ms | 26 MiB/s | |
-
-### Real-world: cogito self-scan
-
-Scanning the cogito repository itself (46 Rust/MD/TOML files, 4 git commits):
-
-```
-Real-world benchmark: scanning cogito itself (46 Rust/MD/TOML files)
-fingerprint_real_world/cogito_self_scan
-                        time:   [60.4 ms 60.8 ms 62.1 ms]
-```
-
-**60 milliseconds** to fingerprint the entire cogito codebase.
-
-## Real-World OSS Project Measurements
-
-These tests clone real OSS projects with `git clone --depth 100` and
-measure Cogito on production code. Gated by `COGITO_RUN_REAL_WORLD=1`.
+### Against a local checkout
 
 ```bash
-COGITO_RUN_REAL_WORLD=1 cargo test --test real_world_test -- --ignored --nocapture
+# Run with default terms (search_code, project_map)
+cogito bench --repo .
+
+# With specific terms
+cogito bench --repo . --terms search_code,project_map,map
+
+# Limit matched files per term (default: 5)
+cogito bench --repo . --terms search_code --limit 3
+
+# Machine-readable JSON output
+cogito bench --repo . --terms search_code --json
 ```
 
-### ripgrep (BurntSushi/ripgrep, ~30k LOC, ~100 commits)
+### Against the pinned manifest
 
-| Metric | Value |
-|---|---|
-| Entry points | 18 |
-| Data flows | 98 |
-| Hot zones | 237 |
-| Cold zones | 1 |
+The manifest at `benchmarks/repos.json` lists small, well-known repositories
+with meaningful search terms. When `--repo` is omitted, `cogito bench`
+clones each repository into `.cogito/bench-cache/` at its pinned commit.
 
-### bat (sharkdp/bat, larger codebase)
+```bash
+# Clone and benchmark all repositories in the manifest
+cogito bench
+```
 
-| Metric | Value |
-|---|---|
-| Entry points | 5 |
-| Data flows | 81 |
-| **Hot zones** | **916** |
-| Cold zones | 4 |
+If a clone fails, the benchmark prints an error and continues with the
+remaining repositories. No single network failure stops the entire run.
 
-## Search Performance
+## Results Table
 
-### Decision search (in-memory state)
+Produced by running the pinned manifest, with `tiktoken-rs` and the
+`cl100k_base` vocabulary:
 
-| Decisions | Time | Time/decision |
-|----------:|-----:|--------------:|
-|        10 |  1.3 µs |    130 ns |
-|       100 |  23 µs |    230 ns |
-|      1000 | 239 µs |    239 ns |
+```
+cogito bench
+```
 
-### Tag search
+The manifest pins each repository to a full commit SHA, and the terms are the
+ones listed for that repository in `benchmarks/repos.json`.
 
-| Tags | Time | Time/tag |
-|-----:|-----:|---------:|
-|   10 | 24 ns |  2.4 ns |
-|  100 | 23 ns |  0.2 ns |
-| 1000 | 23 ns |  0.02 ns |
+### ripgrep (BurntSushi/ripgrep) at `3fce3b5b`
 
-## Storage Comparison: JSON files vs SQLite
+| term | bl_find | bl_read | co_find | co_read | savings | pct% |
+|------|--------:|--------:|--------:|--------:|--------:|-----:|
+| regex (5) | 17,919 | 35,710 | 350 | 6,778 | 46,501 | 86.7 |
+| Matcher (5) | 10,690 | 24,455 | 335 | 5,354 | 29,456 | 83.8 |
+| search (5) | 43,952 | 44,252 | 384 | 14,755 | 73,065 | 82.8 |
+| flags (5) | 5,338 | 50,228 | 397 | 4,171 | 50,998 | 91.8 |
+| **TOTAL** | **77,899** | **154,645** | **1,466** | **31,058** | **200,020** | **86.0** |
 
-Same data, same operations, different backends. This is the real impact
-of the SQLite migration.
+### bat (sharkdp/bat) at `d9559c69`
 
-### Write throughput (insert N decisions)
+| term | bl_find | bl_read | co_find | co_read | savings | pct% |
+|------|--------:|--------:|--------:|--------:|--------:|-----:|
+| syntax (5) | 174,355 | 28,934 | 1,385 | 19,445 | 182,459 | 89.8 |
+| Theme (5) | 12,466 | 40,106 | 233 | 4,556 | 47,783 | 90.9 |
+| highlighter (5) | 4,829 | 71,217 | 207 | 8,347 | 67,492 | 88.8 |
+| assets (5) | 119,961 | 28,853 | 275 | 8,878 | 139,661 | 93.8 |
+| **TOTAL** | **311,611** | **169,110** | **2,100** | **41,226** | **437,395** | **91.0** |
 
-| Decisions | JSON (ms) | SQLite (ms) | Speedup |
-|----------:|----------:|-----------:|--------:|
-|        10 |    23.1  |       1.0  | **23x**  |
-|       100 |   442.7  |       2.5  | **177x** |
-|      1000 |  5,247   |      17.0  | **309x** |
+### Combined
 
-JSON serializes the entire array on every write. SQLite only writes the new row.
+| | baseline | cogito | savings | pct% |
+|--|---------:|-------:|--------:|-----:|
+| Both repositories, all eight terms | 713,265 | 75,850 | 637,415 | 89.4 |
 
-### Read throughput (load all)
+Each row is a full run of the two strategies over the same matched files, so
+the comparison isolates how the code is read, not how it is found.
 
-| Decisions | JSON (µs) | SQLite (µs) | Notes |
-|----------:|----------:|-----------:|-------|
-|        10 |       4.0 |       4.2  | both in-memory at this size |
-|       100 |       4.0 |       4.1  | both instant |
-|      1000 |       4.3 |       4.1  | JSON's whole-file read is fast at 1k |
+### Interpretation
 
-At low counts both are ~4 µs because the data is small enough to fit in
-filesystem cache. The advantage of SQLite grows when:
-- Data exceeds filesystem cache (>10k items)
-- Concurrent readers (SQLite WAL doesn't block)
-- Filtering by query (SQLite indexed, JSON scans all)
+- **Finding cost varies with how common the term is.** For a term that appears
+  in many files, the baseline's recursive search prints every matching line,
+  which is where bat's `syntax` and `assets` rows spend most of their budget
+  (174,355 and 119,961 tokens to find, against 1,385 and 275 with Cogito). For
+  a term that appears in few files, listing and searching is cheap either way.
+- **Reading cost is where the gap is stable.** Reading matched files whole
+  costs 154,645 tokens on ripgrep and 169,110 on bat; outlines plus the matched
+  line ranges cost 31,058 and 41,226. That is the part the product actually
+  changes, and it holds across every term measured.
+- **Combined: 89.4% fewer tokens** across both repositories and all eight
+  terms, from 713,265 down to 75,850.
 
-### File size on disk (1000 decisions)
+### Caveats
 
-| Backend | Total bytes | Bytes/decision |
-|---------|------------:|----------------:|
-| JSON    |     494,669 |          494.7 |
-| SQLite  |     163,840 |          163.8 |
-| **Ratio** | | **3.0x smaller** |
+- These numbers are specific to this repository and these terms. Other
+  repositories and terms will produce different savings percentages.
+- A term that matches thousands of files may show lower savings because
+  the baseline reads more files. Use `--limit` to cap this.
+- The baseline reading strategy (whole-file reads) is intentionally naive.
+  Real agents might use heuristics to avoid reading irrelevant sections.
 
-SQLite is 3x more compact even with the FTS5 index included. After
-`PRAGMA wal_checkpoint(TRUNCATE)`, the WAL is merged into the main file.
+## Benchmarking Other Repositories
 
-### Search with stemming (SQLite-only)
+To add a repository to the pinned manifest:
 
-Using `cogito decision search` on 1000 stored decisions:
+1. Choose a small, permissively licensed open-source repository
+2. Identify terms that appear in the codebase and produce meaningful matches
+3. Pin to a specific git commit (not `main` or `master`)
+4. Add an entry to `benchmarks/repos.json`
 
-| Query | Time |
-|------:|-----:|
-| `scalable` (matches "scalability") | 20.8 µs |
-| `performance` (matches "performance") | 21.0 µs |
-| `decision` (matches "decision") | 20.5 µs |
-
-The **porter stemmer** matches:
-- `scalable` → finds decisions with "scalability" (and vice versa)
-- `auth` → finds "authentication", "authenticate", "authoring"
-- `decision` → finds "decisions", "decide", "deciding"
-
-This is a feature JSON cannot provide without external NLP libraries.
-
-## Real-world benchmark conclusions
-
-### Why SQLite wins for writes
-
-JSON requires re-serializing the entire `Vec<Decision>` on every `add`.
-This is O(n) per write, which means a project with 1000 decisions takes
-5+ seconds to add one more. SQLite's INSERT is O(1) per row.
-
-### Why SQLite wins for file size
-
-JSON stores field names redundantly in each line:
 ```json
-{"id":"...","project_id":"...","title":"...","why":"..."}
+{
+  "manifest_version": "1.0",
+  "repos": [
+    {
+      "name": "ripgrep",
+      "url": "https://github.com/BurntSushi/ripgrep",
+      "commit": "3fce3b5bb0236da2df6d99672afb8a719642eca7",
+      "terms": ["regex", "Matcher", "search", "flags"]
+    }
+  ]
+}
 ```
-Every field name is repeated for every record. SQLite stores them once
-in the schema.
-
-### Why the read times are similar at small N
-
-Both backends load everything into memory. JSON parses 494 KB; SQLite
-loads 164 KB + decodes rows. The deserialize cost dominates. The
-advantage of SQLite shows up when:
-- You have >10k records and need to filter (JSON scans all, SQLite uses indexes)
-- You have multiple readers (SQLite WAL allows concurrent reads)
-- You need to search (FTS5 with porter stemming)
-
-## Comparison With Naive Baseline
-
-A naive "send everything to the LLM" baseline has:
-
-- **Token cost**: 100% of the input (no reduction)
-- **Latency**: 0 ms of pre-processing, but the LLM call costs ~`tokens/100` per
-  second of generation time, so a 100k-token context costs ~10 seconds of
-  generation before producing any answer
-
-With Cogito on the same 100k-token context:
-
-- **Token cost**: 73-88% of the input (12-27% saved)
-- **Pre-processing latency**: ~29 ms (compress) + 60 ms (scan) for a
-  mid-size repo = 90 ms one-time
-- **LLM cost savings**: 12-27% on every subsequent call that touches that
-  context
-
-For a 5-turn agent session that reuses the context each turn, the
-amortized cost is **~9 ms of pre-processing per turn** vs a 12-27% LLM cost
-reduction. Positive ROI on the first turn.
-
-## Limitations
-
-- **Synthetic compressor data is conservative.** Real code compresses
-  significantly better (27% vs 12%).
-- **The fingerprint benchmark does not include `git revwalk` cost for
-  very large repos.** Cogito at 500 files scanned in 21 ms; a repo with
-  50k commits will see a higher absolute time.
-- **JSON vs SQLite read times are similar at small N.** The advantage
-  of SQLite shows at large N or with concurrent access.
-
-## Next Measurements to Take
-
-1. **Fingerprint on a 100k+ file monorepo** (Linux kernel, etcd)
-2. **MCP roundtrip latency** (initialize → tool call → response)
-3. **Compression with LLM-assisted summarization** (vs. structural only)
-4. **SQLite read performance at 10k+ records** (where JSON's linear scan hurts)

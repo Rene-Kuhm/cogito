@@ -4,9 +4,11 @@
 
 use anyhow::{Context, Result};
 use cogito_harness_core::{Cogito, Project};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::ProjectCommands;
+
+pub mod bench;
 
 // ============================================================
 // Project Commands
@@ -943,4 +945,21 @@ fn load_or_create_project(cogito: &Cogito, cwd: &Path) -> Result<Project> {
     }
 
     Ok(project)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Benchmark
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run the token-savings benchmark.
+pub async fn bench(
+    repo: Option<PathBuf>,
+    terms: Vec<String>,
+    json: bool,
+    limit: usize,
+) -> Result<()> {
+    let opts = bench::BenchOptions { repo, terms, limit };
+    let result = bench::run_benchmark_async(opts).await?;
+    bench::print_results(&result, json)?;
+    Ok(())
 }
