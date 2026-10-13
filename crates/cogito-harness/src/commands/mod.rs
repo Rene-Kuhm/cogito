@@ -535,6 +535,40 @@ pub async fn map(refresh: bool, card: bool) -> Result<()> {
     Ok(())
 }
 
+/// Print `file`'s declarations or sections with line ranges.
+pub async fn outline(file: &str) -> Result<()> {
+    let cwd = std::env::current_dir().context("Cannot read current directory")?;
+    let cogito = open_cogito(&cwd)?;
+    let project = load_or_create_project(&cogito, &cwd)?;
+    let (fingerprint, _) = cogito.fingerprint(&project, false).await?;
+    let file = cogito_harness_core::map::find_file(&project.path, &fingerprint, file)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let text = cogito_harness_core::map::render_outline(&project.path, &fingerprint, &file)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    print!("{text}");
+    Ok(())
+}
+
+/// Print symbols, doc sections, files, modules and tags matching `query`.
+pub async fn search(query: &str) -> Result<()> {
+    let cwd = std::env::current_dir().context("Cannot read current directory")?;
+    let cogito = open_cogito(&cwd)?;
+    let project = load_or_create_project(&cogito, &cwd)?;
+    let (fingerprint, _) = cogito.fingerprint(&project, false).await?;
+    let found = cogito_harness_core::map::search_paths(&project.path, &fingerprint, query);
+    let tags: Vec<(String, Vec<std::path::PathBuf>)> = cogito
+        .search_tags(project.id, query)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| (t.tag, t.paths))
+        .collect();
+    print!(
+        "{}",
+        cogito_harness_core::map::render_search(&found, &tags, query)
+    );
+    Ok(())
+}
+
 /// Print what `file` imports and what imports it.
 pub async fn related(file: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;

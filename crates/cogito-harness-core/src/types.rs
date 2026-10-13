@@ -199,7 +199,11 @@ pub struct Fingerprint {
     /// repository. A different `HEAD` means the stored fingerprint is stale.
     #[serde(default)]
     pub head: Option<String>,
-    /// Top-level declarations of every code file, for finding a symbol by name.
+    /// Documentation files (Markdown), relative to the project root.
+    #[serde(default)]
+    pub docs: Vec<PathBuf>,
+    /// Top-level declarations of every code file, and the headings (levels
+    /// 1-3) of every document, for finding them by name.
     #[serde(default)]
     pub symbols: Vec<Symbol>,
     /// Layout version of this fingerprint. A stored fingerprint with an older

@@ -34,6 +34,16 @@ pub async fn generate(project: &Project) -> Result<Fingerprint> {
         let from = flow.from.strip_prefix(root).unwrap_or(&flow.from);
         flow.resolved = resolver.resolve(from, &flow.to.to_string_lossy(), project.language);
     }
+    let mut docs: Vec<PathBuf> = all_files
+        .iter()
+        .filter(|f| {
+            f.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(crate::map::outline::is_doc)
+        })
+        .cloned()
+        .collect();
+    docs.sort();
     let mut files: Vec<PathBuf> = all_files
         .into_iter()
         .filter(|f| {
@@ -44,7 +54,12 @@ pub async fn generate(project: &Project) -> Result<Fingerprint> {
         .collect();
     files.sort();
 
-    let symbols = index_symbols(root, &files);
+    let mut symbols = index_symbols(root, &files);
+    symbols.extend(
+        index_symbols(root, &docs)
+            .into_iter()
+            .filter(|s| matches!(s.kind.as_str(), "h1" | "h2" | "h3")),
+    );
 
     let mut hot_zones = Vec::new();
     let mut warm_zones = Vec::new();
@@ -85,13 +100,14 @@ pub async fn generate(project: &Project) -> Result<Fingerprint> {
         modules,
         head: current_head(root),
         symbols,
+        docs,
         format: FINGERPRINT_FORMAT,
     })
 }
 
 /// Current fingerprint layout. Bump it when a scan starts recording something
 /// tools depend on, so fingerprints stored by older versions are regenerated.
-pub const FINGERPRINT_FORMAT: u32 = 2;
+pub const FINGERPRINT_FORMAT: u32 = 3;
 
 /// Declarations of every code file. Files that cannot be read are skipped.
 fn index_symbols(root: &Path, files: &[PathBuf]) -> Vec<Symbol> {

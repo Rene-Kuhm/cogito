@@ -156,6 +156,18 @@ enum Commands {
         card: bool,
     },
 
+    /// Show a file's declarations or sections with line ranges (the `file_outline` tool)
+    Outline {
+        /// File path, relative to the project root, or a unique suffix
+        file: String,
+    },
+
+    /// Find symbols, doc sections, files and modules by words (the `search_code` tool)
+    Search {
+        /// Words to look for
+        query: String,
+    },
+
     /// Show a file's imports and importers (the `related_files` tool)
     Related {
         /// File path, relative to the project root, or a unique suffix
@@ -322,6 +334,8 @@ async fn main() -> Result<()> {
         Some(Commands::Stats) => commands::stats(args.json).await?,
         Some(Commands::Map { refresh, card }) => commands::map(refresh, card).await?,
         Some(Commands::Related { file }) => commands::related(&file).await?,
+        Some(Commands::Outline { file }) => commands::outline(&file).await?,
+        Some(Commands::Search { query }) => commands::search(&query).await?,
         Some(Commands::Doctor) => commands::doctor().await?,
         Some(Commands::Export { output, format }) => {
             commands::export(output.as_deref(), &format).await?
