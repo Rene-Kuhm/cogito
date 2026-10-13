@@ -636,14 +636,25 @@ pub async fn doctor() -> Result<()> {
     if crate::agents::Agent::GentleShell.agent_present(&home) {
         let declared = crate::agents::pi_package_declared(&home);
         if declared {
+            let settings = crate::agents::Agent::GentleShell.config_path(&home);
             println!();
-            println!(
-                "  ✓ {} declared in {}",
-                crate::agents::PI_PACKAGE,
-                crate::agents::Agent::GentleShell
-                    .config_path(&home)
-                    .display()
-            );
+            // Declared is not the same as installable: Pi runs `npm install` for
+            // every declared package, and a 404 there breaks package loading.
+            if crate::agents::pi_package_check() == crate::agents::NpmCheck::NotFound {
+                println!(
+                    "  ! {} declared in {}",
+                    crate::agents::PI_PACKAGE,
+                    settings.display()
+                );
+                println!("    but it is not on npm, so Pi will fail to install it;");
+                println!("    run `cogito setup` to remove the declaration");
+            } else {
+                println!(
+                    "  ✓ {} declared in {}",
+                    crate::agents::PI_PACKAGE,
+                    settings.display()
+                );
+            }
         } else {
             let check = crate::agents::pi_package_check();
             println!();
@@ -797,7 +808,9 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool, with_pi_package: boo
             }
             crate::agents::NpmCheck::Unavailable(reason) => {
                 println!("            could not check npm ({reason})");
-                println!("            skipping it; the MCP half is configured either way");
+                println!(
+                    "            leaving its declaration as it is; the MCP half is configured either way"
+                );
                 println!("            use --with-pi-package to declare it regardless");
             }
         }

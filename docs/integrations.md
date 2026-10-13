@@ -73,6 +73,11 @@ Two halves, both written by setup:
 > half and says so. Run `cogito setup` again after the package is published and
 > it will declare it.
 >
+> Only an `E404` from npm counts as "absent", and then setup also removes a
+> declaration an earlier run left behind (`cogito doctor` flags it with `!`).
+> When npm cannot be reached at all (offline, DNS, proxy), setup leaves the
+> declaration exactly as it is.
+>
 > If you know it is available and the check cannot see it (an offline machine,
 > a private registry), pass `--with-pi-package` to declare it anyway.
 

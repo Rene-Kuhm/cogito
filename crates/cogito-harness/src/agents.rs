@@ -74,9 +74,16 @@ pub enum NpmCheck {
 /// `npm view` is used rather than a direct request to registry.npmjs.org so
 /// that whatever registry, mirror or scope the user configured is respected.
 fn npm_check(name: &str) -> NpmCheck {
+    npm_check_with_registry(name, None)
+}
+
+/// `npm_check`, optionally against another registry (used by tests).
+fn npm_check_with_registry(name: &str, registry: Option<&str>) -> NpmCheck {
+    use std::io::Read;
     use std::process::{Command, Stdio};
 
-    let mut child = match Command::new("npm")
+    let mut command = Command::new("npm");
+    command
         .args([
             "view",
             name,
@@ -89,24 +96,32 @@ fn npm_check(name: &str) -> NpmCheck {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    if let Some(registry) = registry {
+        command.env("npm_config_registry", registry);
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => return NpmCheck::Unavailable(format!("npm not runnable: {e}")),
     };
+
+    // Drain stderr on its own thread so a chatty npm can never fill the pipe
+    // and stall while we wait for it to exit.
+    let mut stderr_pipe = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    });
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                return if status.success() {
-                    NpmCheck::Published
-                } else {
-                    // npm exits non-zero for 404 and for network errors alike.
-                    // Either way we must not declare the package.
-                    NpmCheck::NotFound
-                };
+                let stderr = reader.join().unwrap_or_default();
+                return classify_npm_view(status.success(), &stderr);
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
@@ -118,6 +133,30 @@ fn npm_check(name: &str) -> NpmCheck {
             }
             Err(e) => return NpmCheck::Unavailable(format!("npm did not run: {e}")),
         }
+    }
+}
+
+/// Turn the outcome of `npm view` into an `NpmCheck`.
+///
+/// npm exits non-zero for a missing package and for a network failure alike,
+/// so the exit code alone cannot tell them apart. The error code npm prints
+/// can: only `E404` proves the package is not there. Anything else (offline,
+/// DNS, proxy, auth) is `Unavailable`, because treating it as "not found"
+/// would make setup remove a declaration that is fine.
+fn classify_npm_view(success: bool, stderr: &str) -> NpmCheck {
+    if success {
+        return NpmCheck::Published;
+    }
+    // npm 7+ prints `npm error code E404`; older npm printed `npm ERR! code E404`.
+    let code = stderr.lines().find_map(|line| {
+        let mut words = line.split_whitespace().skip_while(|w| *w != "code");
+        words.next()?;
+        words.next()
+    });
+    match code {
+        Some("E404") => NpmCheck::NotFound,
+        Some(code) => NpmCheck::Unavailable(format!("npm failed with {code}")),
+        None => NpmCheck::Unavailable("npm failed without an error code".to_string()),
     }
 }
 
@@ -1751,6 +1790,68 @@ mod tests {
         assert!(
             !pi_package_declared(home.path()),
             "package must be removable by re-running setup without it"
+        );
+    }
+
+    #[test]
+    fn test_classify_npm_view_only_e404_means_not_found() {
+        assert_eq!(classify_npm_view(true, ""), NpmCheck::Published);
+        assert_eq!(
+            classify_npm_view(false, "npm error code E404\nnpm error 404 Not Found"),
+            NpmCheck::NotFound
+        );
+        // Older npm wording.
+        assert_eq!(
+            classify_npm_view(false, "npm ERR! code E404\n"),
+            NpmCheck::NotFound
+        );
+        // A network failure exits non-zero too, but proves nothing about the
+        // package: it must never read as "not found".
+        for code in ["ECONNREFUSED", "ENOTFOUND", "ETIMEDOUT", "E401"] {
+            let stderr = format!("npm error code {code}\nnpm error network request failed");
+            assert!(
+                matches!(classify_npm_view(false, &stderr), NpmCheck::Unavailable(_)),
+                "{code} must be Unavailable"
+            );
+        }
+        assert!(matches!(
+            classify_npm_view(false, "something went wrong"),
+            NpmCheck::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn test_unreachable_registry_is_unavailable_not_not_found() {
+        // Nothing listens on port 9, so npm fails fast with ECONNREFUSED. If npm
+        // is not installed the result is Unavailable as well.
+        let check = npm_check_with_registry("commander", Some("http://127.0.0.1:9"));
+        assert!(
+            matches!(check, NpmCheck::Unavailable(_)),
+            "an unreachable registry must not read as not found, got {check:?}"
+        );
+    }
+
+    #[test]
+    fn test_unavailable_registry_keeps_an_existing_declaration() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".gentle-shell/agent")).unwrap();
+        std::fs::write(
+            home.path().join(".gentle-shell/agent/settings.json"),
+            format!(r#"{{"packages":["npm:other","{PI_PACKAGE}"]}}"#),
+        )
+        .unwrap();
+
+        // What setup does when the registry cannot be reached.
+        install(
+            Agent::GentleShell,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
+        assert!(
+            pi_package_declared(home.path()),
+            "an unreachable registry must not remove the declaration"
         );
     }
 
