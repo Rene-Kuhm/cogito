@@ -50,6 +50,8 @@ pub struct ProjectMap {
     pub total_files: usize,
     pub modules: Vec<ModuleSummary>,
     pub hot_files: Vec<(PathBuf, usize)>,
+    /// Key documents for the card: root docs, then doc directories with counts.
+    pub docs: Vec<String>,
 }
 
 /// Paths in a fingerprint relative to `root`. Older fingerprints stored some
@@ -193,6 +195,7 @@ pub fn build(root: &Path, name: &str, fp: &Fingerprint) -> ProjectMap {
         total_files: fp.files.len(),
         modules: summaries,
         hot_files,
+        docs: key_docs(&fp.docs),
     }
 }
 
@@ -291,12 +294,87 @@ pub fn render_card(map: &ProjectMap) -> String {
     if !busiest.is_empty() {
         out.push_str(&format!("Busiest files: {}\n", busiest.join(", ")));
     }
+    if !map.docs.is_empty() {
+        out.push_str(&format!("Docs: {}\n", map.docs.join(", ")));
+    }
     out.push_str(
-        "Cogito has this project indexed. To find code, call search_code (symbols with file:line, \
-         files, modules); before reading a file, call file_outline and read only the line range \
-         you need; related_files shows imports and importers; project_map gives module details. \
-         Do not list directories, grep or read whole files to find your way.\n",
+        "This card is the project overview: do not call project_map unless you need one \
+         module's details. To find code or documentation, call search_code (symbols and doc \
+         sections with file:line, files, modules). Before reading any file, code or Markdown, \
+         call file_outline and read only the line range you need. related_files shows imports \
+         and importers. Do not list directories, grep for file names or read whole files to \
+         find your way.\n",
     );
+    out
+}
+
+/// The documentation worth naming in the card: root-level documents first,
+/// then each top-level directory that holds documents, with its count.
+fn key_docs(docs: &[PathBuf]) -> Vec<String> {
+    const ROOT_LIMIT: usize = 8;
+    const DIR_LIMIT: usize = 6;
+    let mut root: Vec<String> = docs
+        .iter()
+        .filter(|d| d.components().count() == 1)
+        .map(|d| d.display().to_string())
+        .collect();
+    // README first: it is where "what is this" is answered.
+    root.sort_by_key(|d| (!d.to_lowercase().starts_with("readme"), d.clone()));
+    root.truncate(ROOT_LIMIT);
+
+    let mut dirs: BTreeMap<String, usize> = BTreeMap::new();
+    for d in docs.iter().filter(|d| d.components().count() > 1) {
+        if let Some(first) = d.components().next() {
+            *dirs
+                .entry(first.as_os_str().to_string_lossy().into_owned())
+                .or_default() += 1;
+        }
+    }
+    // A directory with one or two documents is not where documentation lives.
+    let mut dirs: Vec<(String, usize)> = dirs.into_iter().filter(|(_, n)| *n >= 3).collect();
+    dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    root.extend(
+        dirs.into_iter()
+            .take(DIR_LIMIT)
+            .map(|(dir, n)| format!("{dir}/ ({n})")),
+    );
+    root
+}
+
+/// Render `search_paths` results (and matching tags) as agent text.
+pub fn render_search(
+    found: &SearchResults,
+    tags: &[(String, Vec<PathBuf>)],
+    query: &str,
+) -> String {
+    if found.files.is_empty()
+        && found.modules.is_empty()
+        && found.symbols.is_empty()
+        && tags.is_empty()
+    {
+        return format!("Nothing matches \"{query}\".\n");
+    }
+    let mut out = String::new();
+    if !tags.is_empty() {
+        out.push_str("Tags:\n");
+        for (tag, paths) in tags {
+            let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+            out.push_str(&format!("  {tag}: {}\n", paths.join(", ")));
+        }
+    }
+    let section = |title: &str, items: &[String], out: &mut String| {
+        if !items.is_empty() {
+            out.push_str(&format!("{title}:\n  {}\n", items.join("\n  ")));
+        }
+    };
+    if found.files_first {
+        section("Files", &found.files, &mut out);
+    }
+    section("Symbols", &found.symbols, &mut out);
+    section("Modules", &found.modules, &mut out);
+    if !found.files_first {
+        section("Files", &found.files, &mut out);
+    }
     out
 }
 
@@ -304,14 +382,15 @@ pub fn render_card(map: &ProjectMap) -> String {
 /// such as `auth/server.ts`.
 pub fn find_file(root: &Path, fp: &Fingerprint, query: &str) -> Result<PathBuf, String> {
     let wanted = rel(root, Path::new(query.trim()));
-    if fp.files.contains(&wanted) {
+    let known = || fp.files.iter().chain(&fp.docs);
+    if known().any(|f| *f == wanted) {
         return Ok(wanted);
     }
-    let matches: Vec<&PathBuf> = fp.files.iter().filter(|f| f.ends_with(&wanted)).collect();
+    let matches: Vec<&PathBuf> = known().filter(|f| f.ends_with(&wanted)).collect();
     match matches.as_slice() {
         [one] => Ok((*one).clone()),
         [] => Err(format!(
-            "{} is not a code file of this project (try search_code)",
+            "{} is not a code or doc file of this project (try search_code)",
             wanted.display()
         )),
         many => Err(format!(
@@ -409,14 +488,25 @@ pub fn search_paths(root: &Path, fp: &Fingerprint, query: &str) -> SearchResults
     }
     let changes = change_counts(root, fp);
 
-    let mut scored: Vec<(usize, bool, usize, &PathBuf)> = fp
+    // A file whose name is a search term ("README" → README.md) is what the
+    // caller is looking for; it ranks above everything else.
+    let named = |f: &Path| {
+        let lower = |s: Option<&std::ffi::OsStr>| s.and_then(|s| s.to_str()).map(str::to_lowercase);
+        let (stem, name) = (lower(f.file_stem()), lower(f.file_name()));
+        terms
+            .iter()
+            .any(|t| stem.as_deref() == Some(t.as_str()) || name.as_deref() == Some(t.as_str()))
+    };
+    let mut scored: Vec<(bool, usize, bool, usize, &PathBuf)> = fp
         .files
         .iter()
+        .chain(&fp.docs)
         .filter_map(|f| {
             let path = f.display().to_string().to_lowercase();
             let hits = terms.iter().filter(|t| path.contains(t.as_str())).count();
             (hits > 0).then(|| {
                 (
+                    named(f),
                     hits,
                     is_test(&path),
                     changes.get(f).copied().unwrap_or(0),
@@ -425,17 +515,27 @@ pub fn search_paths(root: &Path, fp: &Fingerprint, query: &str) -> SearchResults
             })
         })
         .collect();
-    // More terms matched first; source before tests; then the busier file.
+    // Named files first, shallowest first; then more terms matched; source
+    // before tests; then the busier file.
     scored.sort_by(|a, b| {
         b.0.cmp(&a.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| b.2.cmp(&a.2))
-            .then_with(|| a.3.cmp(b.3))
+            .then_with(|| {
+                if a.0 && b.0 {
+                    a.4.components().count().cmp(&b.4.components().count())
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| b.3.cmp(&a.3))
+            .then_with(|| a.4.cmp(b.4))
     });
+    let files_first = scored.first().is_some_and(|f| f.0);
     let files = scored
         .iter()
         .take(SEARCH_FILE_LIMIT)
-        .map(|(_, _, c, f)| {
+        .map(|(_, _, _, c, f)| {
             if *c > 0 {
                 format!("{} ({c} changes)", f.display())
             } else {
@@ -500,6 +600,7 @@ pub fn search_paths(root: &Path, fp: &Fingerprint, query: &str) -> SearchResults
         files,
         modules,
         symbols,
+        files_first,
     }
 }
 
@@ -509,6 +610,8 @@ pub struct SearchResults {
     pub files: Vec<String>,
     pub modules: Vec<String>,
     pub symbols: Vec<String>,
+    /// A file is named exactly like a search term, so files lead the output.
+    pub files_first: bool,
 }
 
 /// One file's declarations with their line ranges, read from disk now so the
@@ -542,6 +645,21 @@ pub fn render_outline(root: &Path, fp: &Fingerprint, file: &Path) -> Result<Stri
 
     if declarations.is_empty() {
         out.push_str("No declarations recognised; read the file directly.\n");
+        return Ok(out);
+    }
+
+    if outline::is_doc(ext) {
+        for d in &declarations {
+            let level = d.kind.trim_start_matches('h').parse::<usize>().unwrap_or(1);
+            out.push_str(&format!(
+                "  {}-{} {} {}\n",
+                d.start,
+                d.end,
+                "#".repeat(level),
+                d.name
+            ));
+        }
+        out.push_str("Read only the section you need.\n");
         return Ok(out);
     }
 
@@ -655,6 +773,7 @@ mod tests {
                 file: "apps/web/lib/auth/server.ts".into(),
                 line: 10,
             }],
+            docs: vec![PathBuf::from("README.md")],
             format: crate::fingerprint::FINGERPRINT_FORMAT,
         }
     }
@@ -718,5 +837,39 @@ mod tests {
             PathBuf::from("apps/web/lib/auth/server.ts")
         );
         assert!(find_file(Path::new(""), &fp, "missing.ts").is_err());
+    }
+}
+
+#[cfg(test)]
+mod doc_tests {
+    use super::*;
+
+    #[test]
+    fn test_key_docs_lists_root_docs_then_big_doc_dirs() {
+        let docs: Vec<PathBuf> = [
+            "CHANGELOG.md",
+            "README.md",
+            "docs/a.md",
+            "docs/b.md",
+            "docs/c.md",
+            ".github/PULL_REQUEST_TEMPLATE.md",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        // README leads; a directory with fewer than three documents is noise.
+        assert_eq!(key_docs(&docs), ["README.md", "CHANGELOG.md", "docs/ (3)"]);
+    }
+
+    #[test]
+    fn test_render_search_puts_a_named_file_first() {
+        let found = SearchResults {
+            files: vec!["README.md (32 changes)".into()],
+            modules: vec![],
+            symbols: vec!["h2 Write the README docs/plan.md:4".into()],
+            files_first: true,
+        };
+        let text = render_search(&found, &[], "README");
+        assert!(text.starts_with("Files:\n  README.md"), "{text}");
     }
 }

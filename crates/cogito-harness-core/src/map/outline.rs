@@ -83,9 +83,19 @@ fn is_callable(kind: &str) -> bool {
     )
 }
 
+/// Whether files with this extension are documentation Cogito outlines by
+/// heading.
+pub fn is_doc(extension: &str) -> bool {
+    matches!(extension.to_lowercase().as_str(), "md" | "mdx" | "markdown")
+}
+
 /// Declarations in `content`, a file with the given extension. Empty for
-/// languages Cogito does not outline.
+/// languages Cogito does not outline. For Markdown these are its headings
+/// (kind `h1`…`h6`), each spanning its section including subsections.
 pub fn declarations(content: &str, extension: &str) -> Vec<Declaration> {
+    if is_doc(extension) {
+        return sections(content);
+    }
     let Some(grammar) = grammar(&extension.to_lowercase()) else {
         return Vec::new();
     };
@@ -135,6 +145,62 @@ pub fn declarations(content: &str, extension: &str) -> Vec<Declaration> {
         found[i].end = end;
     }
     found
+}
+
+/// Markdown headings, outside fenced code blocks. A section runs until the
+/// next heading of the same or a higher level.
+fn sections(content: &str) -> Vec<Declaration> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut found: Vec<(usize, Declaration)> = Vec::new();
+    let mut fence: Option<&str> = None;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        for marker in ["```", "~~~"] {
+            if trimmed.starts_with(marker) {
+                fence = match fence {
+                    Some(open) if open == marker => None,
+                    None => Some(marker),
+                    other => other,
+                };
+            }
+        }
+        if fence.is_some() || !line.starts_with('#') {
+            continue;
+        }
+        let level = line.chars().take_while(|c| *c == '#').count();
+        let Some(title) = line[level..].strip_prefix(' ') else {
+            continue; // `#tag`, not a heading
+        };
+        let title = title.trim().trim_end_matches('#').trim();
+        if level > 6 || title.is_empty() {
+            continue;
+        }
+        found.push((
+            level,
+            Declaration {
+                name: title.to_string(),
+                kind: format!("h{level}"),
+                start: index + 1,
+                end: index + 1,
+                signature: None,
+            },
+        ));
+    }
+
+    let total = lines.len();
+    for i in 0..found.len() {
+        let level = found[i].0;
+        let next = found[i + 1..]
+            .iter()
+            .find(|(l, _)| *l <= level)
+            .map_or(total + 1, |(_, d)| d.start);
+        let mut end = next - 1;
+        while end > found[i].1.start && lines[end - 1].trim().is_empty() {
+            end -= 1;
+        }
+        found[i].1.end = end;
+    }
+    found.into_iter().map(|(_, d)| d).collect()
 }
 
 fn shorten(line: &str) -> String {
@@ -234,6 +300,44 @@ pub(crate) async fn build(root: &Path) -> Map {
         let go = "package x\n\ntype Server struct{}\n\nfunc (s *Server) Start() error {\n\treturn nil\n}\n";
         let names: Vec<_> = declarations(go, "go").into_iter().map(|d| d.name).collect();
         assert_eq!(names, ["Server", "Start"]);
+    }
+
+    #[test]
+    fn test_markdown_sections_nest_and_skip_code_fences() {
+        let md = "\
+# Product
+
+Intro.
+
+## Connectors
+
+- SmartOLT
+
+```bash
+# not a heading
+```
+
+### Status
+
+ok
+
+## Auth
+
+JWT.
+";
+        let found: Vec<_> = declarations(md, "md")
+            .into_iter()
+            .map(|d| (d.kind, d.name, d.start, d.end))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("h1".into(), "Product".into(), 1, 19),
+                ("h2".into(), "Connectors".into(), 5, 15),
+                ("h3".into(), "Status".into(), 13, 15),
+                ("h2".into(), "Auth".into(), 17, 19),
+            ]
+        );
     }
 
     #[test]

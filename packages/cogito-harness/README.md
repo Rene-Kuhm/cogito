@@ -11,9 +11,15 @@ Pi extension that wires [Cogito](https://github.com/Rene-Kuhm/cogito-harness) in
    as `<cogito_project>`. It is identical between turns, so the provider
    serves it from its prompt cache, and the model starts each answer knowing
    the layout without spending a tool call on orientation.
-2. **Shows status.** The status line reports whether Cogito is ready for the
+2. **Guardrails.** The first time the agent reads a large file (250+ lines)
+   whole, it gets Cogito's outline instead; the first time it greps or finds a
+   plain name, it gets Cogito's search result. Repeating the exact same call
+   goes through, so the agent is never stuck; it is only shown the cheap
+   answer first. On FTTH-Copilot: reading `README.md` whole ~11,100 tokens →
+   outline ~530; `grep README **/*.md` ~4,600 → search ~400.
+3. **Shows status.** The status line reports whether Cogito is ready for the
    current project.
-3. **Adds `/cogito`.**
+4. **Adds `/cogito`.**
 
    ```
    /cogito status          what Cogito sees in this project

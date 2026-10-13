@@ -154,7 +154,9 @@ reading the code:
 | `add_tag` | Label code locations so `search_code` finds them by that word |
 
 The map is stored after each scan and reused until `HEAD` moves, so these calls
-read no source files. Cogito is not a memory: decisions and session notes
+read no source files. Documentation is indexed too: `search_code` finds
+Markdown sections by title, and `file_outline` on a `.md` file lists its
+sections with line ranges. Cogito is not a memory: decisions and session notes
 belong to the agent's memory tool (for example Engram), and Cogito exposes no
 tools for them. On FTTH-Copilot (a 661-file pnpm monorepo) the map costs about
 1,150 tokens, against roughly 11,000 for reading every `package.json` and

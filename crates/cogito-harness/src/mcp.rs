@@ -156,7 +156,7 @@ impl CogitoServer {
     }
 
     #[tool(
-        description = "A file's declarations with line ranges (functions with their signature). Read only the range you need instead of the whole file."
+        description = "A file's declarations (code) or sections (Markdown) with line ranges. Read only the range you need instead of the whole file."
     )]
     async fn file_outline(
         &self,
@@ -168,7 +168,7 @@ impl CogitoServer {
     }
 
     #[tool(
-        description = "Find code by words: symbols (function, type, class names) with file:line, file paths (most changed first), modules and tags."
+        description = "Find code or docs by words: symbols (functions, types, classes) and doc sections with file:line, file paths (most changed first), modules and tags."
     )]
     async fn search_code(
         &self,
@@ -176,33 +176,15 @@ impl CogitoServer {
     ) -> Result<String, String> {
         let (cogito, project, fingerprint) = mapped_project(&req.path, false).await?;
         let found = cogito_harness_core::map::search_paths(&project.path, &fingerprint, &req.query);
-        let (files, modules, symbols) = (found.files, found.modules, found.symbols);
-        let tags = cogito
+        let tags: Vec<(String, Vec<PathBuf>)> = cogito
             .search_tags(project.id, &req.query)
-            .map_err(|e| format!("Failed to search tags: {e}"))?;
-
-        if files.is_empty() && modules.is_empty() && symbols.is_empty() && tags.is_empty() {
-            return Ok(format!("Nothing matches \"{}\".", req.query));
-        }
-        let mut out = String::new();
-        if !tags.is_empty() {
-            out.push_str("Tags:\n");
-            for tag in &tags {
-                let paths: Vec<String> =
-                    tag.paths.iter().map(|p| p.display().to_string()).collect();
-                out.push_str(&format!("  {}: {}\n", tag.tag, paths.join(", ")));
-            }
-        }
-        if !symbols.is_empty() {
-            out.push_str(&format!("Symbols:\n  {}\n", symbols.join("\n  ")));
-        }
-        if !modules.is_empty() {
-            out.push_str(&format!("Modules:\n  {}\n", modules.join("\n  ")));
-        }
-        if !files.is_empty() {
-            out.push_str(&format!("Files:\n  {}\n", files.join("\n  ")));
-        }
-        Ok(out)
+            .map_err(|e| format!("Failed to search tags: {e}"))?
+            .into_iter()
+            .map(|t| (t.tag, t.paths))
+            .collect();
+        Ok(cogito_harness_core::map::render_search(
+            &found, &tags, &req.query,
+        ))
     }
 
     #[tool(
