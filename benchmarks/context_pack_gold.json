@@ -1,0 +1,145 @@
+{
+  "schema": "cogito.context_pack_gold/v1",
+  "description": "Labelled tasks used to measure context_pack recall. Each task states what a person would need to answer it, plus the files and symbols a person would consider necessary. Written before the implementation so the measurement defines the target instead of the implementation defining the measurement.",
+  "metric": {
+    "name": "recall@budget",
+    "definition": "expected entries that appear in the pack, over the total expected entries, per task, with the pack built at that task's budget. The reported average is the mean over all tasks.",
+    "file_hit": "any emitted fragment whose path equals the expected path",
+    "symbol_hit": "any emitted fragment whose name equals the expected symbol, case-insensitive",
+    "why_mixed": "Some tasks name the identifier; most only describe behaviour. Recall on the descriptive tasks is the honest signal for what a lexical ranker cannot do, so the set is deliberately biased toward them."
+  },
+  "repos": [
+    {
+      "name": "ripgrep",
+      "url": "https://github.com/BurntSushi/ripgrep",
+      "commit": "3fce3b5bb0236da2df6d99672afb8a719642eca7"
+    },
+    {
+      "name": "bat",
+      "url": "https://github.com/sharkdp/bat",
+      "commit": "d9559c69f541873f8c47ac8ad81d985f4441edf6"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "rg-01",
+      "repo": "ripgrep",
+      "budget": 2000,
+      "task": "Where is SearcherBuilder defined and what does it configure?",
+      "names_the_identifier": true,
+      "notes": "The builder that configures a search: line terminator, binary detection, multi-line, context.",
+      "expect": {
+        "symbols": ["SearcherBuilder"],
+        "files": ["crates/searcher/src/searcher/mod.rs"]
+      }
+    },
+    {
+      "id": "rg-02",
+      "repo": "ripgrep",
+      "budget": 2000,
+      "task": "How does the search stop early when a file looks binary?",
+      "names_the_identifier": false,
+      "notes": "The behaviour is binary detection; a person needs the searcher module where the sink is stopped on a NUL byte.",
+      "expect": {
+        "symbols": ["BinaryDetection"],
+        "files": ["crates/searcher/src/searcher/mod.rs"]
+      }
+    },
+    {
+      "id": "rg-03",
+      "repo": "ripgrep",
+      "budget": 2000,
+      "task": "¿Dónde se leen las reglas de .gitignore mientras se recorre el árbol de directorios?",
+      "names_the_identifier": false,
+      "notes": "Spanish, descriptive. The ignore crate holds both the walker and the gitignore matcher.",
+      "expect": {
+        "symbols": ["Gitignore"],
+        "files": ["crates/ignore/src/gitignore.rs", "crates/ignore/src/walk.rs"]
+      }
+    },
+    {
+      "id": "rg-04",
+      "repo": "ripgrep",
+      "budget": 2000,
+      "task": "¿Cómo implementa RegexMatcher el trait Matcher usando PCRE2?",
+      "names_the_identifier": true,
+      "notes": "Names the type, so a lexical ranker should score high; the point is to confirm the easy case works.",
+      "expect": {
+        "symbols": ["RegexMatcher"],
+        "files": ["crates/pcre2/src/matcher.rs"]
+      }
+    },
+    {
+      "id": "rg-05",
+      "repo": "ripgrep",
+      "budget": 2000,
+      "task": "How are the command-line flags turned into a configured search?",
+      "names_the_identifier": false,
+      "notes": "Descriptive. A person needs the high-level and low-level argument types in the flags module.",
+      "expect": {
+        "symbols": ["HiArgs", "LowArgs"],
+        "files": ["crates/core/flags/hiargs.rs", "crates/core/flags/lowargs.rs"]
+      }
+    },
+    {
+      "id": "bat-01",
+      "repo": "bat",
+      "budget": 2000,
+      "task": "Where is HighlightingAssets defined and how are syntaxes and themes loaded from it?",
+      "names_the_identifier": true,
+      "notes": "Names the type.",
+      "expect": {
+        "symbols": ["HighlightingAssets"],
+        "files": ["src/assets.rs"]
+      }
+    },
+    {
+      "id": "bat-02",
+      "repo": "bat",
+      "budget": 1000,
+      "task": "¿Cómo decide bat si conviene paginar la salida?",
+      "names_the_identifier": false,
+      "notes": "Spanish, descriptive, and a deliberately small budget to exercise the cut.",
+      "expect": {
+        "symbols": ["PagingMode"],
+        "files": ["src/paging.rs"]
+      }
+    },
+    {
+      "id": "bat-03",
+      "repo": "bat",
+      "budget": 2000,
+      "task": "How is a range like 3:10 or :5 parsed from the command line?",
+      "names_the_identifier": false,
+      "notes": "Descriptive. The type is LineRange and its parser lives with it.",
+      "expect": {
+        "symbols": ["LineRange"],
+        "files": ["src/line_range.rs"]
+      }
+    },
+    {
+      "id": "bat-04",
+      "repo": "bat",
+      "budget": 2000,
+      "task": "¿Cómo se mapea el nombre de un archivo a una sintaxis concreta?",
+      "names_the_identifier": false,
+      "notes": "Spanish, descriptive.",
+      "expect": {
+        "symbols": ["SyntaxMapping"],
+        "files": ["src/syntax_mapping.rs"]
+      }
+    },
+    {
+      "id": "bat-05",
+      "repo": "bat",
+      "budget": 4000,
+      "task": "How does the pretty printer compose the grid, the header and the line numbers?",
+      "names_the_identifier": false,
+      "notes": "Descriptive, and a larger budget because the answer spans several declarations of the same type.",
+      "expect": {
+        "symbols": ["PrettyPrinter"],
+        "files": ["src/pretty_printer.rs"]
+      }
+    }
+  ]
+}
