@@ -86,100 +86,6 @@ fn test_cli_scan_in_real_project() {
 }
 
 #[test]
-fn test_cli_decision_add_and_search() {
-    let project = setup_test_project();
-    let bin = cogito_bin();
-
-    // Add a decision
-    let output = Command::new(&bin)
-        .args([
-            "decision",
-            "add",
-            "--title",
-            "Use JWT",
-            "--why",
-            "stateless auth",
-            "--tags",
-            "auth",
-            "--paths",
-            "src/auth.rs",
-        ])
-        .current_dir(project.path())
-        .output()
-        .expect("Failed to add decision");
-
-    assert!(output.status.success(), "decision add should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Decision added"));
-
-    // Search for the decision
-    let output = Command::new(&bin)
-        .args(["decision", "search", "JWT"])
-        .current_dir(project.path())
-        .output()
-        .expect("Failed to search decisions");
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Use JWT"), "Should find the decision");
-    assert!(stdout.contains("stateless auth"));
-}
-
-#[test]
-fn test_cli_tag_add_and_list() {
-    let project = setup_test_project();
-    let bin = cogito_bin();
-
-    // Add a tag
-    let output = Command::new(&bin)
-        .args(["tag", "add", "billing", "src/billing/"])
-        .current_dir(project.path())
-        .output()
-        .expect("Failed to add tag");
-
-    assert!(output.status.success(), "tag add should succeed");
-
-    // List tags
-    let output = Command::new(&bin)
-        .args(["tag", "list"])
-        .current_dir(project.path())
-        .output()
-        .expect("Failed to list tags");
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("billing"), "Should list the tag");
-}
-
-#[test]
-fn test_cli_compress_via_stdin() {
-    let bin = cogito_bin();
-    let input = "fn main() { // comment\n    println!(\"hi\");\n}";
-
-    use std::io::Write;
-    use std::process::Stdio;
-
-    let mut child = Command::new(&bin)
-        .args(["compress", "-", "--max-tokens", "100"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn cogito");
-
-    let mut stdin = child.stdin.take().expect("Failed to open stdin");
-    stdin
-        .write_all(input.as_bytes())
-        .expect("Failed to write to stdin");
-    drop(stdin);
-
-    let output = child.wait_with_output().expect("Failed to read stdout");
-    assert!(output.status.success(), "compress should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Original tokens"));
-    assert!(stdout.contains("Compressed tokens"));
-}
-
-#[test]
 fn test_cli_doctor_in_project() {
     let project = setup_test_project();
     let output = Command::new(cogito_bin())
@@ -208,21 +114,7 @@ fn test_cli_stats_shows_persistence() {
     let project = setup_test_project();
     let bin = cogito_bin();
 
-    // Add a decision
-    Command::new(&bin)
-        .args(["decision", "add", "--title", "Test", "--why", "reason"])
-        .current_dir(project.path())
-        .output()
-        .expect("Failed to add decision");
-
-    // Add a tag
-    Command::new(&bin)
-        .args(["tag", "add", "test", "src/"])
-        .current_dir(project.path())
-        .output()
-        .expect("Failed to add tag");
-
-    // Check stats
+    // Check stats before any scan
     let output = Command::new(&bin)
         .args(["stats"])
         .current_dir(project.path())
@@ -231,11 +123,9 @@ fn test_cli_stats_shows_persistence() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Tags:"));
-    assert!(stdout.contains("Decisions:"));
     assert!(
-        stdout.contains("1"),
-        "Should show at least 1 tag and 1 decision"
+        stdout.contains("not scanned yet"),
+        "Should show not scanned yet: {stdout}"
     );
 }
 

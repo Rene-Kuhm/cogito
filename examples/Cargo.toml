@@ -14,10 +14,6 @@ path = "basic.rs"
 name = "scan_repo"
 path = "scan_repo.rs"
 
-[[example]]
-name = "test_ast"
-path = "test_ast.rs"
-
 [dependencies]
 cogito-harness-core.workspace = true
 tokio.workspace = true

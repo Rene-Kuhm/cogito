@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo run --example basic
 
-use cogito_harness_core::{Cogito, CompressionOptions};
+use cogito_harness_core::Cogito;
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -23,84 +23,17 @@ async fn main() -> anyhow::Result<()> {
     println!("  Data flows: {}", fingerprint.data_flows.len());
     println!("  Language: {}", fingerprint.language);
 
-    // Compress context
-    println!("\nCompressing context...");
-    let large_code = r#"
-        // This is a comment that adds nothing to understanding
-        fn main() {
-            let x = 5;
-            let y = 10;
-            let sum = x + y;
-            println!("{}", sum);
-        }
-        
-        fn helper_function() {
-            // Another meaningless comment
-            let a = 1;
-            let b = 2;
-        }
-    "#;
+    // Build and render the project map
+    println!("\nBuilding project map...");
+    let map = cogito_harness_core::map::build(&project.path, &project.name, &fingerprint);
+    let map_text = cogito_harness_core::map::render(&map);
+    println!("\nProject Map:\n{}", map_text);
 
-    let options = CompressionOptions {
-        max_tokens: 100,
-        preserve_imports: true,
-        preserve_types: true,
-        hot_zones_priority: true,
-    };
-
-    let result = cogito.compress_context(large_code, options).await?;
-
-    println!("  Original tokens: {}", result.original_tokens);
-    println!("  Compressed tokens: {}", result.compressed_tokens);
-    println!("  Savings: {:.1}%", result.savings_percent);
-    println!("\nCompressed content:\n{}", result.content);
-
-    // Add a semantic tag
-    println!("\nAdding semantic tag...");
-    use chrono::Utc;
-    use cogito_harness_core::types::SemanticTag;
-    use uuid::Uuid;
-
-    let tag = SemanticTag {
-        id: Uuid::new_v4(),
-        project_id: project.id,
-        tag: "example".to_string(),
-        domain: "demo".to_string(),
-        paths: vec![PathBuf::from("examples/")],
-        confidence: 0.9,
-        created_at: Utc::now(),
-    };
-
-    let added = cogito.add_tag(tag)?;
-    println!("  Added tag: {}", added.tag);
-
-    // Search tags
-    println!("\nSearching tags for 'example'...");
-    let tags = cogito.search_tags(project.id, "example")?;
-    for tag in tags {
-        println!("  - {} ({})", tag.tag, tag.domain);
-    }
-
-    // Add a decision
-    println!("\nAdding architectural decision...");
-    use cogito_harness_core::decision;
-
-    let decision = decision::builder(project.id)
-        .title("Example decision")
-        .why("To demonstrate the API")
-        .alternative("Not doing it")
-        .tag("example")
-        .build();
-
-    let added = cogito.add_decision(decision)?;
-    println!("  Added: {}", added.title);
-
-    // Search decisions
-    println!("\nSearching decisions for 'example'...");
-    let decisions = cogito.search_decisions(project.id, "example")?;
-    for decision in decisions {
-        println!("  - {}: {}", decision.title, decision.why);
-    }
+    // Search for symbols
+    println!("\nSearching for 'map'...");
+    let results = cogito_harness_core::map::search_paths(&project.path, &fingerprint, "map");
+    let search_text = cogito_harness_core::map::render_search(&results, "map");
+    println!("{}", search_text);
 
     println!("\n✓ All examples completed successfully!");
 

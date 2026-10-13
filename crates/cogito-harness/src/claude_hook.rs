@@ -127,7 +127,7 @@ async fn grep_nudge(root: &Path, input: &Value) -> anyhow::Result<Option<(String
     if found.files.is_empty() && found.symbols.is_empty() && found.modules.is_empty() {
         return Ok(None);
     }
-    let text = map::render_search(&found, &[], pattern);
+    let text = map::render_search(&found, pattern);
     let key = format!(
         "grep:{pattern}:{}:{}",
         input["path"].as_str().unwrap_or_default(),

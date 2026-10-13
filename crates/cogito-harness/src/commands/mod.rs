@@ -3,13 +3,10 @@
 //! Connects to the cogito-harness-core engine and provides user-facing operations.
 
 use anyhow::{Context, Result};
-use cogito_harness_core::{Cogito, CompressionOptions, Project};
-use std::path::{Path, PathBuf};
-use uuid::Uuid;
+use cogito_harness_core::{Cogito, Project};
+use std::path::Path;
 
-use crate::DecisionCommands;
 use crate::ProjectCommands;
-use crate::TagCommands;
 
 // ============================================================
 // Project Commands
@@ -146,327 +143,6 @@ pub async fn fingerprint(verbose: bool) -> Result<()> {
 }
 
 // ============================================================
-// Context Commands
-// ============================================================
-
-/// Compress context
-pub async fn compress(
-    file: &str,
-    max_tokens: usize,
-    preserve_imports: bool,
-    preserve_types: bool,
-    json: bool,
-) -> Result<()> {
-    let content = if file == "-" {
-        let mut buffer = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
-            .context("Failed to read from stdin")?;
-        buffer
-    } else {
-        std::fs::read_to_string(file).with_context(|| format!("Failed to read file: {file}"))?
-    };
-
-    let options = CompressionOptions {
-        max_tokens,
-        preserve_imports,
-        preserve_types,
-        hot_zones_priority: true,
-    };
-
-    let cogito = Cogito::new();
-    let result = cogito
-        .compress_context(&content, options)
-        .await
-        .context("Failed to compress context")?;
-
-    if json {
-        let json_output = serde_json::json!({
-            "original_tokens": result.original_tokens,
-            "compressed_tokens": result.compressed_tokens,
-            "savings_percent": result.savings_percent,
-            "content": result.content,
-            "sources": result.sources,
-        });
-        println!("{}", serde_json::to_string_pretty(&json_output)?);
-    } else {
-        println!("Original tokens:  {}", result.original_tokens);
-        println!("Compressed tokens: {}", result.compressed_tokens);
-        println!("Savings:           {:.1}%", result.savings_percent);
-        println!();
-        println!("--- Compressed Content ---");
-        println!("{}", result.content);
-    }
-
-    Ok(())
-}
-
-/// Query knowledge base
-pub async fn query(query_str: &str, json: bool) -> Result<()> {
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    let tags = cogito
-        .search_tags(project.id, query_str)
-        .context("Failed to search tags")?;
-    let decisions = cogito
-        .search_decisions(project.id, query_str)
-        .context("Failed to search decisions")?;
-
-    if json {
-        let output = serde_json::json!({
-            "query": query_str,
-            "tags": tags,
-            "decisions": decisions,
-        });
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        println!("Search: {}", query_str);
-        println!();
-        println!("📌 Tags ({}):", tags.len());
-        for tag in &tags {
-            println!("   • {} ({})", tag.tag, tag.domain);
-        }
-        println!();
-        println!("📋 Decisions ({}):", decisions.len());
-        for decision in &decisions {
-            println!("   • {} - {}", decision.title, decision.why);
-        }
-    }
-
-    Ok(())
-}
-
-// ============================================================
-// Decision Commands
-// ============================================================
-
-pub async fn decision(subcommand: Option<DecisionCommands>) -> Result<()> {
-    match subcommand {
-        Some(DecisionCommands::Add {
-            title,
-            why,
-            alternative,
-            paths,
-            tags,
-        }) => add_decision(title, why, alternative, paths, tags).await,
-        Some(DecisionCommands::List) => list_decisions().await,
-        Some(DecisionCommands::Search { query }) => search_decisions(&query).await,
-        Some(DecisionCommands::Show { id }) => show_decision(&id).await,
-        None => {
-            println!("Usage: cogito decision <add|list|search|show>");
-            Ok(())
-        }
-    }
-}
-
-async fn add_decision(
-    title: Option<String>,
-    why: Option<String>,
-    alternatives: Vec<String>,
-    paths: Vec<String>,
-    tags: Vec<String>,
-) -> Result<()> {
-    let (title_str, why_str) = match (title, why) {
-        (Some(t), Some(w)) => (t, w),
-        _ => {
-            println!("Error: --title and --why are required");
-            println!("Usage: cogito decision add --title '...' --why '...'");
-            return Ok(());
-        }
-    };
-
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    // Build the decision with all options
-    let mut builder = cogito_harness_core::decision::builder(project.id)
-        .title(&title_str)
-        .why(&why_str)
-        .author(&whoami::username());
-    for alt in &alternatives {
-        builder = builder.alternative(alt);
-    }
-    for tag in &tags {
-        builder = builder.tag(tag);
-    }
-    for path_str in &paths {
-        builder = builder.path(PathBuf::from(path_str));
-    }
-    let decision = builder.build();
-
-    let added = cogito
-        .add_decision(decision)
-        .context("Failed to add decision")?;
-
-    println!("✓ Decision added");
-    println!("  ID:    {}", added.id);
-    println!("  Title: {}", added.title);
-    println!("  Why:   {}", added.why);
-    if !added.alternatives.is_empty() {
-        println!("  Alternatives:");
-        for alt in &added.alternatives {
-            println!("    - {}", alt);
-        }
-    }
-    if !added.tags.is_empty() {
-        println!("  Tags:  {}", added.tags.join(", "));
-    }
-
-    Ok(())
-}
-
-async fn list_decisions() -> Result<()> {
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    // For now, return all by searching empty
-    let decisions = cogito
-        .search_decisions(project.id, "")
-        .context("Failed to list decisions")?;
-
-    if decisions.is_empty() {
-        println!("No decisions found.");
-        println!("Add one with: cogito decision add --title '...' --why '...'");
-        return Ok(());
-    }
-
-    println!("Decisions ({}):", decisions.len());
-    for d in &decisions {
-        println!("  • {} - {}", d.title, d.why);
-    }
-    Ok(())
-}
-
-async fn search_decisions(query_str: &str) -> Result<()> {
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    let decisions = cogito
-        .search_decisions(project.id, query_str)
-        .context("Failed to search decisions")?;
-
-    if decisions.is_empty() {
-        println!("No decisions found matching: {}", query_str);
-        return Ok(());
-    }
-
-    println!("Decisions matching '{}' ({}):", query_str, decisions.len());
-    for d in &decisions {
-        println!("  • {} - {}", d.title, d.why);
-    }
-    Ok(())
-}
-
-async fn show_decision(id: &str) -> Result<()> {
-    println!("Showing decision: {}", id);
-    println!("(not yet implemented - coming soon)");
-    Ok(())
-}
-
-// ============================================================
-// Tag Commands
-// ============================================================
-
-pub async fn tag(subcommand: Option<TagCommands>) -> Result<()> {
-    match subcommand {
-        Some(TagCommands::Add { tag, paths }) => add_tag(&tag, paths).await,
-        Some(TagCommands::List) => list_tags().await,
-        Some(TagCommands::Search { query }) => search_tags(&query).await,
-        None => {
-            println!("Usage: cogito tag <add|list|search>");
-            Ok(())
-        }
-    }
-}
-
-async fn add_tag(tag: &str, paths: Vec<String>) -> Result<()> {
-    if paths.is_empty() {
-        println!("Error: at least one path is required");
-        println!("Usage: cogito tag add <tag> <paths...>");
-        return Ok(());
-    }
-
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    let semantic_tag = cogito_harness_core::types::SemanticTag {
-        id: Uuid::new_v4(),
-        project_id: project.id,
-        tag: tag.to_string(),
-        domain: "manual".to_string(),
-        paths: paths.iter().map(PathBuf::from).collect(),
-        confidence: 1.0,
-        created_at: chrono::Utc::now(),
-    };
-
-    let added = cogito.add_tag(semantic_tag).context("Failed to add tag")?;
-
-    println!("✓ Tag added");
-    println!("  Tag:  {}", added.tag);
-    println!("  Paths: {}", added.paths.len());
-
-    Ok(())
-}
-
-async fn list_tags() -> Result<()> {
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    let tags = cogito
-        .search_tags(project.id, "")
-        .context("Failed to list tags")?;
-
-    if tags.is_empty() {
-        println!("No tags found.");
-        println!("Add one with: cogito tag add <tag> <paths...>");
-        return Ok(());
-    }
-
-    println!("Tags ({}):", tags.len());
-    for tag in &tags {
-        println!(
-            "  • {} ({}) - {} paths",
-            tag.tag,
-            tag.domain,
-            tag.paths.len()
-        );
-    }
-    Ok(())
-}
-
-async fn search_tags(query_str: &str) -> Result<()> {
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    let tags = cogito
-        .search_tags(project.id, query_str)
-        .context("Failed to search tags")?;
-
-    if tags.is_empty() {
-        println!("No tags found matching: {}", query_str);
-        return Ok(());
-    }
-
-    println!("Tags matching '{}' ({}):", query_str, tags.len());
-    for tag in &tags {
-        println!(
-            "  • {} ({}) - {} paths",
-            tag.tag,
-            tag.domain,
-            tag.paths.len()
-        );
-    }
-    Ok(())
-}
-
-// ============================================================
 // Project Subcommands
 // ============================================================
 
@@ -493,33 +169,9 @@ async fn delete_project(_id: &str) -> Result<()> {
 }
 
 // ============================================================
-// Server Commands
+// Stats / Doctor
 // ============================================================
 
-/// Start server mode
-pub async fn serve(port: u16, mcp: bool) -> Result<()> {
-    if mcp {
-        println!("Starting MCP server on port {}...", port);
-        // TODO: Start MCP server
-    } else {
-        println!("Starting REST API server on port {}...", port);
-        println!("Run 'cogito-api' to start the API server");
-    }
-    println!();
-    println!("Server started. Press Ctrl+C to stop.");
-
-    // Keep running
-    tokio::signal::ctrl_c()
-        .await
-        .context("Failed to wait for Ctrl+C")?;
-    Ok(())
-}
-
-// ============================================================
-// Stats / Doctor / Export
-// ============================================================
-
-/// Show statistics
 /// Print the project map, scanning only if the stored one is stale.
 pub async fn map(refresh: bool, card: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
@@ -549,23 +201,14 @@ pub async fn outline(file: &str) -> Result<()> {
     Ok(())
 }
 
-/// Print symbols, doc sections, files, modules and tags matching `query`.
+/// Print symbols, doc sections, files and modules matching `query`.
 pub async fn search(query: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
     let (fingerprint, _) = cogito.fingerprint(&project, false).await?;
     let found = cogito_harness_core::map::search_paths(&project.path, &fingerprint, query);
-    let tags: Vec<(String, Vec<std::path::PathBuf>)> = cogito
-        .search_tags(project.id, query)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| (t.tag, t.paths))
-        .collect();
-    print!(
-        "{}",
-        cogito_harness_core::map::render_search(&found, &tags, query)
-    );
+    print!("{}", cogito_harness_core::map::render_search(&found, query));
     Ok(())
 }
 
@@ -588,30 +231,20 @@ pub async fn stats(json: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
-
-    let tags = cogito.search_tags(project.id, "").unwrap_or_default();
-    let decisions = cogito.search_decisions(project.id, "").unwrap_or_default();
     let stored = cogito.stats(project.id)?;
 
     if json {
         let stats = serde_json::json!({
             "project": project.name,
-            "tags": tags.len(),
-            "decisions": decisions.len(),
-            "hot_zones": stored.hot_zones_count,
+            "has_fingerprint": stored.has_fingerprint,
             "fingerprint_generated_at": stored.fingerprint_generated_at,
         });
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {
         println!("=== Cogito Statistics ===");
-        println!("Project:     {}", project.name);
-        println!("Tags:        {}", tags.len());
-        println!("Decisions:   {}", decisions.len());
+        println!("Project: {}", project.name);
         match &stored.fingerprint_generated_at {
-            Some(at) => println!(
-                "Fingerprint: {} hot zones, scanned {at}",
-                stored.hot_zones_count
-            ),
+            Some(at) => println!("Fingerprint: present, generated {at}"),
             None => println!("Fingerprint: not scanned yet (run `cogito scan`)"),
         }
     }
@@ -1091,64 +724,11 @@ fn pick_interactively(home: &Path, binary: &Path) -> Result<Vec<crate::agents::A
     Ok(chosen)
 }
 
-/// Export project data
-pub async fn export(output: Option<&str>, format: &str) -> Result<()> {
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    let fingerprint = cogito.generate_fingerprint(&project).await?;
-    let tags = cogito.search_tags(project.id, "")?;
-    let decisions = cogito.search_decisions(project.id, "")?;
-
-    let export_data = serde_json::json!({
-        "version": "0.1.0",
-        "exported_at": chrono::Utc::now().to_rfc3339(),
-        "project": {
-            "id": project.id,
-            "name": project.name,
-            "path": project.path,
-            "language": project.language,
-        },
-        "fingerprint": {
-            "entry_points": fingerprint.entry_points.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-            "data_flows_count": fingerprint.data_flows.len(),
-            "hot_zones_count": fingerprint.hot_zones.len(),
-            "cold_zones_count": fingerprint.cold_zones.len(),
-            "frozen_zones_count": fingerprint.frozen_zones.len(),
-        },
-        "tags": tags,
-        "decisions": decisions,
-    });
-
-    let json_output = if format == "yaml" {
-        // Simple JSON-to-YAML-ish output (not real YAML, but readable)
-        format!(
-            "# Cogito Export\n# Format: {}\n{}",
-            format,
-            serde_json::to_string_pretty(&export_data)?
-        )
-    } else {
-        serde_json::to_string_pretty(&export_data)?
-    };
-
-    match output {
-        Some(path) => {
-            std::fs::write(path, &json_output)
-                .with_context(|| format!("Failed to write to {path}"))?;
-            println!("✓ Exported to {}", path);
-        }
-        None => println!("{}", json_output),
-    }
-    Ok(())
-}
-
 // ============================================================
 // Helpers
 // ============================================================
 
 /// Open a Cogito instance backed by SQLite at `<cwd>/.cogito/state.db`.
-/// Auto-migrates legacy JSON files on first run.
 fn open_cogito(cwd: &Path) -> Result<Cogito> {
     let cogito_dir = cwd.join(".cogito");
     std::fs::create_dir_all(&cogito_dir)
@@ -1180,6 +760,3 @@ fn load_or_create_project(cogito: &Cogito, cwd: &Path) -> Result<Project> {
 
     Ok(project)
 }
-
-// ProjectId is just a type alias for Uuid
-type _ProjectId = Uuid;

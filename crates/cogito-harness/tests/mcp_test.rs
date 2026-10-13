@@ -85,12 +85,11 @@ fn test_mcp_lists_the_map_tools_only() {
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
     ];
 
-    // The surface is the project map. Decision and note tools are absent on
+    // The surface is the project map. Decision, tag and note tools are absent on
     // purpose: they belong to the agent's memory, not to Cogito.
     assert_eq!(
         tool_names(&send_jsonrpc(messages)),
         [
-            "add_tag",
             "file_outline",
             "project_map",
             "related_files",

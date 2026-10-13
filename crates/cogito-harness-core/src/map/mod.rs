@@ -342,27 +342,12 @@ fn key_docs(docs: &[PathBuf]) -> Vec<String> {
     root
 }
 
-/// Render `search_paths` results (and matching tags) as agent text.
-pub fn render_search(
-    found: &SearchResults,
-    tags: &[(String, Vec<PathBuf>)],
-    query: &str,
-) -> String {
-    if found.files.is_empty()
-        && found.modules.is_empty()
-        && found.symbols.is_empty()
-        && tags.is_empty()
-    {
+/// Render `search_paths` results as agent text.
+pub fn render_search(found: &SearchResults, query: &str) -> String {
+    if found.files.is_empty() && found.modules.is_empty() && found.symbols.is_empty() {
         return format!("Nothing matches \"{query}\".\n");
     }
     let mut out = String::new();
-    if !tags.is_empty() {
-        out.push_str("Tags:\n");
-        for (tag, paths) in tags {
-            let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-            out.push_str(&format!("  {tag}: {}\n", paths.join(", ")));
-        }
-    }
     let section = |title: &str, items: &[String], out: &mut String| {
         if !items.is_empty() {
             out.push_str(&format!("{title}:\n  {}\n", items.join("\n  ")));
@@ -870,7 +855,7 @@ mod doc_tests {
             symbols: vec!["h2 Write the README docs/plan.md:4".into()],
             files_first: true,
         };
-        let text = render_search(&found, &[], "README");
+        let text = render_search(&found, "README");
         assert!(text.starts_with("Files:\n  README.md"), "{text}");
     }
 }

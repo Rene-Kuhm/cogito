@@ -28,9 +28,6 @@ parking_lot.workspace = true
 whoami.workspace = true
 git2.workspace = true
 rusqlite.workspace = true
-syn.workspace = true
-quote.workspace = true
-proc-macro2.workspace = true
 tree-sitter.workspace = true
 tree-sitter-typescript.workspace = true
 tree-sitter-python.workspace = true
@@ -54,36 +51,4 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 
 [[bench]]
 name = "fingerprint"
-harness = false
-
-[[bench]]
-name = "compress"
-harness = false
-
-[[bench]]
-name = "search"
-harness = false
-
-[[bench]]
-name = "storage_compare"
-harness = false
-
-[[bench]]
-name = "ast_vs_structural"
-harness = false
-
-[[bench]]
-name = "ast_ts_vs_structural"
-harness = false
-
-[[bench]]
-name = "ast_all_langs"
-harness = false
-
-[[bench]]
-name = "ast_csharp_java"
-harness = false
-
-[[bench]]
-name = "ast_ruby_php_kotlin_swift"
 harness = false

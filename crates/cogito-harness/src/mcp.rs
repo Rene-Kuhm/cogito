@@ -4,16 +4,14 @@
 //! opencode, Gemini CLI, …) can use Cogito as a tool provider.
 //!
 //! The tools give an agent the project's layout so it does not have to read
-//! the code to find its way: `project_map`, `related_files`, `search_code`,
-//! and `add_tag` to label code locations. Memory (decisions, session notes)
-//! is deliberately out of scope; that belongs to the agent's memory tool.
+//! the code to find its way: `project_map`, `related_files`, and `search_code`.
 //!
 //! Each tool takes an explicit `path` argument. The server opens that
 //! project's `.cogito/state.db` per call, so one process can serve several
 //! projects without mixing their data.
 
 use anyhow::Result;
-use cogito_harness_core::{Cogito, Fingerprint, Project};
+use cogito_harness_core::{Fingerprint, Project};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -22,7 +20,6 @@ use rmcp::{
     transport::stdio,
 };
 use std::path::PathBuf;
-use uuid::Uuid;
 
 /// Server name advertised to MCP clients.
 pub const SERVER_NAME: &str = "cogito";
@@ -34,8 +31,7 @@ symbol, file or module by name (it gives file:line); file_outline to see a file'
 with line ranges; then read only the lines you need. related_files shows what a file imports \
 and what imports it. Avoid listing directories, grepping or reading whole files to find your \
 way. The index refreshes when HEAD changes; pass refresh=true to project_map after large \
-uncommitted changes. Cogito is not a memory: keep decisions and notes in your memory tool. \
-Every tool takes `path`, the absolute project root.";
+uncommitted changes. Every tool takes `path`, the absolute project root.";
 
 // ============================================================
 // Requests
@@ -62,18 +58,8 @@ pub struct RelatedFilesRequest {
 pub struct SearchCodeRequest {
     /// Absolute path to the project root
     pub path: String,
-    /// Words to look for in file paths, module names and tags, e.g. `auth session`
+    /// Words to look for in file paths and module names, e.g. `auth session`
     pub query: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct AddTagRequest {
-    /// Absolute path to the project root
-    pub path: String,
-    /// Tag name, e.g. "auth", "billing"
-    pub tag: String,
-    /// Project paths the tag points at
-    pub paths: Vec<String>,
 }
 
 // ============================================================
@@ -96,9 +82,9 @@ impl Default for CogitoServer {
 ///
 /// This is the fix for the multi-project bug: the connection is derived from
 /// the caller-supplied path, never from the process working directory.
-fn open_project(path: &str) -> Result<(Cogito, Project), String> {
+fn open_project(path: &str) -> Result<(cogito_harness_core::Cogito, Project), String> {
     let root = PathBuf::from(path);
-    let cogito = Cogito::for_project(&root)
+    let cogito = cogito_harness_core::Cogito::for_project(&root)
         .map_err(|e| format!("Failed to open project at {}: {e:#}", root.display()))?;
     let project = cogito
         .load_project(root.clone())
@@ -110,7 +96,7 @@ fn open_project(path: &str) -> Result<(Cogito, Project), String> {
 async fn mapped_project(
     path: &str,
     refresh: bool,
-) -> Result<(Cogito, Project, Fingerprint), String> {
+) -> Result<(cogito_harness_core::Cogito, Project, Fingerprint), String> {
     let (cogito, project) = open_project(path)?;
     let (fingerprint, _) = cogito
         .fingerprint(&project, refresh)
@@ -168,51 +154,15 @@ impl CogitoServer {
     }
 
     #[tool(
-        description = "Find code or docs by words: symbols (functions, types, classes) and doc sections with file:line, file paths (most changed first), modules and tags."
+        description = "Find code or docs by words: symbols (functions, types, classes) and doc sections with file:line, and file paths (most changed first)."
     )]
     async fn search_code(
         &self,
         Parameters(req): Parameters<SearchCodeRequest>,
     ) -> Result<String, String> {
-        let (cogito, project, fingerprint) = mapped_project(&req.path, false).await?;
+        let (_, project, fingerprint) = mapped_project(&req.path, false).await?;
         let found = cogito_harness_core::map::search_paths(&project.path, &fingerprint, &req.query);
-        let tags: Vec<(String, Vec<PathBuf>)> = cogito
-            .search_tags(project.id, &req.query)
-            .map_err(|e| format!("Failed to search tags: {e}"))?
-            .into_iter()
-            .map(|t| (t.tag, t.paths))
-            .collect();
-        Ok(cogito_harness_core::map::render_search(
-            &found, &tags, &req.query,
-        ))
-    }
-
-    #[tool(
-        description = "Label project paths with a tag (e.g. 'auth' → apps/web/lib/auth) so search_code finds them by that word later. For code locations only; not for notes or decisions."
-    )]
-    async fn add_tag(&self, Parameters(req): Parameters<AddTagRequest>) -> Result<String, String> {
-        let (cogito, project) = open_project(&req.path)?;
-
-        let tag = cogito_harness_core::types::SemanticTag {
-            id: Uuid::new_v4(),
-            project_id: project.id,
-            tag: req.tag.clone(),
-            domain: "manual".to_string(),
-            paths: req.paths.iter().map(PathBuf::from).collect(),
-            confidence: 1.0,
-            created_at: chrono::Utc::now(),
-        };
-
-        let added = cogito
-            .add_tag(tag)
-            .map_err(|e| format!("Failed to add tag: {e}"))?;
-
-        Ok(format!(
-            "Tagged {} path(s) as '{}' in {}",
-            added.paths.len(),
-            added.tag,
-            project.name
-        ))
+        Ok(cogito_harness_core::map::render_search(&found, &req.query))
     }
 }
 
