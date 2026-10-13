@@ -26,12 +26,15 @@ pub const SERVER_NAME: &str = "cogito";
 
 /// What the client tells the model about this server.
 const INSTRUCTIONS: &str = "Cogito indexes the project's code so you can answer without reading \
-it. Cheapest path first: project_map to orient (once per session); search_code to find a \
-symbol, file or module by name (it gives file:line); file_outline to see a file's declarations \
-with line ranges; then read only the lines you need. related_files shows what a file imports \
-and what imports it. Avoid listing directories, grepping or reading whole files to find your \
-way. The index refreshes when HEAD changes; pass refresh=true to project_map after large \
-uncommitted changes. Every tool takes `path`, the absolute project root.";
+it. If you know what you are about to do, start with context_pack: give it the task in your own \
+words and it returns the fragments that matter, ranked and inside a token budget, with the \
+reason each was chosen. Otherwise work cheapest first: project_map to orient (once per \
+session); search_code to find a symbol, file or module by name (it gives file:line); \
+file_outline to see a file's declarations with line ranges; then read only the lines you need. \
+related_files shows what a file imports and what imports it. Avoid listing directories, \
+grepping or reading whole files to find your way. The index refreshes when HEAD changes; pass \
+refresh=true to project_map after large uncommitted changes. Every tool takes `path`, the \
+absolute project root.";
 
 // ============================================================
 // Requests
@@ -60,6 +63,23 @@ pub struct SearchCodeRequest {
     pub path: String,
     /// Words to look for in file paths and module names, e.g. `auth session`
     pub query: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ContextPackRequest {
+    /// Absolute path to the project root
+    pub path: String,
+    /// What you are about to do, in your own words: `add MFA by SMS`, `how does
+    /// the session guard validate a token`, `change the retry policy`. English
+    /// and Spanish both work.
+    pub task: String,
+    /// Token budget for the whole answer. Defaults to 2000, capped at 8000.
+    #[serde(default = "default_pack_budget")]
+    pub budget: usize,
+}
+
+fn default_pack_budget() -> usize {
+    cogito_harness_core::pack::DEFAULT_BUDGET
 }
 
 // ============================================================
@@ -294,6 +314,43 @@ impl CogitoServer {
             &req.query,
             files_first,
         ))
+    }
+
+    #[tool(
+        description = "The context for a task in one call: the code and documentation fragments it needs, ranked, with the reason each was chosen and inside a token budget. Use this first when you know what you are about to do; it replaces search_code plus several file_outline calls and range reads."
+    )]
+    async fn context_pack(
+        &self,
+        Parameters(req): Parameters<ContextPackRequest>,
+    ) -> Result<String, String> {
+        let (cogito, project, stored) = indexed_project(&req.path)?;
+        // Sync before taking the connection: the guard cannot be held across an
+        // await.
+        let _ = cogito
+            .sync_index(&project)
+            .await
+            .map_err(|e| format!("Index sync failed: {e}"))?;
+
+        let conn = cogito
+            .connection()
+            .ok_or_else(|| format!("No index for {}: run `cogito scan`", req.path))?;
+
+        let counter = crate::tokenizer::shared();
+        let count = |text: &str| counter.count(text).0;
+        let pack = cogito_harness_core::pack::build(
+            cogito_harness_core::pack::Request {
+                conn: &conn,
+                project_id: project.id,
+                root: &project.path,
+                task: &req.task,
+                budget: req.budget,
+                fingerprint: stored.as_ref(),
+            },
+            &count,
+        )
+        .map_err(|e| format!("Failed to build the context pack: {e}"))?;
+
+        Ok(cogito_harness_core::pack::render(&pack))
     }
 }
 

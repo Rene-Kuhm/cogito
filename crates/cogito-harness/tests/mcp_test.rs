@@ -85,11 +85,13 @@ fn test_mcp_lists_the_map_tools_only() {
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
     ];
 
-    // The surface is the project map. Decision, tag and note tools are absent on
-    // purpose: they belong to the agent's memory, not to Cogito.
+    // The surface is the project map plus the context pack. Decision, tag and
+    // note tools are absent on purpose: they belong to the agent's memory, not
+    // to Cogito.
     assert_eq!(
         tool_names(&send_jsonrpc(messages)),
         [
+            "context_pack",
             "file_outline",
             "project_map",
             "related_files",
@@ -332,4 +334,92 @@ fn test_mcp_stdout_is_only_json_rpc() {
             "every stdout line must be a JSON-RPC message, got: {line}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// context_pack
+// ---------------------------------------------------------------------------
+
+/// The `used` figure the pack header reports.
+fn pack_used_tokens(text: &str) -> usize {
+    let after = text
+        .split("used ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no used figure in: {text}"));
+    after
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("the used figure is not a number in: {text}"))
+}
+
+fn context_pack_workspace() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let write = |rel: &str, text: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(
+        "Cargo.toml",
+        "[package]\nname = \"packws\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        "src/session_store.rs",
+        "pub fn session_store() -> u32 {\n    load()\n}\n\nfn load() -> u32 {\n    1\n}\n",
+    );
+    write(
+        "src/unrelated.rs",
+        "pub fn unrelated() -> u32 {\n    2\n}\n",
+    );
+    dir
+}
+
+#[test]
+fn test_mcp_context_pack_returns_budgeted_fragments() {
+    let dir = context_pack_workspace();
+    let path = dir.path().display().to_string();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"context_pack","arguments":{{"path":"{}","task":"how does the session store load","budget":800}}}}}}"#,
+        path
+    );
+
+    let text = tool_text(&send_jsonrpc(vec![init, ready, &call]), 2);
+
+    assert!(
+        text.contains("src/session_store.rs"),
+        "the pack must reach the file the task is about:\n{text}"
+    );
+    let used = pack_used_tokens(&text);
+    assert!(used > 0, "a pack with fragments must cost tokens:\n{text}");
+    assert!(
+        used <= 800,
+        "the pack must respect the budget, used {used} of 800:\n{text}"
+    );
+}
+
+#[test]
+fn test_mcp_context_pack_says_when_nothing_matches() {
+    let dir = context_pack_workspace();
+    let path = dir.path().display().to_string();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"context_pack","arguments":{{"path":"{}","task":"kubernetes ingress annotations","budget":800}}}}}}"#,
+        path
+    );
+
+    let text = tool_text(&send_jsonrpc(vec![init, ready, &call]), 2);
+
+    assert!(
+        text.contains("No matches for this task"),
+        "an unmatched task must say so:\n{text}"
+    );
+    assert!(
+        !text.contains("src/session_store.rs") && !text.contains("src/unrelated.rs"),
+        "nothing generic may be returned instead:\n{text}"
+    );
 }

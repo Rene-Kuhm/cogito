@@ -9,7 +9,17 @@
 //! The vocabulary is `cl100k_base`, the closest available match to the
 //! tokenizers current coding agents use.
 
+use std::sync::OnceLock;
 use tiktoken_rs::{CoreBPE, cl100k_base};
+
+/// The counter shared by everything in the process.
+///
+/// Building the cl100k vocabulary is not free, and a tool call can arrive per
+/// request, so the encoder is built once and reused.
+pub fn shared() -> &'static TokenCounter {
+    static SHARED: OnceLock<TokenCounter> = OnceLock::new();
+    SHARED.get_or_init(TokenCounter::new)
+}
 
 /// Token counter using tiktoken-rs with the cl100k_base vocabulary.
 /// Falls back to a byte-count / 4 estimate if the tokenizer fails to initialise.
