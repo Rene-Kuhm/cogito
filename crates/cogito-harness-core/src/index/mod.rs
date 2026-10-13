@@ -895,6 +895,37 @@ pub fn files(conn: &Connection, project_id: Uuid) -> Result<Vec<PathBuf>> {
     Ok(result?)
 }
 
+/// How many indexed symbols and files a query matches, exactly.
+///
+/// Used to weight a task term by how much it narrows the project. Counting is
+/// separate from searching because a search result list is capped for the cost
+/// of the answer, and a capped count would make every common term look equally
+/// common, which is the opposite of what the weight is for.
+pub fn count_matches(conn: &Connection, project_id: Uuid, query: &str) -> Result<usize> {
+    let fts_query = build_fts_query(query);
+    if fts_query.trim().is_empty() {
+        return Ok(0);
+    }
+    let pid = project_id.to_string();
+    let mut total = 0usize;
+
+    let mut symbols = conn.prepare(
+        r#"SELECT count(*) FROM indexed_symbols s
+           JOIN indexed_symbols_fts f ON s.rowid = f.rowid
+           WHERE indexed_symbols_fts MATCH ?1 AND s.project_id = ?2"#,
+    )?;
+    total += symbols.query_row(params![fts_query, pid], |row| row.get::<_, i64>(0))? as usize;
+
+    let mut files = conn.prepare(
+        r#"SELECT count(*) FROM indexed_files i
+           JOIN indexed_files_fts f ON i.rowid = f.rowid
+           WHERE indexed_files_fts MATCH ?1 AND i.project_id = ?2"#,
+    )?;
+    total += files.query_row(params![fts_query, pid], |row| row.get::<_, i64>(0))? as usize;
+
+    Ok(total)
+}
+
 /// All declarations indexed from a file.
 pub fn outline(
     conn: &Connection,

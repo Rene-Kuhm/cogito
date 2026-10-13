@@ -13,6 +13,22 @@
 //! Everything here is deterministic: the same task against the same index
 //! produces byte-identical output. Nothing iterates a `HashMap` into the
 //! result, and every comparison ends in path and line.
+//!
+//! Ranking multiplies two signals together:
+//!
+//! - **Where** the term matched: a declaration's name, the file's path, or one
+//!   import hop away. This is the brief's `name > path > neighbour` order.
+//! - **How much that term narrows the project.** A word matching a thousand
+//!   symbols says little; one matching three says a lot. Measured as the number
+//!   of candidates the term produced, in integer parts per million.
+//!
+//! The tier multiplies the rarity rather than gating it. Treating the tier as an
+//! absolute wall measured wrong twice on the labelled set: a task phrased with
+//! common words filled its whole budget with weak name matches and never reached
+//! the one precise path, while a single rare word could not lift its own file
+//! above the crowd. With the multipliers below, a name hit on a common word loses
+//! to a path hit on a rare one, and two hits in the same tier still order by
+//! rarity, which is what the brief's precedence is for.
 
 use crate::index::{self, IndexedDeclaration};
 use crate::types::Fingerprint;
@@ -29,8 +45,9 @@ pub const MAX_BUDGET: usize = 8000;
 
 /// Task words turned into search terms, at most this many.
 const MAX_TERMS: usize = 12;
-/// Hits requested from the index per term, before our own ranking runs.
-const PER_TERM_LIMIT: usize = 25;
+/// Hits requested from the index per term, to bound how much work one task
+/// costs. It no longer caps the term weighting, which counts exactly.
+const PER_TERM_LIMIT: usize = 100;
 /// Declarations taken from a file that matched by path.
 const MAX_DECLS_PER_FILE: usize = 3;
 /// Declarations taken from a file pulled in as a neighbour.
@@ -57,13 +74,22 @@ pub enum Reason {
 }
 
 impl Reason {
-    /// Higher is stronger. The whole ranking is built on this order.
-    fn rank(self) -> u8 {
+    /// Multiplier applied to the rarity of the matched terms.
+    ///
+    /// Deliberately close together: ten, three and one keep the brief's order
+    /// for comparable evidence without letting a weak match in a higher tier
+    /// bury a strong one in a lower tier.
+    fn multiplier(self) -> u64 {
         match self {
-            Reason::Name => 3,
-            Reason::Path => 2,
+            Reason::Name => 10,
+            Reason::Path => 3,
             Reason::Neighbour => 1,
         }
+    }
+
+    /// Evidence strength: how the term matched times how rare it was.
+    fn score(self, weight: u64) -> u64 {
+        self.multiplier().saturating_mul(weight)
     }
 }
 
@@ -132,7 +158,19 @@ struct Candidate {
     detail: String,
     /// How many task terms this candidate matched.
     terms: usize,
+    /// Summed rarity of the matched terms, in integer parts per million.
+    ///
+    /// A term that matches a thousand symbols says much less about relevance
+    /// than one that matches three, and without this a task phrased with common
+    /// words fills its budget with whatever happens to sort first. Integers, not
+    /// floats, so the comparison stays exact and reproducible.
+    weight: u64,
     is_test: bool,
+}
+
+/// Rarity of one matched term, in parts per million: rarer is larger.
+fn term_weight(document_frequency: usize) -> u64 {
+    1_000_000 / (1 + document_frequency as u64)
 }
 
 /// What the index told us about one candidate, accumulated across terms.
@@ -140,6 +178,7 @@ struct Candidate {
 struct Accum {
     name: String,
     terms: BTreeSet<String>,
+    weight: u64,
     name_matched: bool,
     path_matched: bool,
     is_test: bool,
@@ -404,9 +443,17 @@ fn candidates(
     let mut found: Vec<Candidate> = Vec::new();
     let mut symbol_hits: BTreeMap<(PathBuf, usize), Accum> = BTreeMap::new();
     let mut file_hits: BTreeMap<PathBuf, Accum> = BTreeMap::new();
+    // One outline query per file, however many hits that file produced.
+    let mut outlines: BTreeMap<PathBuf, Vec<IndexedDeclaration>> = BTreeMap::new();
 
     for term in terms {
-        for hit in index::search(req.conn, req.project_id, term, PER_TERM_LIMIT)? {
+        let hits = index::search(req.conn, req.project_id, term, PER_TERM_LIMIT)?;
+        // How much this term narrows the project. A term matching many
+        // candidates is weak evidence; one matching a few is strong evidence.
+        // The count is exact and separate from `hits`: a capped count would make
+        // every common term look equally common.
+        let weight = term_weight(index::count_matches(req.conn, req.project_id, term)?);
+        for hit in hits {
             if hit.is_symbol {
                 let entry = symbol_hits
                     .entry((hit.path.clone(), hit.line))
@@ -416,6 +463,7 @@ fn candidates(
                         ..Accum::default()
                     });
                 entry.terms.insert(term.clone());
+                entry.weight = entry.weight.saturating_add(weight);
                 entry.name_matched |= name_matches(&hit.name, term);
                 entry.path_matched |= path_matches(&hit.path, term);
             } else {
@@ -425,6 +473,7 @@ fn candidates(
                     ..Accum::default()
                 });
                 entry.terms.insert(term.clone());
+                entry.weight = entry.weight.saturating_add(weight);
                 // A file hit is a match on the file: its path or its own name.
                 // The declarations inside it are how we show it, not what
                 // matched, so they all rank as a path match.
@@ -435,7 +484,7 @@ fn candidates(
 
     // Symbol hits: the fragment is the declaration that owns the line.
     for ((path, line), acc) in &symbol_hits {
-        let decls = index::outline(req.conn, req.project_id, path)?;
+        let decls = outline(&mut outlines, req, path)?;
         let chosen = decls
             .iter()
             .find(|d| d.name == acc.name)
@@ -454,13 +503,14 @@ fn candidates(
             reason: acc.reason(),
             detail: acc.detail(),
             terms: acc.terms.len(),
+            weight: acc.weight,
             is_test: acc.is_test,
         });
     }
 
     // Path hits: the fragment is that file's most relevant declarations.
     for (path, acc) in &file_hits {
-        let decls = index::outline(req.conn, req.project_id, path)?;
+        let decls = outline(&mut outlines, req, path)?;
         if decls.is_empty() {
             // Nothing to point at, so include a short file whole rather than
             // dumping a long one.
@@ -475,6 +525,7 @@ fn candidates(
                     reason: Reason::Path,
                     detail: "path match · whole short file".to_string(),
                     terms: acc.terms.len(),
+                    weight: acc.weight,
                     is_test: acc.is_test,
                 });
             }
@@ -501,6 +552,7 @@ fn candidates(
                     "path match".to_string()
                 },
                 terms: acc.terms.len(),
+                weight: acc.weight,
                 is_test: acc.is_test,
             });
         }
@@ -527,7 +579,7 @@ fn candidates(
         neighbours.sort();
         neighbours.dedup();
         for (path, detail) in neighbours.into_iter().take(MAX_NEIGHBOURS_PER_SEED) {
-            let decls = index::outline(req.conn, req.project_id, &path)?;
+            let decls = outline(&mut outlines, req, &path)?;
             for d in decls.iter().take(MAX_DECLS_PER_NEIGHBOUR) {
                 found.push(Candidate {
                     path: path.clone(),
@@ -538,6 +590,7 @@ fn candidates(
                     reason: Reason::Neighbour,
                     detail: detail.clone(),
                     terms: 0,
+                    weight: 0,
                     is_test: index::is_test_path(&path),
                 });
             }
@@ -549,8 +602,8 @@ fn candidates(
     // iteration order.
     found.sort_by(|a, b| {
         b.reason
-            .rank()
-            .cmp(&a.reason.rank())
+            .score(b.weight)
+            .cmp(&a.reason.score(a.weight))
             .then(b.terms.cmp(&a.terms))
             .then(a.is_test.cmp(&b.is_test))
             .then(changes_of(changes, b).cmp(&changes_of(changes, a)))
@@ -561,6 +614,24 @@ fn candidates(
     let mut seen: BTreeSet<(PathBuf, usize, usize)> = BTreeSet::new();
     found.retain(|c| seen.insert((c.path.clone(), c.start, c.end)));
     Ok(found)
+}
+
+/// The file's declarations, queried once per file per request.
+///
+/// Raising the per-term hit limit multiplies the hits a request sees, so the
+/// outline has to be fetched per file rather than per hit.
+fn outline<'a>(
+    cache: &'a mut BTreeMap<PathBuf, Vec<IndexedDeclaration>>,
+    req: &Request<'_>,
+    path: &Path,
+) -> Result<&'a Vec<IndexedDeclaration>> {
+    if !cache.contains_key(path) {
+        let decls = index::outline(req.conn, req.project_id, path)?;
+        cache.insert(path.to_path_buf(), decls);
+    }
+    cache
+        .get(path)
+        .ok_or_else(|| anyhow::anyhow!("outline missing for {} after insert", path.display()))
 }
 
 /// Change counts per file, from the fingerprint's zones.
