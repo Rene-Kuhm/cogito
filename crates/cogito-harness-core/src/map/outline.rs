@@ -2,27 +2,16 @@
 //!
 //! This is what lets an agent read a file in pieces: it sees one line per
 //! declaration, then reads only the range it needs instead of the whole file.
-//! Detection is line-based on purpose. It runs on every file at scan time and
-//! must never fail, so it trades precision on exotic syntax for speed and
-//! robustness: a declaration starts on a line at (or near) column 0 that
-//! begins with a declaring keyword.
+//!
+//! Primary extraction uses tree-sitter for accurate nested declarations and
+//! proper line spans. The legacy regex grammar is kept as a fallback when
+//! tree-sitter is unavailable, fails, or yields fewer declarations.
 
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// One declaration in a file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Declaration {
-    pub name: String,
-    /// `function`, `class`, `interface`, `type`, `const`, `struct`, `impl`…
-    pub kind: String,
-    /// 1-based, inclusive.
-    pub start: usize,
-    pub end: usize,
-    /// The declaring line, trimmed and shortened. Only kept for callables,
-    /// where parameters are the useful part; elsewhere the name says enough.
-    pub signature: Option<String>,
-}
+// Re-export Declaration from symbols for backward compatibility.
+pub use crate::map::symbols::Declaration;
 
 /// Longest signature kept, in characters.
 const SIGNATURE_MAX: usize = 110;
@@ -96,6 +85,24 @@ pub fn declarations(content: &str, extension: &str) -> Vec<Declaration> {
     if is_doc(extension) {
         return sections(content);
     }
+
+    // Try tree-sitter first, fall back to regex.
+    let ts_decls = crate::map::symbols::declarations(content, extension);
+    let regex_decls = regex_declarations(content, extension);
+
+    // Prefer tree-sitter results (more precise, sees nested members).
+    // Fall back to regex when it yields more declarations.
+    // Trade-off: tree-sitter is more accurate but a declaration the agent
+    // cannot see is more expensive than an extra outline line, so
+    // completeness wins on a tie-break by count.
+    if regex_decls.len() > ts_decls.len() {
+        return regex_decls;
+    }
+    ts_decls
+}
+
+/// Legacy regex-based declaration extraction. Kept as fallback.
+fn regex_declarations(content: &str, extension: &str) -> Vec<Declaration> {
     let Some(grammar) = grammar(&extension.to_lowercase()) else {
         return Vec::new();
     };
@@ -285,6 +292,7 @@ pub(crate) async fn build(root: &Path) -> Map {
             [
                 ("struct".into(), "Map".into(), 5, 7),
                 ("impl".into(), "Map".into(), 9, 11),
+                ("fn".into(), "new".into(), 10, 10),
                 ("impl".into(), "Display for Map".into(), 13, 13),
                 ("fn".into(), "build".into(), 15, 17),
             ]

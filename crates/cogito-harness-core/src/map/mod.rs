@@ -8,6 +8,7 @@
 
 pub(crate) mod layout;
 pub mod outline;
+pub mod symbols;
 
 use crate::types::{Fingerprint, ModuleInfo};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
