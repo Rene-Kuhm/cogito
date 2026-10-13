@@ -32,9 +32,6 @@ pub fn open(path: &Path) -> Result<Connection> {
 
     let conn = Connection::open(path)
         .with_context(|| format!("Failed to open SQLite at {}", path.display()))?;
-    conn.busy_timeout(std::time::Duration::from_secs(10))
-        .context("Failed to set the SQLite busy timeout")?;
-
     let mut attempt = 0;
     loop {
         match apply_pragmas(&conn).and_then(|()| migrate(&conn)) {
@@ -70,6 +67,7 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
         PRAGMA mmap_size = 268435456;
         PRAGMA page_size = 8192;
         PRAGMA foreign_keys = ON;
+        PRAGMA busy_timeout = 10000;
         PRAGMA optimize;
         ",
     )

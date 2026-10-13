@@ -10,8 +10,8 @@ use crate::map::layout::{Resolver, find_modules};
 use crate::map::outline::{declarations, is_doc};
 use crate::map::symbols::Declaration;
 use crate::types::Language;
-use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension, params};
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -220,7 +220,8 @@ pub fn sync(
 
     // Collect already-indexed paths
     let mut indexed: HashSet<PathBuf> = HashSet::new();
-    let mut indexed_stmt = conn.prepare("SELECT path FROM indexed_files WHERE project_id = ?1")?;
+    let mut indexed_stmt =
+        conn.prepare_cached("SELECT path FROM indexed_files WHERE project_id = ?1")?;
     let rows = indexed_stmt.query_map(params![project_id.to_string()], |row| {
         Ok(PathBuf::from(row.get::<_, String>(0)?))
     })?;
@@ -229,112 +230,156 @@ pub fn sync(
     }
     drop(indexed_stmt);
 
-    // Remove vanished files
-    for vanished in indexed.difference(&current) {
-        let path_str = vanished.to_string_lossy();
-        // FTS entries are deleted by the DELETE trigger on indexed_symbols
-        conn.execute(
-            "DELETE FROM indexed_symbols WHERE project_id = ?1 AND path = ?2",
-            params![project_id.to_string(), path_str],
-        )?;
-        conn.execute(
-            "DELETE FROM indexed_imports WHERE project_id = ?1 AND path = ?2",
-            params![project_id.to_string(), path_str],
-        )?;
-        // Delete file metadata (file FTS entry becomes orphaned but that's acceptable)
-        conn.execute(
-            "DELETE FROM indexed_files WHERE project_id = ?1 AND path = ?2",
-            params![project_id.to_string(), path_str],
-        )?;
-        report.removed += 1;
+    // Batch size for committing transactions. Smaller batches reduce commit time
+    // but more batches mean more transaction overhead. 5000 is a good balance for
+    // large projects.
+    const BATCH_SIZE: usize = 5000;
+
+    // Remove vanished files in one transaction
+    {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        let mut delete_symbols =
+            tx.prepare_cached("DELETE FROM indexed_symbols WHERE project_id = ?1 AND path = ?2")?;
+        let mut delete_imports =
+            tx.prepare_cached("DELETE FROM indexed_imports WHERE project_id = ?1 AND path = ?2")?;
+        let mut delete_files =
+            tx.prepare_cached("DELETE FROM indexed_files WHERE project_id = ?1 AND path = ?2")?;
+
+        let pid = project_id.to_string();
+        for vanished in indexed.difference(&current) {
+            let path_str = vanished.to_string_lossy();
+            delete_symbols.execute(params![&pid, path_str.as_ref()])?;
+            delete_imports.execute(params![&pid, path_str.as_ref()])?;
+            delete_files.execute(params![&pid, path_str.as_ref()])?;
+            report.removed += 1;
+        }
+        drop(delete_symbols);
+        drop(delete_imports);
+        drop(delete_files);
+        tx.commit()?;
     }
 
-    // Process current files
+    // Process current files in batches
+    let pid = project_id.to_string();
     let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    for rel_path in &current {
-        let abs = root_abs.join(rel_path);
-        let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    let files_refs: Vec<&PathBuf> = current.iter().collect();
 
-        // Get stored metadata, if any
-        let stored: Option<(i64, u64, u64)> = conn
-            .query_row(
-                "SELECT size, mtime_ns, content_hash FROM indexed_files WHERE project_id = ?1 AND path = ?2",
-                params![project_id.to_string(), rel_path.to_string_lossy()],
-                |row| {
+    // Build the resolver once, before the batch loop.
+    // Resolver::new is O(n) in file count; building it per-file made sync O(n²).
+    let resolver = Resolver::new(&root_abs, &files_vec, &modules);
+
+    for batch in files_refs.chunks(BATCH_SIZE) {
+        // Each batch is its own transaction for commit efficiency
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+
+        // Prepared statements for this batch
+        let mut select_metadata = tx.prepare_cached(
+            "SELECT size, mtime_ns, content_hash FROM indexed_files WHERE project_id = ?1 AND path = ?2",
+        )?;
+        let mut update_metadata = tx.prepare_cached(
+            "UPDATE indexed_files SET size = ?1, mtime_ns = ?2, indexed_at = ?3 WHERE project_id = ?4 AND path = ?5",
+        )?;
+        let mut reparse_stmts = ReparseStmts::new(&tx)?;
+
+        for rel_path in batch {
+            let abs = root_abs.join(rel_path);
+            let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or_default();
+            let rel_path_str = rel_path.to_string_lossy();
+
+            // Get stored metadata, if any
+            let stored: Option<(i64, u64, u64)> = select_metadata
+                .query_row(params![&pid, rel_path_str.as_ref()], |row| {
                     Ok((
                         row.get(0)?,
                         row.get::<_, i64>(1)? as u64,
                         row.get::<_, i64>(2)? as u64,
                     ))
-                },
-            )
-            .optional()?;
+                })
+                .optional()?;
 
-        let Ok(meta) = fs::metadata(&abs) else {
-            continue;
-        };
-        let size = meta.len() as i64;
-        let mtime_ns = file_mtime_ns(&abs)?;
-
-        match stored {
-            Some((s, m, _hash)) if s == size && m == mtime_ns => {
-                // Unchanged: skip content read entirely
-                report.unchanged += 1;
+            let Ok(meta) = fs::metadata(&abs) else {
                 continue;
-            }
-            Some((_, _, hash)) => {
-                // Metadata differs: read and hash to confirm
-                let Ok(content) = fs::read(&abs) else {
-                    continue;
-                };
-                let content_hash = fnv1a(&content);
+            };
+            let size = meta.len() as i64;
+            let mtime_ns = file_mtime_ns(&abs)?;
 
-                if content_hash == hash {
-                    // Same content, just update metadata
-                    let now = chrono::Utc::now().to_rfc3339();
-                    conn.execute(
-                        "UPDATE indexed_files SET size = ?1, mtime_ns = ?2, indexed_at = ?3 WHERE project_id = ?4 AND path = ?5",
-                        params![size, mtime_ns as i64, now, project_id.to_string(), rel_path.to_string_lossy()],
-                    )?;
+            match stored {
+                Some((s, m, _hash)) if s == size && m == mtime_ns => {
                     report.unchanged += 1;
                     continue;
                 }
+                Some((_, _, hash)) => {
+                    let Ok(content) = fs::read(&abs) else {
+                        continue;
+                    };
+                    let content_hash = fnv1a(&content);
 
-                // Content actually changed: reparse
-                reparse_file(
-                    conn, project_id, &root_abs, &abs, rel_path, ext, &content, &modules,
-                )?;
-                report.modified += 1;
-                report.reparsed += 1;
-            }
-            None => {
-                // New file
-                let Ok(content) = fs::read(&abs) else {
-                    continue;
-                };
-                reparse_file(
-                    conn, project_id, &root_abs, &abs, rel_path, ext, &content, &modules,
-                )?;
-                report.added += 1;
-                report.reparsed += 1;
+                    if content_hash == hash {
+                        let now = chrono::Utc::now().to_rfc3339();
+                        update_metadata.execute(params![
+                            size,
+                            mtime_ns as i64,
+                            &now,
+                            &pid,
+                            rel_path_str.as_ref()
+                        ])?;
+                        report.unchanged += 1;
+                        continue;
+                    }
+
+                    reparse_file(
+                        project_id,
+                        &abs,
+                        rel_path,
+                        ext,
+                        &content,
+                        &resolver,
+                        &mut reparse_stmts,
+                    )?;
+                    report.modified += 1;
+                    report.reparsed += 1;
+                }
+                None => {
+                    let Ok(content) = fs::read(&abs) else {
+                        continue;
+                    };
+                    reparse_file(
+                        project_id,
+                        &abs,
+                        rel_path,
+                        ext,
+                        &content,
+                        &resolver,
+                        &mut reparse_stmts,
+                    )?;
+                    report.added += 1;
+                    report.reparsed += 1;
+                }
             }
         }
+
+        drop(select_metadata);
+        drop(update_metadata);
+        drop(reparse_stmts);
+        tx.commit()?;
     }
 
     Ok(report)
 }
 
 /// Index (or re-index) a single file.
-#[allow(clippy::too_many_arguments)]
+///
+/// Called within a transaction that wraps the entire sync run, so all work for
+/// all files is committed atomically in one transaction. Uses pre-prepared
+/// statements for efficiency.
 fn reparse_file(
-    conn: &Connection,
     project_id: Uuid,
-    root: &Path,
     abs: &Path,
     rel_path: &Path,
     ext: &str,
     content: &[u8],
-    modules: &[crate::types::ModuleInfo],
+    resolver: &Resolver,
+    stmts: &mut ReparseStmts,
 ) -> Result<()> {
     let content_hash = fnv1a(content);
     let size = content.len() as i64;
@@ -343,87 +388,109 @@ fn reparse_file(
     let path_str = rel_path.to_string_lossy().to_string();
     let is_doc = is_doc(ext) as i32;
     let language = ext.to_lowercase();
+    let pid = project_id.to_string();
 
     // Upsert file row
-    conn.execute(
-        r#"INSERT INTO indexed_files (project_id, path, is_doc, language, size, mtime_ns, content_hash, indexed_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-           ON CONFLICT(project_id, path) DO UPDATE SET
-               is_doc = excluded.is_doc,
-               language = excluded.language,
-               size = excluded.size,
-               mtime_ns = excluded.mtime_ns,
-               content_hash = excluded.content_hash,
-               indexed_at = excluded.indexed_at"#,
-        params![
-            project_id.to_string(),
-            path_str,
-            is_doc,
-            language,
-            size,
-            mtime_ns as i64,
-            content_hash as i64,
-            now
-        ],
-    )?;
+    stmts.upsert_file.execute(params![
+        &pid,
+        &path_str,
+        is_doc,
+        &language,
+        size,
+        mtime_ns as i64,
+        content_hash as i64,
+        &now
+    ])?;
 
     // Delete old symbols (FTS rows are deleted by trigger)
-    conn.execute(
-        "DELETE FROM indexed_symbols WHERE project_id = ?1 AND path = ?2",
-        params![project_id.to_string(), path_str],
-    )?;
+    stmts.delete_symbols.execute(params![&pid, &path_str])?;
 
     // Parse declarations
     let content_str = String::from_utf8_lossy(content);
     let decls: Vec<Declaration> = declarations(&content_str, ext);
     for decl in decls {
-        conn.execute(
-            r#"INSERT INTO indexed_symbols (project_id, path, kind, name, start_line, end_line, signature)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
-            params![
-                project_id.to_string(),
-                path_str,
-                decl.kind,
-                decl.name,
-                decl.start as i64,
-                decl.end as i64,
-                decl.signature,
-            ],
-        )?;
+        stmts.insert_symbol.execute(params![
+            &pid,
+            &path_str,
+            &decl.kind,
+            &decl.name,
+            decl.start as i64,
+            decl.end as i64,
+            &decl.signature,
+        ])?;
     }
 
     // Extract and resolve imports
-    conn.execute(
-        "DELETE FROM indexed_imports WHERE project_id = ?1 AND path = ?2",
-        params![project_id.to_string(), path_str],
-    )?;
+    stmts.delete_imports.execute(params![&pid, &path_str])?;
 
     if let Ok(lang) = Language::detect(abs) {
-        // Build file list for the resolver - all files in the project
-        let files: Vec<PathBuf> = project_file_paths(root)
-            .filter(|p| !p.starts_with(".cogito"))
-            .collect();
-        let resolver = Resolver::new(root, &files, modules);
-
         let raw_imports = crate::fingerprint::extract_imports(abs, &content_str, &lang)?;
         for flow in raw_imports {
             let resolved = resolver
                 .resolve(rel_path, &flow.to.to_string_lossy(), lang)
                 .map(|p| p.to_string_lossy().to_string());
-            conn.execute(
-                r#"INSERT INTO indexed_imports (project_id, path, spec, resolved)
-                   VALUES (?1, ?2, ?3, ?4)"#,
-                params![
-                    project_id.to_string(),
-                    path_str,
-                    flow.to.to_string_lossy(),
-                    resolved,
-                ],
-            )?;
+            stmts.insert_import.execute(params![
+                &pid,
+                &path_str,
+                &flow.to.to_string_lossy(),
+                resolved,
+            ])?;
         }
     }
 
     Ok(())
+}
+
+/// Prepared statements for reparse_file, created once and reused for all files.
+struct ReparseStmts<'tx> {
+    upsert_file: rusqlite::CachedStatement<'tx>,
+    delete_symbols: rusqlite::CachedStatement<'tx>,
+    insert_symbol: rusqlite::CachedStatement<'tx>,
+    delete_imports: rusqlite::CachedStatement<'tx>,
+    insert_import: rusqlite::CachedStatement<'tx>,
+}
+
+impl<'tx> ReparseStmts<'tx> {
+    fn new(tx: &'tx Transaction) -> Result<Self> {
+        let upsert_file = tx
+            .prepare_cached(
+                r#"INSERT INTO indexed_files (project_id, path, is_doc, language, size, mtime_ns, content_hash, indexed_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                   ON CONFLICT(project_id, path) DO UPDATE SET
+                       is_doc = excluded.is_doc,
+                       language = excluded.language,
+                       size = excluded.size,
+                       mtime_ns = excluded.mtime_ns,
+                       content_hash = excluded.content_hash,
+                       indexed_at = excluded.indexed_at"#,
+            )
+            .context("Failed to prepare upsert_file statement")?;
+        let delete_symbols = tx
+            .prepare_cached("DELETE FROM indexed_symbols WHERE project_id = ?1 AND path = ?2")
+            .context("Failed to prepare delete_symbols statement")?;
+        let insert_symbol = tx
+            .prepare_cached(
+                r#"INSERT INTO indexed_symbols (project_id, path, kind, name, start_line, end_line, signature)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+            )
+            .context("Failed to prepare insert_symbol statement")?;
+        let delete_imports = tx
+            .prepare_cached("DELETE FROM indexed_imports WHERE project_id = ?1 AND path = ?2")
+            .context("Failed to prepare delete_imports statement")?;
+        let insert_import = tx
+            .prepare_cached(
+                r#"INSERT INTO indexed_imports (project_id, path, spec, resolved)
+                   VALUES (?1, ?2, ?3, ?4)"#,
+            )
+            .context("Failed to prepare insert_import statement")?;
+        Ok(Self {
+            upsert_file,
+            delete_symbols,
+            insert_symbol,
+            delete_imports,
+            insert_import,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -606,11 +673,11 @@ fn fts_search(
     Ok(hits)
 }
 
-/// Fall back to a LIKE scan when the FTS5 expression is invalid.
+/// LIKE scan for when the FTS5 expression is invalid or returns nothing.
 ///
 /// LIKE scans use bounded candidates and rank in Rust, matching the two-phase
 /// approach for consistency.
-fn like_fallback(
+fn like_scan(
     conn: &Connection,
     project_id: Uuid,
     query: &str,
@@ -767,7 +834,7 @@ pub fn search(
 
     // If FTS returned nothing and the query had meaningful content, fall back to LIKE
     if hits.is_empty() && !fts_query.trim().is_empty() && !query.trim().is_empty() {
-        hits = like_fallback(conn, project_id, query, candidates)?;
+        hits = like_scan(conn, project_id, query, candidates)?;
     }
 
     // Sort: symbols before files, within each class non-test before test,

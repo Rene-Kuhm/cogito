@@ -544,10 +544,10 @@ fn test_search_special_chars_no_panic() {
     drop(tmp);
 }
 
-/// Test: a valid identifier query still works after the LIKE fallback path
+/// Test: a valid identifier query still works after the LIKE scan path
 /// is exercised by an earlier invalid query.
 #[test]
-fn test_search_like_fallback() {
+fn test_search_like_scan() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     let src = root.join("src");
@@ -571,6 +571,108 @@ fn test_search_like_fallback() {
         hits.iter().any(|h| h.name == "my_function"),
         "Normal query should still work after LIKE fallback: {:?}",
         hits
+    );
+
+    drop(conn_guard);
+    drop(tmp);
+}
+
+/// Test: LIKE scan supplements FTS5 when FTS5 misses substring symbol matches.
+///
+/// FTS5 token matching does not find a substring token (query "session"
+/// does not match the symbol name "requireSession"). LIKE '%session%'
+/// does match it. This test verifies that `search` supplements FTS5 results
+/// with LIKE results for symbols, so queries find both token matches and
+/// substring matches.
+#[test]
+fn test_search_like_supplements_fts5() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let src = root.join("src");
+    fs::create_dir(&src).unwrap();
+
+    // Create a file with a symbol whose name contains "session" as a
+    // non-leading substring: requireSession.
+    // FTS5 token "session" will NOT match the FTS5 token "requiresession",
+    // but LIKE '%session%' WILL match.
+    fs::write(
+        src.join("session.rs"),
+        r#"pub fn requireSession() {}
+pub async function requireSession() {}
+"#,
+    )
+    .unwrap();
+
+    // Also a file whose name contains "session"
+    fs::write(src.join("session_util.rs"), "// session utility").unwrap();
+
+    let (cogito, project_id) = init_cogito(root);
+    let conn_guard = cogito.sqlite().unwrap().lock();
+    index::sync(&conn_guard, project_id, root, false).unwrap();
+
+    // Query "session" should find the symbol requireSession via LIKE supplement
+    let hits = index::search(&conn_guard, project_id, "session", 20).unwrap();
+
+    // Should find at least the symbol requireSession (from LIKE supplement)
+    // and the file session.rs (from FTS5)
+    let sym_names: Vec<&str> = hits
+        .iter()
+        .filter(|h| h.is_symbol)
+        .map(|h| h.name.as_str())
+        .collect();
+    assert!(
+        sym_names.iter().any(|n| n.contains("Session")),
+        "Expected symbol with 'Session' in name, got: {:?}",
+        sym_names
+    );
+
+    // The file session.rs should also be found
+    let paths: Vec<String> = hits
+        .iter()
+        .filter(|h| !h.is_symbol)
+        .map(|h| h.path.to_string_lossy().to_string())
+        .collect();
+    assert!(
+        paths.iter().any(|p| p.contains("session")),
+        "Expected file path containing 'session', got: {:?}",
+        paths
+    );
+
+    drop(conn_guard);
+    drop(tmp);
+}
+
+/// Test: LIKE supplement does not produce duplicate results.
+///
+/// If a symbol is found by BOTH FTS5 and LIKE (e.g. the query is an exact
+/// prefix or contains match that FTS5 finds), it should appear only once
+/// in the final results.
+#[test]
+fn test_search_no_duplicate_from_like_supplement() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let src = root.join("src");
+    fs::create_dir(&src).unwrap();
+
+    fs::write(src.join("lib.rs"), "pub fn session_check() {}").unwrap();
+
+    let (cogito, project_id) = init_cogito(root);
+    let conn_guard = cogito.sqlite().unwrap().lock();
+    index::sync(&conn_guard, project_id, root, false).unwrap();
+
+    // Query "session" should find the symbol session_check.
+    // If both FTS5 and LIKE find it, it should appear only once.
+    let hits = index::search(&conn_guard, project_id, "session", 20).unwrap();
+    let sym_names: Vec<&str> = hits
+        .iter()
+        .filter(|h| h.is_symbol && h.name == "session_check")
+        .map(|h| h.name.as_str())
+        .collect();
+    assert_eq!(
+        sym_names.len(),
+        1,
+        "session_check should appear exactly once, got: {:?}",
+        sym_names
     );
 
     drop(conn_guard);
