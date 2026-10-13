@@ -7,8 +7,8 @@
  *    the fingerprint Cogito stores for it. The scan is bounded and never
  *    blocks the session.
  * 2. It sets a status line showing what Cogito knows about the project.
- * 3. It registers `/cogito` with `status`, `scan`, `query`, `stats` and
- *    `doctor`, so the knowledge base is usable without leaving the session.
+ * 3. It registers `/cogito` with `status`, `map`, `scan`, `query`, `stats`
+ *    and `doctor`, so the map is usable without leaving the session.
  *
  * Persistence is owned by the `cogito` binary. This extension does **not**
  * register the MCP server: Pi reads MCP servers from `mcp.json`, which
@@ -167,7 +167,7 @@ export default function registerCogito(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("cogito", {
-    description: "Cogito context harness: status, scan, query, stats, doctor",
+    description: "Cogito context harness: status, map, scan, query, stats, doctor",
     handler: async (args: string, raw: any) => {
       const ctx = raw as CogitoContext;
       const cwd = ctx.cwd;
@@ -196,6 +196,15 @@ export default function registerCogito(pi: ExtensionAPI) {
           report("cogito: scanning…");
           const result = await run(["scan"], cwd, SCAN_TIMEOUT_MS);
           report(result.ok ? result.stdout.trim() : `cogito scan failed: ${firstLine(result.stderr)}`);
+          return;
+        }
+        case "map": {
+          if (!isProject(cwd)) {
+            report(`${cwd} is not a project (no .git or .cogito).`);
+            return;
+          }
+          const result = await run(["map"], cwd, SCAN_TIMEOUT_MS);
+          report(result.ok ? result.stdout.trim() : `cogito map failed: ${firstLine(result.stderr)}`);
           return;
         }
         case "stats": {
@@ -228,6 +237,7 @@ export default function registerCogito(pi: ExtensionAPI) {
             [
               "Cogito commands:",
               "  /cogito status          what Cogito sees in this project",
+              "  /cogito map             the project map the agent reads",
               "  /cogito scan            regenerate the code fingerprint",
               "  /cogito query <text>    search tags and architectural decisions",
               "  /cogito stats           stored tag/decision counts",

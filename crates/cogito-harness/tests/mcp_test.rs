@@ -60,50 +60,109 @@ fn test_mcp_initialize() {
     );
 }
 
+/// The tools a `tools/list` response advertises, by name.
+fn tool_names(output: &str) -> Vec<String> {
+    let response = output
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["id"] == 2)
+        .expect("a tools/list response");
+    let mut names: Vec<String> = response["result"]["tools"]
+        .as_array()
+        .expect("a tool array")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
 #[test]
-fn test_mcp_lists_five_tools() {
+fn test_mcp_lists_the_map_tools_only() {
     let messages = vec![
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
         r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
     ];
 
-    let output = send_jsonrpc(messages);
+    // The surface is the project map. Decision and note tools are absent on
+    // purpose: they belong to the agent's memory, not to Cogito.
+    assert_eq!(
+        tool_names(&send_jsonrpc(messages)),
+        ["add_tag", "project_map", "related_files", "search_code"]
+    );
+}
 
-    // All 5 tools should be advertised
-    assert!(output.contains("scan_project"), "Should list scan_project");
-    assert!(
-        output.contains("compress_context"),
-        "Should list compress_context"
-    );
-    assert!(
-        output.contains("search_knowledge"),
-        "Should list search_knowledge"
-    );
-    assert!(output.contains("add_decision"), "Should list add_decision");
-    assert!(output.contains("add_tag"), "Should list add_tag");
+/// The text of the tool result answering request `id`.
+fn tool_text(output: &str, id: u64) -> String {
+    output
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["id"] == id)
+        .and_then(|v| {
+            v["result"]["content"][0]["text"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("no result for request {id} in:\n{output}"))
 }
 
 #[test]
-fn test_mcp_compress_tool() {
-    let messages = vec![
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
-        r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"compress_context","arguments":{"content":"// big comment\nfn main() {\n    // another\n    let x = 5;\n    println!(\"{}\", x);\n}","max_tokens":1000}}}"#,
-    ];
+fn test_mcp_map_tools_on_a_workspace() {
+    // A two-package workspace: web imports shared through the package name.
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let write = |rel: &str, text: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write("package.json", r#"{"name":"mono","private":true}"#);
+    write("packages/shared/package.json", r#"{"name":"@m/shared"}"#);
+    write("packages/shared/src/index.ts", "export const x = 1;\n");
+    write("apps/web/package.json", r#"{"name":"@m/web"}"#);
+    write("apps/web/tsconfig.json", "{}");
+    write(
+        "apps/web/lib/session.ts",
+        "import { x } from '@m/shared';\n",
+    );
+    write("apps/web/app/page.tsx", "import '@/lib/session';\n");
 
-    let output = send_jsonrpc(messages);
+    let path = root.display().to_string();
+    let call = |id: u64, name: &str, args: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{name}","arguments":{{"path":"{path}"{args}}}}}}}"#
+        )
+    };
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
 
-    assert!(output.contains("\"id\":2"), "Should respond to call");
+    let map = call(2, "project_map", "");
+    let related = call(3, "related_files", r#","file":"lib/session.ts""#);
+    let search = call(4, "search_code", r#","query":"session""#);
+    let output = send_jsonrpc(vec![init, ready, &map, &related, &search]);
+
+    let map = tool_text(&output, 2);
+    assert!(map.contains("2 modules"), "{map}");
+    assert!(map.contains("apps/web (@m/web)"), "{map}");
+    assert!(map.contains("uses: packages/shared"), "{map}");
     assert!(
-        output.contains("Original tokens"),
-        "Should show original tokens"
+        map.contains("packages/shared (@m/shared) · 1 files · entry src/index.ts · used by 1"),
+        "{map}"
+    );
+
+    let related = tool_text(&output, 3);
+    assert!(
+        related.contains("Imports (1):\n  packages/shared/src/index.ts"),
+        "{related}"
     );
     assert!(
-        output.contains("Compressed tokens"),
-        "Should show compressed tokens"
+        related.contains("Imported by (1):\n  apps/web/app/page.tsx"),
+        "{related}"
     );
-    assert!(output.contains("Savings"), "Should show savings");
+
+    let search = tool_text(&output, 4);
+    assert!(search.contains("apps/web/lib/session.ts"), "{search}");
 }
 
 #[test]

@@ -25,13 +25,43 @@ pub fn open(path: &Path) -> Result<Connection> {
             .with_context(|| format!("Failed to create directory {}", parent.display()))?;
     }
 
+    // Agents call tools in parallel, so several connections can open the same
+    // database at once, and switching a new database to WAL takes a write
+    // lock. SQLite answers that contention with SQLITE_BUSY without consulting
+    // the busy handler, so the setup is serialized within this process and
+    // retried across processes (a session hook scanning while the MCP server
+    // opens the same database).
+    static OPEN_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _guard = OPEN_LOCK.lock();
+
     let conn = Connection::open(path)
         .with_context(|| format!("Failed to open SQLite at {}", path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))
+        .context("Failed to set the SQLite busy timeout")?;
 
-    apply_pragmas(&conn)?;
-    migrate(&conn)?;
+    let mut attempt = 0;
+    loop {
+        match apply_pragmas(&conn).and_then(|()| migrate(&conn)) {
+            Ok(()) => return Ok(conn),
+            Err(e) if attempt < 50 && is_busy(&e) => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20 * attempt.min(10)));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
-    Ok(conn)
+/// Whether an error is SQLite reporting a locked database.
+fn is_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<rusqlite::Error>().is_some_and(|e| {
+            matches!(
+                e.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            )
+        })
+    })
 }
 
 /// Apply performance and correctness PRAGMAs.

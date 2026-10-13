@@ -93,11 +93,10 @@ the `cogito mcp` server is configured, prefer the MCP tools over the CLI:
 
 | Tool | Purpose |
 |---|---|
-| `scan_project` | Generate fingerprint |
-| `compress_context` | Reduce context size |
-| `search_knowledge` | Search tags + decisions |
-| `add_decision` | Record a decision |
-| `add_tag` | Tag code paths |
+| `project_map` | Modules with entry point, size, most changed files and which modules they use. Read it before exploring the repository |
+| `related_files` | What one file imports, what imports it, and its external packages |
+| `search_code` | Find code by words in file paths, module names and tags |
+| `add_tag` | Label code locations so `search_code` finds them by that word |
 
 The MCP server is `cogito mcp` (same binary, `mcp` subcommand). It uses the
 same `.cogito/state.db` as the CLI, so both stay in sync. `cogito setup` writes

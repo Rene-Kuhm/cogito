@@ -146,6 +146,19 @@ enum Commands {
     /// Show statistics
     Stats,
 
+    /// Print the project map an agent gets from the `project_map` tool
+    Map {
+        /// Rescan even if the stored map is current
+        #[arg(long)]
+        refresh: bool,
+    },
+
+    /// Show a file's imports and importers (the `related_files` tool)
+    Related {
+        /// File path, relative to the project root, or a unique suffix
+        file: String,
+    },
+
     /// Diagnose configuration
     Doctor,
 
@@ -304,6 +317,8 @@ async fn main() -> Result<()> {
         Some(Commands::Uninstall { agents, yes }) => commands::uninstall(agents, yes)?,
         Some(Commands::Serve { port, mcp }) => commands::serve(port, mcp).await?,
         Some(Commands::Stats) => commands::stats(args.json).await?,
+        Some(Commands::Map { refresh }) => commands::map(refresh).await?,
+        Some(Commands::Related { file }) => commands::related(&file).await?,
         Some(Commands::Doctor) => commands::doctor().await?,
         Some(Commands::Export { output, format }) => {
             commands::export(output.as_deref(), &format).await?
