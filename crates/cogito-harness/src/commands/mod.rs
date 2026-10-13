@@ -670,18 +670,35 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool, with_pi_package: boo
             );
         }
 
+        // Project root for AGENTS.md block: the current working directory.
+        // Agents that read AGENTS.md (Codex, opencode) get a block here.
+        let project_root = std::env::current_dir()?;
+
         if dry_run {
             let status = crate::agents::status(agent, &home, &binary)?;
-            println!(
-                "  {} [{}] -> would {}",
-                agent.display(),
-                status.label(),
-                match status {
-                    crate::agents::Status::Configured => "stay as is",
-                    crate::agents::Status::Outdated => "update the entry",
-                    _ => "write",
-                }
-            );
+            let agents_action = match status {
+                crate::agents::Status::Configured => "stay as is",
+                crate::agents::Status::Outdated => "update the entry",
+                _ => "write",
+            };
+
+            if crate::agents::reads_agents_md(agent) {
+                // Print the AGENTS.md action first (from the function), then our summary line.
+                let _ = crate::agents::install_agents_md_block(&project_root, true);
+                println!(
+                    "  {} [{}] -> {}, AGENTS.md block would be written",
+                    agent.display(),
+                    status.label(),
+                    agents_action
+                );
+            } else {
+                println!(
+                    "  {} [{}] -> would {}",
+                    agent.display(),
+                    status.label(),
+                    agents_action
+                );
+            }
             continue;
         }
 
@@ -706,6 +723,25 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool, with_pi_package: boo
                 // say which file or which step went wrong.
                 for (i, cause) in e.chain().enumerate() {
                     println!("    {}{cause}", if i == 0 { "error: " } else { "cause: " });
+                }
+            }
+        }
+
+        // Install the AGENTS.md block for agents that read it.
+        if crate::agents::reads_agents_md(agent) {
+            if dry_run {
+                let _ = crate::agents::install_agents_md_block(&project_root, true);
+            } else {
+                match crate::agents::install_agents_md_block(&project_root, false) {
+                    Ok(crate::agents::Change::Written { .. }) => {
+                        println!("    AGENTS.md: block installed");
+                    }
+                    Ok(crate::agents::Change::AlreadyCorrect) => {
+                        println!("    AGENTS.md: block already present");
+                    }
+                    Err(e) => {
+                        println!("    AGENTS.md: failed: {e}");
+                    }
                 }
             }
         }
@@ -783,6 +819,9 @@ pub fn uninstall(agents: Vec<String>, yes: bool) -> Result<()> {
     }
 
     println!();
+    // Project root for AGENTS.md block: the current working directory.
+    let project_root = std::env::current_dir()?;
+
     for agent in selected {
         match crate::agents::uninstall(agent, &home) {
             Ok(crate::agents::Change::AlreadyCorrect) => {
@@ -795,6 +834,21 @@ pub fn uninstall(agents: Vec<String>, yes: bool) -> Result<()> {
                 }
             }
             Err(e) => println!("  {} — failed: {e}", agent.display()),
+        }
+
+        // Remove the AGENTS.md block for agents that read it.
+        if crate::agents::reads_agents_md(agent) {
+            match crate::agents::remove_agents_md_block(&project_root) {
+                Ok(crate::agents::Change::Written { .. }) => {
+                    println!("    AGENTS.md: block removed");
+                }
+                Ok(crate::agents::Change::AlreadyCorrect) => {
+                    // No block to remove; nothing to report.
+                }
+                Err(e) => {
+                    println!("    AGENTS.md: failed to remove block: {e}");
+                }
+            }
         }
     }
     Ok(())

@@ -333,44 +333,9 @@ printf '<cogito_project>\n%s\n</cogito_project>\n' "$card"
 exit 0
 "#;
 
-/// The opencode plugin.
-const OPENCODE_PLUGIN: &str = r#"// Cogito plugin for opencode.
-//
-// Refreshes the project's stored fingerprint when a session starts, so it
-// matches the current code.
-//
-// The MCP tools come from the `mcp.cogito` entry in opencode.json; this
-// plugin only reacts to session lifecycle events.
-
-export const CogitoPlugin = async ({ directory, $ }) => {
-  const scan = async () => {
-    try {
-      // Only touch real projects. Scanning unconditionally would create a
-      // `.cogito/` in $HOME or in any tree opencode happens to start in.
-      // `-e`, not `-d`: in a git worktree or submodule `.git` is a file.
-      const isProject =
-        (await $`test -e .git`.cwd(directory).quiet().nothrow()).exitCode === 0 ||
-        (await $`test -d .cogito`.cwd(directory).quiet().nothrow()).exitCode === 0;
-      if (!isProject) return;
-
-      await $`cogito scan --quiet`.cwd(directory).quiet().nothrow();
-    } catch {
-      // Cogito missing or the scan failed: never block the session.
-    }
-  };
-
-  return {
-    event: async ({ event }) => {
-      if (event?.type === "session.created" || event?.type === "session.start") {
-        // Fire and forget.
-        void scan();
-      }
-    },
-  };
-};
-
-export default CogitoPlugin;
-"#;
+/// The opencode plugin, loaded from a real file so it can be linted and
+/// type-checked instead of living as an opaque string constant.
+const OPENCODE_PLUGIN: &str = include_str!("../assets/opencode/cogito.js");
 
 /// The Claude Code PreToolUse guardrail. The decision lives in the binary
 /// (`cogito hook claude-pre-tool-use`) so it is tested Rust, not shell, and
@@ -750,6 +715,179 @@ pub fn status(agent: Agent, home: &Path, binary: &Path) -> Result<Status> {
     }
     Ok(Status::Configured)
 }
+
+// ============================================================
+// AGENTS.md block management (Codex and opencode)
+// ============================================================
+
+/// Markers that delimit Cogito's section in AGENTS.md.
+const AGENTS_START: &str = "<!-- cogito:start -->";
+const AGENTS_END: &str = "<!-- cogito:end -->";
+
+/// The block inserted into AGENTS.md for Codex and opencode.
+///
+/// Kept short: Codex limits the total file to 32 KiB and opencode concatenates
+/// all AGENTS.md files from project root to the working directory.
+const AGENTS_BLOCK_CONTENT: &str = "
+**This project is indexed by Cogito** — run `cogito map --card` to see the
+project card.
+
+**Use these MCP tools instead of whole-file reads and greps:**
+- `project_map` — module overview (once per session to orient)
+- `search_code` — find symbols, files and modules by name (returns file:line)
+- `file_outline` — a file's declarations with line ranges
+- `related_files` — what a file imports and what imports it
+
+**Guardrail:** Before reading a large file, call `file_outline` to get its
+declarations with line ranges, then read only the range you need. Reading the
+same range twice is always allowed.
+";
+
+/// Returns the path to the AGENTS.md file in `project_root`.
+pub fn agents_md_path(project_root: &Path) -> PathBuf {
+    project_root.join("AGENTS.md")
+}
+
+/// Whether `agent` reads AGENTS.md at session start.
+pub fn reads_agents_md(agent: Agent) -> bool {
+    matches!(agent, Agent::Codex | Agent::Opencode)
+}
+
+/// Install or refresh the Cogito block in `project_root/AGENTS.md`.
+///
+/// Idempotent: a second install with the same content is byte-identical.
+/// Returns the change that was (or would be) made, or `AlreadyCorrect` if
+/// the file is already correct.
+pub fn install_agents_md_block(project_root: &Path, dry_run: bool) -> Result<Change> {
+    let path = agents_md_path(project_root);
+    let new_block = format!(
+        "{}\n{}{}\n",
+        AGENTS_START,
+        AGENTS_BLOCK_CONTENT.trim(),
+        AGENTS_END
+    );
+
+    let existing = if path.exists() {
+        std::fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+
+    if existing.contains(AGENTS_START) && existing.contains(AGENTS_END) {
+        // Block exists: replace only the content between the markers.
+        let start_idx = existing.find(AGENTS_START).unwrap();
+        let end_idx = existing.find(AGENTS_END).unwrap() + AGENTS_END.len();
+
+        let before = &existing[..start_idx];
+        let after = &existing[end_idx..];
+
+        // Strip any trailing newline from `after` so we control the separator.
+        let after = after.trim_end_matches('\n');
+
+        let replacement = if after.is_empty() {
+            format!("{}{}", before, new_block.trim_end())
+        } else {
+            format!("{}{}\n{}", before, new_block.trim_end(), after)
+        };
+
+        if replacement == existing {
+            return Ok(Change::AlreadyCorrect);
+        }
+
+        if dry_run {
+            println!("  Would update {}", path.display());
+            return Ok(Change::AlreadyCorrect);
+        }
+
+        let backup = backup_file(&path)?;
+        std::fs::write(&path, &replacement)?;
+        return Ok(Change::Written { backup });
+    }
+
+    // No block: append one.
+    let separator = if existing.is_empty() || existing.ends_with('\n') {
+        String::new()
+    } else {
+        "\n".to_string()
+    };
+
+    let new_content = format!("{}{}{}", existing, separator, new_block.trim_end());
+
+    if new_content == existing {
+        return Ok(Change::AlreadyCorrect);
+    }
+
+    if dry_run {
+        println!("  Would write {}", path.display());
+        return Ok(Change::AlreadyCorrect);
+    }
+
+    let backup = if path.exists() {
+        backup_file(&path)?
+    } else {
+        std::fs::write(&path, "")?;
+        backup_file(&path)?
+    };
+    std::fs::write(&path, &new_content)?;
+    Ok(Change::Written { backup })
+}
+
+/// Remove the Cogito block from `project_root/AGENTS.md`.
+///
+/// Idempotent: removing when there is no block is a no-op and does not create
+/// the file. Returns `AlreadyCorrect` when nothing was changed.
+pub fn remove_agents_md_block(project_root: &Path) -> Result<Change> {
+    let path = agents_md_path(project_root);
+
+    if !path.exists() {
+        return Ok(Change::AlreadyCorrect);
+    }
+
+    let existing = std::fs::read_to_string(&path)?;
+
+    if !existing.contains(AGENTS_START) {
+        return Ok(Change::AlreadyCorrect);
+    }
+
+    // Find the block boundaries.
+    let start_idx = existing.find(AGENTS_START).unwrap();
+    let end_idx = existing.find(AGENTS_END).unwrap() + AGENTS_END.len();
+
+    let before = &existing[..start_idx];
+    let after = &existing[end_idx..];
+
+    // Remove trailing blank lines from `before` and leading blank lines from
+    // `after`, but preserve at least one newline between the sections.
+    let before = before.trim_end_matches('\n');
+    let after = after.trim_start_matches('\n');
+
+    let replacement = if before.is_empty() && after.is_empty() {
+        String::new()
+    } else if before.is_empty() {
+        after.to_string()
+    } else if after.is_empty() {
+        before.to_string()
+    } else {
+        format!("{}\n{}", before, after)
+    };
+
+    if replacement == existing {
+        return Ok(Change::AlreadyCorrect);
+    }
+
+    let backup = backup_file(&path)?;
+    // If the file is now empty, remove it rather than leaving a blank file.
+    if replacement.is_empty() {
+        std::fs::remove_file(&path)?;
+    } else {
+        std::fs::write(&path, &replacement)?;
+    }
+    Ok(Change::Written { backup })
+}
+
+// ============================================================
+// Agent install / uninstall
+// ============================================================
 
 /// Configure `agent` to use the `cogito` binary at `binary`.
 /// Install or repair `agent`'s configuration.
@@ -1425,6 +1563,32 @@ mod tests {
         let source = std::fs::read_to_string(&plugin).unwrap();
         assert!(source.contains("CogitoPlugin"), "{source}");
         assert!(source.contains("cogito scan"), "{source}");
+
+        // Defect 1 fix: injectCard must push into output.system, not a dangling variable.
+        assert!(
+            source.contains("output.system.push"),
+            "plugin must push the card into output.system: {source}"
+        );
+
+        // Defect 2 fix: guardrail hooks must use opencode's (input, output) signature.
+        // The correct shape reads input.tool and output.args; Claude Code's
+        // tool_name / tool_input must not appear anywhere.
+        assert!(
+            source.contains("input.tool"),
+            "tool.execute.before must read input.tool: {source}"
+        );
+        assert!(
+            source.contains("output.args"),
+            "tool.execute.before must read output.args: {source}"
+        );
+        assert!(
+            !source.contains("tool_name"),
+            "plugin must not use Claude Code's tool_name: {source}"
+        );
+        assert!(
+            !source.contains("tool_input"),
+            "plugin must not use Claude Code's tool_input: {source}"
+        );
 
         assert_eq!(
             status(Agent::Opencode, home.path(), &bin()).unwrap(),
@@ -2138,5 +2302,202 @@ mod tests {
         let change = install(Agent::Crush, home.path(), &bin(), PiPackageAction::Leave).unwrap();
         assert!(matches!(change, Change::Written { .. }));
         assert!(home.path().join(".config/crush/crush.json").exists());
+    }
+
+    // ============================================================
+    // AGENTS.md block management
+    // ============================================================
+
+    #[test]
+    fn test_agents_md_install_into_empty_dir_creates_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        assert!(!path.exists());
+
+        let result = install_agents_md_block(dir.path(), false).unwrap();
+        assert!(matches!(result, Change::Written { .. }));
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("<!-- cogito:start -->"));
+        assert!(content.contains("<!-- cogito:end -->"));
+        assert!(content.contains("project_map"));
+        assert!(content.contains("search_code"));
+        assert!(content.contains("file_outline"));
+    }
+
+    #[test]
+    fn test_agents_md_install_preserves_existing_prose() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(&path, "Existing project notes.\n").unwrap();
+
+        install_agents_md_block(dir.path(), false).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("Existing project notes."));
+        assert!(content.contains("<!-- cogito:start -->"));
+        assert!(content.contains("<!-- cogito:end -->"));
+    }
+
+    #[test]
+    fn test_agents_md_install_twice_is_byte_identical() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(&path, "Pre-existing content.\n").unwrap();
+
+        install_agents_md_block(dir.path(), false).unwrap();
+        let first = std::fs::read(&path).unwrap();
+
+        install_agents_md_block(dir.path(), false).unwrap();
+        let second = std::fs::read(&path).unwrap();
+
+        assert_eq!(first, second, "installing twice must be byte-identical");
+    }
+
+    #[test]
+    fn test_agents_md_replace_stale_block_preserves_rest() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(
+            &path,
+            "Before text.\n<!-- cogito:start -->Old content<!-- cogito:end -->\nAfter text.\n",
+        )
+        .unwrap();
+
+        install_agents_md_block(dir.path(), false).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("Before text."));
+        assert!(content.contains("After text."));
+        assert!(content.contains("<!-- cogito:start -->"));
+        assert!(content.contains("<!-- cogito:end -->"));
+        // Old content replaced
+        assert!(!content.contains("Old content"));
+        // New content present
+        assert!(content.contains("project_map"));
+    }
+
+    #[test]
+    fn test_agents_md_remove_restores_original() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(
+            &path,
+            "Before text.\n<!-- cogito:start -->Old content<!-- cogito:end -->\nAfter text.\n",
+        )
+        .unwrap();
+
+        remove_agents_md_block(dir.path()).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("Before text."));
+        assert!(content.contains("After text."));
+        assert!(!content.contains("<!-- cogito:start -->"));
+        assert!(!content.contains("<!-- cogito:end -->"));
+        assert!(!content.contains("Old content"));
+    }
+
+    #[test]
+    fn test_agents_md_remove_no_block_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(&path, "No block here.\n").unwrap();
+
+        let result = remove_agents_md_block(dir.path()).unwrap();
+        assert!(matches!(result, Change::AlreadyCorrect));
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "No block here.\n");
+    }
+
+    #[test]
+    fn test_agents_md_remove_nonexistent_file_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        assert!(!path.exists());
+
+        let result = remove_agents_md_block(dir.path()).unwrap();
+        assert!(matches!(result, Change::AlreadyCorrect));
+        assert!(!path.exists(), "must not create the file");
+    }
+
+    #[test]
+    fn test_agents_md_dry_run_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("AGENTS.md");
+
+        let result = install_agents_md_block(dir.path(), true).unwrap();
+        assert!(matches!(result, Change::AlreadyCorrect));
+        assert!(!path.exists(), "dry run must not create the file");
+    }
+
+    // ============================================================
+    // opencode plugin
+    // ============================================================
+
+    #[test]
+    fn test_opencode_plugin_loaded_from_file() {
+        // Verify the plugin constant is loaded from the real file.
+        let plugin = OPENCODE_PLUGIN;
+        assert!(!plugin.is_empty(), "plugin must be loaded from asset file");
+        assert!(plugin.contains("CogitoPlugin"));
+    }
+
+    #[test]
+    fn test_opencode_plugin_has_session_scan() {
+        let plugin = OPENCODE_PLUGIN;
+        assert!(
+            plugin.contains("session.created") || plugin.contains("session.start"),
+            "plugin must handle session lifecycle events"
+        );
+        assert!(plugin.contains("cogito scan"));
+    }
+
+    #[test]
+    fn test_opencode_plugin_has_card_injection() {
+        let plugin = OPENCODE_PLUGIN;
+        assert!(
+            plugin.contains("experimental.chat.system.transform"),
+            "plugin must have card injection hook"
+        );
+        assert!(plugin.contains("cogito map --card") || plugin.contains("map --card"));
+    }
+
+    #[test]
+    fn test_opencode_plugin_has_read_guardrail() {
+        let plugin = OPENCODE_PLUGIN;
+        assert!(
+            plugin.contains("tool.execute.before"),
+            "plugin must have guardrail hook"
+        );
+        assert!(plugin.contains("cogito outline") || plugin.contains("outline"));
+    }
+
+    #[test]
+    fn test_opencode_plugin_has_grep_guardrail() {
+        let plugin = OPENCODE_PLUGIN;
+        assert!(plugin.contains("cogito search") || plugin.contains("search"));
+        // Should check for plain name patterns
+        assert!(plugin.contains("isPlainName") || plugin.contains("is_plain_name"));
+    }
+
+    #[test]
+    fn test_opencode_plugin_repeat_passes_through() {
+        let plugin = OPENCODE_PLUGIN;
+        // Should have per-session bookkeeping for "already nudged"
+        assert!(
+            plugin.contains("firstTime") || plugin.contains("first_time"),
+            "plugin must track already-nudged state per session"
+        );
+    }
+
+    #[test]
+    fn test_reads_agents_md() {
+        assert!(reads_agents_md(Agent::Codex));
+        assert!(reads_agents_md(Agent::Opencode));
+        assert!(!reads_agents_md(Agent::ClaudeCode));
+        assert!(!reads_agents_md(Agent::GentleShell));
+        assert!(!reads_agents_md(Agent::Gemini));
+        assert!(!reads_agents_md(Agent::Crush));
     }
 }

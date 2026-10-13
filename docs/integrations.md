@@ -129,6 +129,41 @@ enabled = true
 The file is edited with `toml_edit`, so comments and formatting elsewhere are
 preserved.
 
+`setup` also installs a Cogito block into `AGENTS.md` at the project root.
+Codex reads every `AGENTS.md` from the project root toward the working
+directory and concatenates them (closer files take precedence), with a 32 KiB
+budget. The block is short and carries the project card reminder, the MCP tool
+names, and the guardrail rule.
+
+You can add a SessionStart hook to inject the project card into Codex sessions:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{
+      "matcher": "^(startup|resume|clear|compact|fork)$",
+      "hooks": [{
+        "type": "command",
+        "command": "sh '/path/to/cogito-session-start.sh'",
+        "timeout": 30
+      }]
+    }]
+  }
+}
+```
+
+And the hook script (`~/.codex/hooks/cogito-session-start.sh`, 0755):
+
+```sh
+#!/bin/sh
+command -v cogito >/dev/null 2>&1 || exit 0
+cd "${CODEX_DIR:-.}" 2>/dev/null || exit 0
+[ -e .git ] || [ -d .cogito ] || exit 0
+card=$(cogito map --card 2>/dev/null)
+[ -n "$card" ] || exit 0
+printf '<cogito_project>\n%s\n</cogito_project>\n' "$card"
+```
+
 ### Gemini CLI
 
 `~/.gemini/settings.json` gains `mcpServers.cogito`.
@@ -136,9 +171,16 @@ preserved.
 ### opencode
 
 - `~/.config/opencode/opencode.json` gains `mcp.cogito`.
-- `~/.config/opencode/plugins/cogito.js` fires `cogito scan --quiet` on
-  `session.created`. opencode loads everything in that directory, so no config
-  change is needed for the plugin itself.
+- `~/.config/opencode/plugins/cogito.js` is installed by `setup`. It:
+  - Fires `cogito scan --quiet` on `session.created` and `session.start`.
+  - Injects the project card via `experimental.chat.system.transform` (once per
+    session).
+  - Intercepts the first whole-file `Read` and plain-name `Grep` calls via
+    `tool.execute.before` and returns Cogito's outline or search result instead.
+    The same call on retry passes through.
+
+`setup` also installs the Cogito block into `AGENTS.md` at the project root.
+opencode reads every `AGENTS.md` from the workspace root toward home.
 
 ### Crush
 
