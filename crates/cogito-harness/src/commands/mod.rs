@@ -527,19 +527,29 @@ pub async fn stats(json: bool) -> Result<()> {
 
     let tags = cogito.search_tags(project.id, "").unwrap_or_default();
     let decisions = cogito.search_decisions(project.id, "").unwrap_or_default();
+    let stored = cogito.stats(project.id)?;
 
     if json {
         let stats = serde_json::json!({
             "project": project.name,
             "tags": tags.len(),
             "decisions": decisions.len(),
+            "hot_zones": stored.hot_zones_count,
+            "fingerprint_generated_at": stored.fingerprint_generated_at,
         });
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {
         println!("=== Cogito Statistics ===");
-        println!("Project:   {}", project.name);
-        println!("Tags:      {}", tags.len());
-        println!("Decisions: {}", decisions.len());
+        println!("Project:     {}", project.name);
+        println!("Tags:        {}", tags.len());
+        println!("Decisions:   {}", decisions.len());
+        match &stored.fingerprint_generated_at {
+            Some(at) => println!(
+                "Fingerprint: {} hot zones, scanned {at}",
+                stored.hot_zones_count
+            ),
+            None => println!("Fingerprint: not scanned yet (run `cogito scan`)"),
+        }
     }
     Ok(())
 }

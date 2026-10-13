@@ -3,9 +3,9 @@
  *
  * What this adds to Pi:
  *
- * 1. On `session_start` it scans the project in the background so the code
- *    fingerprint is warm before the first search. The scan is bounded and
- *    never blocks the session.
+ * 1. On `session_start` it scans the project in the background, refreshing
+ *    the fingerprint Cogito stores for it. The scan is bounded and never
+ *    blocks the session.
  * 2. It sets a status line showing what Cogito knows about the project.
  * 3. It registers `/cogito` with `status`, `scan`, `query`, `stats` and
  *    `doctor`, so the knowledge base is usable without leaving the session.
@@ -132,8 +132,9 @@ export default function registerCogito(pi: ExtensionAPI) {
     const cwd = ctx.cwd;
     if (!cwd) return;
 
-    // Warm the fingerprint in the background. A scan can take a moment on a
-    // large repo, and nothing in the session depends on it, so do not await.
+    // Refresh the stored fingerprint in the background. A scan can take a
+    // moment on a large repo, and nothing in the session depends on it, so do
+    // not await.
     if (!isProject(cwd)) {
       try {
         ctx.ui?.setStatus?.("cogito", "cogito: not a project");

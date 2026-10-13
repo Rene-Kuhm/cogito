@@ -105,3 +105,26 @@ fn test_mcp_compress_tool() {
     );
     assert!(output.contains("Savings"), "Should show savings");
 }
+
+#[test]
+fn test_mcp_stdout_is_only_json_rpc() {
+    // stdout is the protocol channel: a log line there is a parse error for a
+    // strict client. The server logs at INFO on startup, so this fails if
+    // logging is ever pointed back at stdout.
+    let messages = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    ];
+
+    let output = send_jsonrpc(messages);
+    let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(!lines.is_empty(), "the server must answer");
+    for line in lines {
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(line);
+        assert!(
+            parsed.is_ok_and(|v| v.get("jsonrpc").is_some()),
+            "every stdout line must be a JSON-RPC message, got: {line}"
+        );
+    }
+}

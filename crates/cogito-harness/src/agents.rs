@@ -299,7 +299,8 @@ const SERVER_DESCRIPTION: &str =
 const CLAUDE_HOOK_SCRIPT: &str = r#"#!/bin/sh
 # Cogito SessionStart hook.
 #
-# Warms the project fingerprint so the first query in the session is fast.
+# Refreshes the project's stored fingerprint, so the session starts with
+# Cogito's view of the project up to date.
 #
 # This script always exits 0. A missing `cogito`, a directory that is not a
 # project, or a failed scan are all silent no-ops, so it can never block or
@@ -330,8 +331,8 @@ exit 0
 /// The opencode plugin.
 const OPENCODE_PLUGIN: &str = r#"// Cogito plugin for opencode.
 //
-// Warms the project fingerprint when a session starts so the first query is
-// fast, and exposes `/cogito` through the plugin's command surface.
+// Refreshes the project's stored fingerprint when a session starts, so it
+// matches the current code.
 //
 // The MCP tools come from the `mcp.cogito` entry in opencode.json; this
 // plugin only reacts to session lifecycle events.

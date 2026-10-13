@@ -5,8 +5,9 @@ Pi extension that wires [Cogito](https://github.com/Rene-Kuhm/cogito-harness) in
 
 ## What it does
 
-1. **Scans at session start.** The project's code fingerprint is generated in
-   the background so the first query is fast. The scan never blocks the
+1. **Scans at session start.** The project's code fingerprint is regenerated
+   in the background and stored, so `/cogito stats` and the MCP
+   `project_stats` tool reflect the current code. The scan never blocks the
    session and is capped at 30 seconds.
 2. **Shows status.** The status line reports whether Cogito is ready for the
    current project.
