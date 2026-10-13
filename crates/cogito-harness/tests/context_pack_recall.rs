@@ -22,7 +22,7 @@
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -110,6 +110,13 @@ fn used_tokens(pack: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Ask the tool one question and return its answer.
+///
+/// stdin stays open until the answer for `id: 2` has been read. Closing it first
+/// and then draining stdout happens to work, but it leans on the server treating
+/// an early end of input as "finish what you have": a server that instead
+/// cancels in-flight requests when its input closes would drop the answer. This
+/// reads the answer, and only then closes stdin and reaps the process.
 fn ask(path: &Path, task: &str, budget: usize) -> String {
     let mut child = Command::new(cogito_bin())
         .args(["mcp"])
@@ -138,23 +145,42 @@ fn ask(path: &Path, task: &str, budget: usize) -> String {
         for message in [init, ready, &call] {
             writeln!(stdin, "{message}").expect("write");
         }
+        stdin.flush().expect("flush");
     }
 
-    let output = child.wait_with_output().expect("wait");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+    // Collect stdout until the answer arrives, with stdin still open.
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut answer: Option<String> = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // the server closed its output
+            Ok(_) => {}
+            Err(e) => panic!("reading from cogito mcp: {e}"),
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
             continue;
         };
         if value.get("id") != Some(&serde_json::json!(2)) {
             continue;
         }
-        return value["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
+        answer = Some(
+            value["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        break;
     }
-    panic!("no context_pack answer:\n{stdout}");
+
+    // Only now close stdin, then reap the process.
+    drop(child.stdin.take());
+    let status = child.wait().expect("wait");
+    answer.unwrap_or_else(|| {
+        panic!("no answer for the task {task:?}: the server exited with {status}")
+    })
 }
 
 #[test]
