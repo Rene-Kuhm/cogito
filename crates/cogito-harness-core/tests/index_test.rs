@@ -57,7 +57,7 @@ fn test_new_file_appears_after_sync() {
     let conn_guard = cogito.sqlite().unwrap().lock();
 
     // First sync
-    let report1 = index::sync(&conn_guard, project_id, &root).unwrap();
+    let report1 = index::sync(&conn_guard, project_id, &root, false).unwrap();
     assert!(
         report1.added >= 1,
         "Should add at least Cargo.toml and lib.rs"
@@ -85,7 +85,7 @@ pub fn multiply(a: i32, b: i32) -> i32 {
     );
 
     // Second sync
-    let report2 = index::sync(&conn_guard, project_id, &root).unwrap();
+    let report2 = index::sync(&conn_guard, project_id, &root, false).unwrap();
     assert_eq!(report2.added, 1, "Should add the new file");
     assert_eq!(report2.removed, 0);
 
@@ -111,7 +111,7 @@ fn test_symbol_change_triggers_reparse() {
     let conn_guard = cogito.sqlite().unwrap().lock();
 
     // Initial sync
-    index::sync(&conn_guard, project_id, &root).unwrap();
+    index::sync(&conn_guard, project_id, &root, false).unwrap();
 
     // Verify initial symbol exists
     let outline_before =
@@ -139,7 +139,7 @@ pub fn subtract(a: i32, b: i32) -> i32 {
     .unwrap();
 
     // Sync again
-    let report = index::sync(&conn_guard, project_id, &root).unwrap();
+    let report = index::sync(&conn_guard, project_id, &root, false).unwrap();
     assert_eq!(report.modified, 1, "Should modify src/lib.rs");
 
     // Verify new symbol exists and old one is gone
@@ -175,7 +175,7 @@ fn test_same_bytes_newer_mtime_unchanged() {
     let conn_guard = cogito.sqlite().unwrap().lock();
 
     // Initial sync
-    let report1 = index::sync(&conn_guard, project_id, &root).unwrap();
+    let report1 = index::sync(&conn_guard, project_id, &root, false).unwrap();
     let _initial_reparsed = report1.reparsed;
 
     // Wait a tiny bit, then rewrite with same content
@@ -191,7 +191,7 @@ fn test_same_bytes_newer_mtime_unchanged() {
     .unwrap();
 
     // Sync again
-    let report2 = index::sync(&conn_guard, project_id, &root).unwrap();
+    let report2 = index::sync(&conn_guard, project_id, &root, false).unwrap();
     assert_eq!(
         report2.reparsed, 0,
         "Should not reparse files with identical content"
@@ -214,7 +214,7 @@ fn test_deleted_file_removed() {
     let conn_guard = cogito.sqlite().unwrap().lock();
 
     // Initial sync
-    index::sync(&conn_guard, project_id, &root).unwrap();
+    index::sync(&conn_guard, project_id, &root, false).unwrap();
 
     // Verify lib.rs is indexed
     let outline_before =
@@ -225,7 +225,7 @@ fn test_deleted_file_removed() {
     fs::remove_file(root.join("src/lib.rs")).unwrap();
 
     // Sync
-    let report = index::sync(&conn_guard, project_id, &root).unwrap();
+    let report = index::sync(&conn_guard, project_id, &root, false).unwrap();
     assert_eq!(report.removed, 1, "Should remove deleted file");
 
     // Verify it's gone from search
@@ -258,11 +258,11 @@ fn test_idempotent_sync() {
     let conn_guard = cogito.sqlite().unwrap().lock();
 
     // First sync
-    let report1 = index::sync(&conn_guard, project_id, &root).unwrap();
+    let report1 = index::sync(&conn_guard, project_id, &root, false).unwrap();
     let first_scanned = report1.scanned;
 
     // Second sync (tree unchanged)
-    let report2 = index::sync(&conn_guard, project_id, &root).unwrap();
+    let report2 = index::sync(&conn_guard, project_id, &root, false).unwrap();
     assert_eq!(report2.added, 0, "Nothing added");
     assert_eq!(report2.modified, 0, "Nothing modified");
     assert_eq!(report2.removed, 0, "Nothing removed");
@@ -313,7 +313,7 @@ class SnakeCaseName:
     let (cogito, project_id) = init_cogito(tmp.path());
     let conn_guard = cogito.sqlite().unwrap().lock();
 
-    index::sync(&conn_guard, project_id, tmp.path()).unwrap();
+    index::sync(&conn_guard, project_id, tmp.path(), false).unwrap();
 
     // Search for partial identifier
     let hits = index::search(&conn_guard, project_id, "CamelCase", 10).unwrap();
@@ -354,7 +354,7 @@ fn test_doc_file_indexed() {
     let (cogito, project_id) = init_cogito(tmp.path());
     let conn_guard = cogito.sqlite().unwrap().lock();
 
-    let report = index::sync(&conn_guard, project_id, tmp.path()).unwrap();
+    let report = index::sync(&conn_guard, project_id, tmp.path(), false).unwrap();
     assert!(report.added >= 1, "Should add docs/guide.md");
 
     // Search for heading
@@ -435,5 +435,272 @@ pub fn new_function() {}
         "Should have new_function in fingerprint symbols"
     );
 
+    drop(tmp);
+}
+
+/// Test: a source file ranks above a test file for the same symbol name.
+/// Within each class (symbol vs file), non-test paths come before test paths,
+/// then FTS5 bm25, then path, then line — giving fully deterministic ordering.
+#[test]
+fn test_search_ranks_source_before_tests() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // Create a source file with a symbol
+    let lib_rel = PathBuf::from("src/lib.rs");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn process_data(x: i32) -> i32 { x }\npub struct DataProcessor;\n",
+    )
+    .unwrap();
+
+    // Create a test file with the same symbol name
+    let test_rel = PathBuf::from("tests/lib_test.rs");
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(
+        root.join("tests/lib_test.rs"),
+        "#[test]\nfn process_data() {\n    assert_eq!(super::process_data(1), 1);\n}\n",
+    )
+    .unwrap();
+
+    let (cogito, project_id) = init_cogito(root);
+    let conn_guard = cogito.sqlite().unwrap().lock();
+
+    index::sync(&conn_guard, project_id, root, false).unwrap();
+
+    let hits = index::search(&conn_guard, project_id, "process_data", 10).unwrap();
+
+    // Must find both
+    assert!(
+        hits.iter().any(|h| h.path == lib_rel),
+        "Should find source file: {:?}",
+        hits
+    );
+    assert!(
+        hits.iter().any(|h| h.path == test_rel),
+        "Should find test file: {:?}",
+        hits
+    );
+
+    // Source file must come before test file
+    let source_idx = hits.iter().position(|h| h.path == lib_rel).unwrap();
+    let test_idx = hits.iter().position(|h| h.path == test_rel).unwrap();
+    assert!(
+        source_idx < test_idx,
+        "Source file should rank before test file: {:?}",
+        hits
+    );
+
+    drop(conn_guard);
+    drop(tmp);
+}
+
+/// Test: a query containing FTS5 special characters (`\"`, `*`, `(`, `:`,
+/// backslash) does not panic and returns either results or an empty list.
+#[test]
+fn test_search_special_chars_no_panic() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let src = root.join("src");
+    fs::create_dir(&src).unwrap();
+
+    fs::write(src.join("lib.rs"), "pub fn foo_bar() {}").unwrap();
+
+    let (cogito, project_id) = init_cogito(root);
+    let conn_guard = cogito.sqlite().unwrap().lock();
+    index::sync(&conn_guard, project_id, root, false).unwrap();
+
+    let dangerous = [
+        r#"""#,
+        "*",
+        "(",
+        ":",
+        r#"\"#,
+        "hello*world",
+        "foo:bar",
+        "(test)",
+    ];
+
+    for q in dangerous {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            index::search(&conn_guard, project_id, q, 10)
+        }));
+        assert!(
+            result.is_ok(),
+            "Query {:?} should not panic: {:?}",
+            q,
+            result
+        );
+        // A valid name query must keep working
+        let normal = index::search(&conn_guard, project_id, "foo_bar", 10).unwrap();
+        assert!(
+            !normal.is_empty(),
+            "Normal query 'foo_bar' should still find results"
+        );
+    }
+
+    drop(conn_guard);
+    drop(tmp);
+}
+
+/// Test: a valid identifier query still works after the LIKE fallback path
+/// is exercised by an earlier invalid query.
+#[test]
+fn test_search_like_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let src = root.join("src");
+    fs::create_dir(&src).unwrap();
+
+    fs::write(
+        src.join("lib.rs"),
+        "pub fn my_function() {}\npub struct MyType;",
+    )
+    .unwrap();
+
+    let (cogito, project_id) = init_cogito(root);
+    let conn_guard = cogito.sqlite().unwrap().lock();
+    index::sync(&conn_guard, project_id, root, false).unwrap();
+
+    // A bare " triggers FTS5 error; the LIKE fallback path is entered.
+    // A normal query afterward must still return correct results.
+    let _ = index::search(&conn_guard, project_id, "\"", 10).unwrap();
+    let hits = index::search(&conn_guard, project_id, "my_function", 10).unwrap();
+    assert!(
+        hits.iter().any(|h| h.name == "my_function"),
+        "Normal query should still work after LIKE fallback: {:?}",
+        hits
+    );
+
+    drop(conn_guard);
+    drop(tmp);
+}
+
+/// Test: `SearchHit.score` carries the real FTS5 bm25 value, not a constant.
+#[test]
+fn test_search_score_is_bm25() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let src = root.join("src");
+    fs::create_dir(&src).unwrap();
+
+    fs::write(src.join("a.rs"), "pub fn unique_token_xyz() {}").unwrap();
+    fs::write(
+        src.join("b.rs"),
+        "// comment\n// comment\n// comment\npub fn unique_token_xyz() {}",
+    )
+    .unwrap();
+
+    let (cogito, project_id) = init_cogito(root);
+    let conn_guard = cogito.sqlite().unwrap().lock();
+    index::sync(&conn_guard, project_id, root, false).unwrap();
+
+    let hits = index::search(&conn_guard, project_id, "unique_token_xyz", 10).unwrap();
+
+    assert!(
+        !hits.is_empty(),
+        "Should find 'unique_token_xyz': {:?}",
+        hits
+    );
+    // All scores should be real bm25 values (negative floats), not 1.0 or 0.5
+    for hit in &hits {
+        assert!(
+            hit.score != 1.0 && hit.score != 0.5,
+            "Score should be real bm25, not constant: {:?}",
+            hit
+        );
+    }
+
+    drop(conn_guard);
+    drop(tmp);
+}
+
+/// Test: in a git repository with a clean worktree, `sync` with
+/// `allow_skip_when_clean = true` reports no changes and reparses nothing.
+#[test]
+fn test_sync_skip_on_clean_worktree() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // Create files before git init (git add_path requires existing files)
+    fs::write(root.join("README.md"), "# Test").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn x() {}").unwrap();
+
+    // Initialise a git repo and create one commit so the worktree is clean
+    let repo = git2::Repository::init(root).unwrap();
+
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("README.md")).unwrap();
+    index.add_path(std::path::Path::new("src/lib.rs")).unwrap();
+    index.write().unwrap();
+
+    let sig = git2::Signature::now("test", "test@example.com").unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "Initial", &tree, &[])
+        .ok();
+
+    let (cogito, project_id) = init_cogito(root);
+    let conn = cogito.sqlite().unwrap().lock();
+
+    // First sync: populate the index
+    let report = index::sync(&conn, project_id, root, false).unwrap();
+    assert!(report.scanned > 0, "Should have scanned files");
+    assert!(report.reparsed > 0, "Should have reparsed files");
+
+    // Second sync with allow_skip_when_clean=true: should skip without re-parsing
+    let report = index::sync(&conn, project_id, root, true).unwrap();
+    assert!(!report.changed(), "Clean worktree: nothing changed");
+    assert_eq!(report.reparsed, 0, "Should not have re-parsed");
+    assert_eq!(report.unchanged, report.scanned, "All files unchanged");
+
+    drop(conn);
+    drop(tmp);
+}
+
+/// Test: in a git repository with one uncommitted file, `sync` with
+/// `allow_skip_when_clean = true` does NOT skip and reports the change.
+#[test]
+fn test_sync_no_skip_on_dirty_worktree() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // Create files before git init
+    fs::write(root.join("README.md"), "# Test").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn x() {}").unwrap();
+
+    // Initialise a git repo and create one commit
+    let repo = git2::Repository::init(root).unwrap();
+
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("README.md")).unwrap();
+    index.add_path(std::path::Path::new("src/lib.rs")).unwrap();
+    index.write().unwrap();
+
+    let sig = git2::Signature::now("test", "test@example.com").unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "Initial", &tree, &[])
+        .ok();
+
+    let (cogito, project_id) = init_cogito(root);
+    let conn = cogito.sqlite().unwrap().lock();
+
+    // First sync: populate the index
+    index::sync(&conn, project_id, root, false).unwrap();
+
+    // Add an uncommitted file (src/ already exists)
+    fs::write(root.join("src/new.rs"), "pub fn y() {}").unwrap();
+
+    // Second sync with allow_skip_when_clean=true: should NOT skip because
+    // worktree is dirty, and should find the new file.
+    let report = index::sync(&conn, project_id, root, true).unwrap();
+    assert!(report.changed(), "Dirty worktree: should detect change");
+    assert!(report.added > 0, "Should have found the new file");
+
+    drop(conn);
     drop(tmp);
 }

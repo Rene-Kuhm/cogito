@@ -114,20 +114,27 @@ fn bench_index(c: &mut Criterion) {
             let conn = cg.sqlite().unwrap().lock();
             let project_root = project_root.clone();
             b.iter(|| {
-                index::sync(black_box(&conn), black_box(pid), black_box(&project_root)).unwrap();
+                index::sync(
+                    black_box(&conn),
+                    black_box(pid),
+                    black_box(&project_root),
+                    false,
+                )
+                .unwrap();
             });
         });
 
         // Measure warm sync (index already populated, no changes)
         group.bench_function(BenchmarkId::new("sync_warm", n), |b| {
             // First, populate the index
-            index::sync(&conn, project_id, &project_root).unwrap();
+            index::sync(&conn, project_id, &project_root, false).unwrap();
             // Now measure warm sync
             b.iter(|| {
                 index::sync(
                     black_box(&conn),
                     black_box(project_id),
                     black_box(&project_root),
+                    false,
                 )
                 .unwrap();
             });
@@ -136,7 +143,7 @@ fn bench_index(c: &mut Criterion) {
         // Measure search
         group.bench_function(BenchmarkId::new("search", n), |b| {
             // Ensure index is populated
-            index::sync(&conn, project_id, &project_root).unwrap();
+            index::sync(&conn, project_id, &project_root, false).unwrap();
             b.iter(|| {
                 index::search(
                     black_box(&conn),

@@ -62,7 +62,8 @@ pub async fn scan() -> Result<()> {
     // Sync the index and report what changed
     if let Some(conn) = cogito.sqlite() {
         let conn_guard = conn.lock();
-        let report = cogito_harness_core::index::sync(&conn_guard, project.id, &project.path)?;
+        let report =
+            cogito_harness_core::index::sync(&conn_guard, project.id, &project.path, false)?;
         println!();
         println!("📁 Index: {} files scanned", report.scanned);
         if report.added > 0 {

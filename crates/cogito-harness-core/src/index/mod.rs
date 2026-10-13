@@ -46,11 +46,21 @@ impl SyncReport {
 /// One search result.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
+    /// `"symbol"`, `"file"`, or `"doc"`.
     pub kind: &'static str,
+    /// The matched symbol name or file name.
     pub name: String,
+    /// Path to the file containing the match.
     pub path: PathBuf,
+    /// 1-based line number for symbol hits; `0` for file/doc hits.
     pub line: usize,
+    /// Ranking signal. In the single-phase FTS5 path this is the bm25 rank
+    /// (**lower = more relevant**). In the two-phase bounded path this is the
+    /// match-tier score: `3.0` = exact name match, `2.0` = name prefix match,
+    /// `1.0` = name contains match, `0.0` = other. Do not reverse the sign.
     pub score: f64,
+    /// Whether this hit lives inside a test directory or test file.
+    pub is_test: bool,
 }
 
 /// One declaration indexed from a file.
@@ -103,6 +113,47 @@ fn file_mtime_ns(path: &Path) -> std::io::Result<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// Test-path classification
+// ---------------------------------------------------------------------------
+
+/// Return true if `path` is inside a test directory or has a test-like name.
+///
+/// A test path is one where any path component matches (case-insensitively)
+/// `tests`, `test`, `spec`, `specs`, `__tests__`, or where the file name
+/// contains `.test.`, `_test.`, `.spec.`, `_spec.`, or starts with `test_`.
+fn is_test_path(path: &Path) -> bool {
+    let components: Vec<String> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_string_lossy().into_owned().into())
+        .collect();
+
+    // Check directory components
+    for comp in &components[..components.len().saturating_sub(1)] {
+        let lower = comp.to_lowercase();
+        if lower == "tests"
+            || lower == "test"
+            || lower == "spec"
+            || lower == "specs"
+            || lower == "__tests__"
+        {
+            return true;
+        }
+    }
+
+    // Check the file name (last component)
+    if let Some(filename) = components.last() {
+        let lower = filename.to_lowercase();
+        lower.contains(".test.")
+            || lower.contains("_test.")
+            || lower.contains(".spec.")
+            || lower.contains("_spec.")
+            || lower.starts_with("test_")
+    } else {
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sync
 // ---------------------------------------------------------------------------
 
@@ -114,7 +165,32 @@ fn file_mtime_ns(path: &Path) -> std::io::Result<u64> {
 /// imports are re-indexed.
 ///
 /// Files present in the index but absent from the file set are removed.
-pub fn sync(conn: &Connection, project_id: Uuid, root: &Path) -> Result<SyncReport> {
+///
+/// When `allow_skip_when_clean` is true and the git worktree is clean,
+/// returns immediately with an unchanged report without walking the tree.
+pub fn sync(
+    conn: &Connection,
+    project_id: Uuid,
+    root: &Path,
+    allow_skip_when_clean: bool,
+) -> Result<SyncReport> {
+    // Fast path: skip the walk entirely when the worktree is clean.
+    if allow_skip_when_clean && !worktree_changed(root) {
+        let scanned = conn
+            .query_row(
+                "SELECT COUNT(*) FROM indexed_files WHERE project_id = ?1",
+                params![project_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as usize;
+
+        return Ok(SyncReport {
+            scanned,
+            unchanged: scanned,
+            ..Default::default()
+        });
+    }
+
     let mut report = SyncReport::default();
 
     // Collect the current file set, excluding the .cogito directory
@@ -165,7 +241,13 @@ pub fn sync(conn: &Connection, project_id: Uuid, root: &Path) -> Result<SyncRepo
             .query_row(
                 "SELECT size, mtime_ns, content_hash FROM indexed_files WHERE project_id = ?1 AND path = ?2",
                 params![project_id.to_string(), rel_path.to_string_lossy()],
-                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u64)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                    ))
+                },
             )
             .optional()?;
 
@@ -320,87 +402,374 @@ fn reparse_file(
 }
 
 // ---------------------------------------------------------------------------
-// Search
+// Search helpers
 // ---------------------------------------------------------------------------
 
-/// Search symbols and files by name.
-pub fn search(
+/// Build a safe FTS5 MATCH expression from a user query.
+///
+/// Splits on whitespace, quotes each token (escaping embedded quotes),
+/// appends a prefix `*`, then joins with ` AND `.
+fn build_fts_query(query: &str) -> String {
+    let tokens: Vec<String> = query
+        .split_whitespace()
+        .map(|t| {
+            let escaped = t.replace('"', "\"\"");
+            format!("\"{escaped}\"*")
+        })
+        .collect();
+    tokens.join(" AND ")
+}
+
+/// Compute a match-tier score for a hit given the query tokens.
+///
+/// Higher tier = better match:
+/// - 3.0: case-insensitive exact name match
+/// - 2.0: name starts with query (prefix match)
+/// - 1.0: name contains query (substring match)
+/// - 0.0: token appears in FTS5 but not in name (FTS5 matched path or doc)
+fn name_match_tier(name: &str, query: &str) -> f64 {
+    let lower_name = name.to_lowercase();
+    let query_lower = query.to_lowercase();
+    if lower_name == query_lower {
+        3.0
+    } else if lower_name.starts_with(&query_lower) {
+        2.0
+    } else if lower_name.contains(&query_lower) {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// Escape SQL LIKE meta-characters so they are matched literally.
+fn like_escape(query: &str) -> String {
+    query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// Run an FTS5 search using a two-phase bounded approach.
+///
+/// Phase 1 (no ORDER BY): collect up to `candidates` rowids per class cheaply,
+/// so FTS5 terminates early on common tokens.
+///
+/// Phase 2: fetch full rows by rowid and rank in Rust by match-tier,
+/// non-test before test, then path, then line.
+fn fts_search(
     conn: &Connection,
     project_id: Uuid,
+    fts_query: &str,
     query: &str,
-    limit: usize,
+    candidates: usize,
 ) -> Result<Vec<SearchHit>> {
-    let mut hits = Vec::new();
+    if fts_query.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    // Symbol search via FTS5
-    let fts_query = format!("\"{query}\"*");
-    if let Ok(mut stmt) = conn.prepare(
-        r#"SELECT s.name, s.path, s.start_line, s.kind
-           FROM indexed_symbols s
-           JOIN indexed_symbols_fts f ON s.rowid = f.rowid
-           WHERE indexed_symbols_fts MATCH ?1 AND s.project_id = ?2
-           ORDER BY rank
-           LIMIT ?3"#,
+    let mut hits = Vec::new();
+    let sym_candidates = candidates;
+    let file_candidates = candidates / 2;
+
+    // ── Phase 1: symbol rowids (no ORDER BY) ─────────────────────────────────
+    let sym_rowids: Vec<i64> = match conn.prepare(
+        "SELECT rowid FROM indexed_symbols_fts WHERE indexed_symbols_fts MATCH ?1 LIMIT ?2",
     ) {
-        let rows = stmt.query_map(
-            params![fts_query, project_id.to_string(), limit as i64],
-            |row| {
+        Ok(mut stmt) => stmt
+            .query_map(params![fts_query, sym_candidates as i64], |row| row.get(0))
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
+    // ── Phase 2: fetch symbol rows by rowid, rank in Rust ───────────────────
+    if !sym_rowids.is_empty() {
+        let placeholders: String = sym_rowids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT name, path, start_line, kind FROM indexed_symbols \
+             WHERE project_id = ?1 AND rowid IN ({placeholders})"
+        );
+        let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project_id.to_string())];
+        for &id in &sym_rowids {
+            all_params.push(Box::new(id));
+        }
+        let param_refs: Vec<&dyn rusqlite::ToSql> = all_params.iter().map(|b| b.as_ref()).collect();
+
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, String>(3)?,
                 ))
-            },
-        );
-        if let Ok(rows) = rows {
-            for row in rows.flatten() {
-                hits.push(SearchHit {
-                    kind: "symbol",
-                    name: row.0,
-                    path: PathBuf::from(&row.1),
-                    line: row.2 as usize,
-                    score: 1.0,
-                });
+            });
+            if let Ok(rows) = rows {
+                for row in rows.flatten() {
+                    let path = PathBuf::from(&row.1);
+                    hits.push(SearchHit {
+                        kind: "symbol",
+                        name: row.0.clone(),
+                        path: path.clone(),
+                        line: row.2 as usize,
+                        score: name_match_tier(&row.0, query),
+                        is_test: is_test_path(&path),
+                    });
+                }
             }
         }
     }
 
-    // File search via file FTS5
-    if let Ok(mut stmt) = conn.prepare(
-        r#"SELECT f.path, f.is_doc
-           FROM indexed_files f
-           JOIN indexed_files_fts ft ON f.rowid = ft.rowid
-           WHERE indexed_files_fts MATCH ?1 AND f.project_id = ?2
-           ORDER BY rank
-           LIMIT ?3"#,
-    ) {
-        let rows = stmt.query_map(
-            params![fts_query, project_id.to_string(), (limit / 2) as i64],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?)),
+    // ── Phase 1: file rowids (no ORDER BY) ───────────────────────────────────
+    let file_rowids: Vec<i64> = match conn
+        .prepare("SELECT rowid FROM indexed_files_fts WHERE indexed_files_fts MATCH ?1 LIMIT ?2")
+    {
+        Ok(mut stmt) => stmt
+            .query_map(params![fts_query, file_candidates as i64], |row| row.get(0))
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
+    // ── Phase 2: fetch file rows by rowid, rank in Rust ─────────────────────
+    if !file_rowids.is_empty() {
+        let placeholders: String = file_rowids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT path, is_doc FROM indexed_files \
+             WHERE project_id = ?1 AND rowid IN ({placeholders})"
         );
-        if let Ok(rows) = rows {
-            for row in rows.flatten() {
-                hits.push(SearchHit {
-                    kind: if row.1 == 1 { "doc" } else { "file" },
-                    name: Path::new(&row.0)
+        let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project_id.to_string())];
+        for &id in &file_rowids {
+            all_params.push(Box::new(id));
+        }
+        let param_refs: Vec<&dyn rusqlite::ToSql> = all_params.iter().map(|b| b.as_ref()).collect();
+
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+            });
+            if let Ok(rows) = rows {
+                for row in rows.flatten() {
+                    let path = PathBuf::from(&row.0);
+                    let filename = path
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default(),
-                    path: PathBuf::from(&row.0),
-                    line: 0,
-                    score: 0.5,
-                });
+                        .unwrap_or_default();
+                    hits.push(SearchHit {
+                        kind: if row.1 == 1 { "doc" } else { "file" },
+                        name: filename.clone(),
+                        path: path.clone(),
+                        line: 0,
+                        score: name_match_tier(&filename, query),
+                        is_test: is_test_path(&path),
+                    });
+                }
             }
         }
     }
 
-    // Sort by score descending, then trim
+    Ok(hits)
+}
+
+/// Fall back to a LIKE scan when the FTS5 expression is invalid.
+///
+/// LIKE scans use bounded candidates and rank in Rust, matching the two-phase
+/// approach for consistency.
+fn like_fallback(
+    conn: &Connection,
+    project_id: Uuid,
+    query: &str,
+    candidates: usize,
+) -> Result<Vec<SearchHit>> {
+    let escaped = like_escape(query);
+    let pattern = format!("%{escaped}%");
+    let mut hits = Vec::new();
+
+    // Symbol LIKE scan
+    let sym_rowids: Vec<i64> = match conn.prepare(
+        "SELECT rowid FROM indexed_symbols \
+         WHERE project_id = ?1 AND name LIKE ?2 LIMIT ?3",
+    ) {
+        Ok(mut stmt) => stmt
+            .query_map(
+                params![project_id.to_string(), &pattern, candidates as i64],
+                |row| row.get(0),
+            )
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
+    if !sym_rowids.is_empty() {
+        let placeholders: String = sym_rowids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT name, path, start_line, kind FROM indexed_symbols \
+             WHERE project_id = ?1 AND rowid IN ({placeholders})"
+        );
+        let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project_id.to_string())];
+        for &id in &sym_rowids {
+            all_params.push(Box::new(id));
+        }
+        let param_refs: Vec<&dyn rusqlite::ToSql> = all_params.iter().map(|b| b.as_ref()).collect();
+
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            });
+            if let Ok(rows) = rows {
+                for row in rows.flatten() {
+                    let path = PathBuf::from(&row.1);
+                    hits.push(SearchHit {
+                        kind: "symbol",
+                        name: row.0.clone(),
+                        path: path.clone(),
+                        line: row.2 as usize,
+                        score: name_match_tier(&row.0, query),
+                        is_test: is_test_path(&path),
+                    });
+                }
+            }
+        }
+    }
+
+    // File LIKE scan
+    let file_rowids: Vec<i64> = match conn.prepare(
+        "SELECT rowid FROM indexed_files \
+         WHERE project_id = ?1 AND path LIKE ?2 LIMIT ?3",
+    ) {
+        Ok(mut stmt) => stmt
+            .query_map(
+                params![project_id.to_string(), &pattern, (candidates / 2) as i64],
+                |row| row.get(0),
+            )
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
+    if !file_rowids.is_empty() {
+        let placeholders: String = file_rowids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT path, is_doc FROM indexed_files \
+             WHERE project_id = ?1 AND rowid IN ({placeholders})"
+        );
+        let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project_id.to_string())];
+        for &id in &file_rowids {
+            all_params.push(Box::new(id));
+        }
+        let param_refs: Vec<&dyn rusqlite::ToSql> = all_params.iter().map(|b| b.as_ref()).collect();
+
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+            });
+            if let Ok(rows) = rows {
+                for row in rows.flatten() {
+                    let path = PathBuf::from(&row.0);
+                    let filename = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    hits.push(SearchHit {
+                        kind: if row.1 == 1 { "doc" } else { "file" },
+                        name: filename.clone(),
+                        path: path.clone(),
+                        line: 0,
+                        score: name_match_tier(&filename, query),
+                        is_test: is_test_path(&path),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(hits)
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+/// Search symbols and files by name.
+///
+/// Tokens are split on whitespace, each token is quoted and prefixed with `*`,
+/// then joined with ` AND ` to form a safe FTS5 MATCH expression. If the
+/// expression produces an FTS5 error (e.g. a lone `*` or `"`) a LIKE scan over
+/// `indexed_symbols.name` and `indexed_files.path` is used instead.
+///
+/// Phase 1 collects candidate rowids without ORDER BY so FTS5 terminates early
+/// on common tokens. Phase 2 fetches those rows and ranks them in Rust.
+///
+/// Results are sorted: symbols before files; within each class, non-test paths
+/// before test paths; then by match-tier (exact > prefix > contains > other);
+/// then by path; then by line number.
+pub fn search(
+    conn: &Connection,
+    project_id: Uuid,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>> {
+    let fts_query = build_fts_query(query);
+    let candidates = (limit * 20).clamp(200, 2000);
+
+    // Try two-phase FTS5 search first
+    let mut hits = fts_search(conn, project_id, &fts_query, query, candidates)?;
+
+    // If FTS returned nothing and the query had meaningful content, fall back to LIKE
+    if hits.is_empty() && !fts_query.trim().is_empty() && !query.trim().is_empty() {
+        hits = like_fallback(conn, project_id, query, candidates)?;
+    }
+
+    // Sort: symbols before files, within each class non-test before test,
+    // then match-tier (higher = better), then path, then line.
     hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        // Class: symbol = 0, file/doc = 1
+        let a_class = if a.kind == "symbol" { 0 } else { 1 };
+        let b_class = if b.kind == "symbol" { 0 } else { 1 };
+        if a_class != b_class {
+            return a_class.cmp(&b_class);
+        }
+        // Within class: non-test before test
+        if a.is_test != b.is_test {
+            return a.is_test.cmp(&b.is_test); // false < true
+        }
+        // Within class+test: match-tier (higher = better)
+        if (a.score - b.score).abs() > 1e-9 {
+            return b
+                .score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal);
+        }
+        // Tie-break: path
+        let path_cmp = a.path.cmp(&b.path);
+        if path_cmp != std::cmp::Ordering::Equal {
+            return path_cmp;
+        }
+        // Tie-break: line
+        a.line.cmp(&b.line)
     });
+
     hits.truncate(limit);
     Ok(hits)
 }
@@ -534,6 +903,10 @@ pub fn worktree_changed(root: &Path) -> bool {
     false
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,5 +927,62 @@ mod tests {
             ..Default::default()
         };
         assert!(with_added.changed());
+    }
+
+    #[test]
+    fn test_is_test_path() {
+        // Test directory components
+        assert!(is_test_path(Path::new("apps/web/tests/auth.test.ts")));
+        assert!(is_test_path(Path::new(
+            "packages/utils/test/helpers.spec.ts"
+        )));
+        assert!(is_test_path(Path::new(
+            "src/__tests__/integration.spec.tsx"
+        )));
+        assert!(is_test_path(Path::new("spec/unit.spec.js")));
+
+        // Test file name patterns
+        assert!(is_test_path(Path::new("lib/math.test.ts")));
+        assert!(is_test_path(Path::new("lib/math_spec.ts")));
+        assert!(is_test_path(Path::new("helpers_test.py")));
+        assert!(is_test_path(Path::new("helpers.spec.js")));
+
+        // Not test paths
+        assert!(!is_test_path(Path::new("apps/web/lib/auth/server.ts")));
+        assert!(!is_test_path(Path::new("src/main.rs")));
+        assert!(!is_test_path(Path::new("packages/core/src/lib.rs")));
+        assert!(!is_test_path(Path::new("docs/guide.md")));
+        assert!(!is_test_path(Path::new("README.md")));
+
+        // Edge: no components
+        assert!(!is_test_path(Path::new("")));
+    }
+
+    #[test]
+    fn test_build_fts_query() {
+        assert_eq!(build_fts_query("foo bar"), "\"foo\"* AND \"bar\"*");
+        // A leading double-quote is escaped by doubling it for FTS5
+        assert_eq!(build_fts_query("\"foo"), "\"\"\"foo\"*");
+        // An embedded double-quote is also doubled
+        assert_eq!(build_fts_query("foo\"bar"), "\"foo\"\"bar\"*");
+        assert_eq!(build_fts_query(""), "");
+        assert_eq!(build_fts_query("  "), "");
+    }
+
+    #[test]
+    fn test_name_match_tier() {
+        // Exact match
+        assert_eq!(name_match_tier("process_data", "process_data"), 3.0);
+        assert_eq!(name_match_tier("Process_Data", "process_data"), 3.0);
+
+        // Prefix match
+        assert_eq!(name_match_tier("process_data", "process"), 2.0);
+        assert_eq!(name_match_tier("Process_Data", "PROCESS"), 2.0);
+
+        // Substring match
+        assert_eq!(name_match_tier("my_process_data", "process"), 1.0);
+
+        // Other (matched by FTS5 but not by name)
+        assert_eq!(name_match_tier("foo", "bar"), 0.0);
     }
 }

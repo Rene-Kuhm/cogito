@@ -217,15 +217,36 @@ impl Cogito {
     /// synced first and any change (added, modified, removed file) forces a
     /// regeneration so `fingerprint.files` and `fingerprint.symbols` always
     /// reflect the current working tree.
+    ///
+    /// The fast skip path (`allow_skip_when_clean = true`) is used only when
+    /// a valid stored fingerprint exists and `HEAD` has not moved: the
+    /// `worktree_changed()` check then avoids re-walking the tree.
     pub async fn fingerprint(
         &self,
         project: &Project,
         refresh: bool,
     ) -> Result<(Fingerprint, bool)> {
-        // Sync the index first. Even when the git HEAD matches, a working-tree
-        // change makes the fingerprint stale.
+        // Load stored fingerprint before syncing so we know whether to allow
+        // the fast skip path.
+        let stored = if self.sqlite.is_some() {
+            self.stored_fingerprint(project.id)?
+        } else {
+            None
+        };
+
+        let can_skip = !refresh
+            && stored.is_some()
+            && stored
+                .as_ref()
+                .map(|s| s.format >= fingerprint::FINGERPRINT_FORMAT)
+                .unwrap_or(false)
+            && stored
+                .as_ref()
+                .map(|s| s.head == fingerprint::current_head(&project.path))
+                .unwrap_or(false);
+
         let index_changed = if let Some(conn) = self.connection() {
-            let report = crate::index::sync(&conn, project.id, &project.path)?;
+            let report = crate::index::sync(&conn, project.id, &project.path, can_skip)?;
             report.changed()
         } else {
             false
@@ -233,11 +254,15 @@ impl Cogito {
 
         if !refresh
             && !index_changed
-            && let Some(stored) = self.stored_fingerprint(project.id)?
-            && stored.format >= fingerprint::FINGERPRINT_FORMAT
-            && stored.head == fingerprint::current_head(&project.path)
+            && stored
+                .as_ref()
+                .map(|s| {
+                    s.format >= fingerprint::FINGERPRINT_FORMAT
+                        && s.head == fingerprint::current_head(&project.path)
+                })
+                .unwrap_or(false)
         {
-            return Ok((stored, false));
+            return Ok((stored.unwrap(), false));
         }
         Ok((self.generate_fingerprint(project).await?, true))
     }
