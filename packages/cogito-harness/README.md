@@ -5,10 +5,12 @@ Pi extension that wires [Cogito](https://github.com/Rene-Kuhm/cogito-harness) in
 
 ## What it does
 
-1. **Scans at session start.** The project's code fingerprint is regenerated
-   in the background and stored, so the MCP `project_map` tool answers from
-   the current code without scanning. The scan never blocks the
-   session and is capped at 30 seconds.
+1. **Puts a project card in the system prompt.** At session start it loads a
+   ~250-token summary (modules, busiest files, how to look code up),
+   rescanning only if `HEAD` moved, and adds it to every turn's system prompt
+   as `<cogito_project>`. It is identical between turns, so the provider
+   serves it from its prompt cache, and the model starts each answer knowing
+   the layout without spending a tool call on orientation.
 2. **Shows status.** The status line reports whether Cogito is ready for the
    current project.
 3. **Adds `/cogito`.**
@@ -37,7 +39,8 @@ cogito setup gentle-shell
 ## MCP tools
 
 This package is the *session* adapter. The MCP tools
-(`project_map`, `related_files`, `search_code`, `add_tag`) come from Pi's
+(`project_map`, `search_code`, `file_outline`, `related_files`, `add_tag`)
+come from Pi's
 built-in MCP and are registered by `cogito setup`, which writes:
 
 ```json

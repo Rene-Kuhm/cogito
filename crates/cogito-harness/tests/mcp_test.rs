@@ -89,7 +89,13 @@ fn test_mcp_lists_the_map_tools_only() {
     // purpose: they belong to the agent's memory, not to Cogito.
     assert_eq!(
         tool_names(&send_jsonrpc(messages)),
-        ["add_tag", "project_map", "related_files", "search_code"]
+        [
+            "add_tag",
+            "file_outline",
+            "project_map",
+            "related_files",
+            "search_code"
+        ]
     );
 }
 
@@ -124,7 +130,7 @@ fn test_mcp_map_tools_on_a_workspace() {
     write("apps/web/tsconfig.json", "{}");
     write(
         "apps/web/lib/session.ts",
-        "import { x } from '@m/shared';\n",
+        "import { x } from '@m/shared';\n\nexport function requireSession(token: string): boolean {\n  return x > 0;\n}\n",
     );
     write("apps/web/app/page.tsx", "import '@/lib/session';\n");
 
@@ -140,7 +146,8 @@ fn test_mcp_map_tools_on_a_workspace() {
     let map = call(2, "project_map", "");
     let related = call(3, "related_files", r#","file":"lib/session.ts""#);
     let search = call(4, "search_code", r#","query":"session""#);
-    let output = send_jsonrpc(vec![init, ready, &map, &related, &search]);
+    let outline = call(5, "file_outline", r#","file":"lib/session.ts""#);
+    let output = send_jsonrpc(vec![init, ready, &map, &related, &search, &outline]);
 
     let map = tool_text(&output, 2);
     assert!(map.contains("2 modules"), "{map}");
@@ -163,6 +170,16 @@ fn test_mcp_map_tools_on_a_workspace() {
 
     let search = tool_text(&output, 4);
     assert!(search.contains("apps/web/lib/session.ts"), "{search}");
+    assert!(
+        search.contains("function requireSession apps/web/lib/session.ts:3"),
+        "{search}"
+    );
+
+    let outline = tool_text(&output, 5);
+    assert!(
+        outline.contains("3-5 export function requireSession(token: string): boolean"),
+        "{outline}"
+    );
 }
 
 #[test]

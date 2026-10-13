@@ -226,7 +226,7 @@ impl Cogito {
     ) -> Result<(Fingerprint, bool)> {
         if !refresh
             && let Some(stored) = self.stored_fingerprint(project.id)?
-            && !stored.files.is_empty()
+            && stored.format >= fingerprint::FINGERPRINT_FORMAT
             && stored.head == fingerprint::current_head(&project.path)
         {
             return Ok((stored, false));

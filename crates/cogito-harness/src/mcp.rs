@@ -28,13 +28,14 @@ use uuid::Uuid;
 pub const SERVER_NAME: &str = "cogito";
 
 /// What the client tells the model about this server.
-const INSTRUCTIONS: &str = "Cogito keeps a map of the project's code so you can find your way \
-without reading it. When you start working in a repository, call project_map before listing \
-directories or opening files to orient yourself; use related_files to see what a file imports \
-and what imports it, and search_code to locate code by path, module or tag. The map is \
-refreshed automatically when HEAD changes; pass refresh=true after large uncommitted changes. \
-Cogito is not a memory: it stores no decisions or session notes, keep those in your memory \
-tool. Every tool takes `path`, the absolute project root.";
+const INSTRUCTIONS: &str = "Cogito indexes the project's code so you can answer without reading \
+it. Cheapest path first: project_map to orient (once per session); search_code to find a \
+symbol, file or module by name (it gives file:line); file_outline to see a file's declarations \
+with line ranges; then read only the lines you need. related_files shows what a file imports \
+and what imports it. Avoid listing directories, grepping or reading whole files to find your \
+way. The index refreshes when HEAD changes; pass refresh=true to project_map after large \
+uncommitted changes. Cogito is not a memory: keep decisions and notes in your memory tool. \
+Every tool takes `path`, the absolute project root.";
 
 // ============================================================
 // Requests
@@ -155,20 +156,32 @@ impl CogitoServer {
     }
 
     #[tool(
-        description = "Find code by words: matching file paths (most changed first), modules and tags."
+        description = "A file's declarations with line ranges (functions with their signature). Read only the range you need instead of the whole file."
+    )]
+    async fn file_outline(
+        &self,
+        Parameters(req): Parameters<RelatedFilesRequest>,
+    ) -> Result<String, String> {
+        let (_, project, fingerprint) = mapped_project(&req.path, false).await?;
+        let file = cogito_harness_core::map::find_file(&project.path, &fingerprint, &req.file)?;
+        cogito_harness_core::map::render_outline(&project.path, &fingerprint, &file)
+    }
+
+    #[tool(
+        description = "Find code by words: symbols (function, type, class names) with file:line, file paths (most changed first), modules and tags."
     )]
     async fn search_code(
         &self,
         Parameters(req): Parameters<SearchCodeRequest>,
     ) -> Result<String, String> {
         let (cogito, project, fingerprint) = mapped_project(&req.path, false).await?;
-        let (files, modules) =
-            cogito_harness_core::map::search_paths(&project.path, &fingerprint, &req.query);
+        let found = cogito_harness_core::map::search_paths(&project.path, &fingerprint, &req.query);
+        let (files, modules, symbols) = (found.files, found.modules, found.symbols);
         let tags = cogito
             .search_tags(project.id, &req.query)
             .map_err(|e| format!("Failed to search tags: {e}"))?;
 
-        if files.is_empty() && modules.is_empty() && tags.is_empty() {
+        if files.is_empty() && modules.is_empty() && symbols.is_empty() && tags.is_empty() {
             return Ok(format!("Nothing matches \"{}\".", req.query));
         }
         let mut out = String::new();
@@ -179,6 +192,9 @@ impl CogitoServer {
                     tag.paths.iter().map(|p| p.display().to_string()).collect();
                 out.push_str(&format!("  {}: {}\n", tag.tag, paths.join(", ")));
             }
+        }
+        if !symbols.is_empty() {
+            out.push_str(&format!("Symbols:\n  {}\n", symbols.join("\n  ")));
         }
         if !modules.is_empty() {
             out.push_str(&format!("Modules:\n  {}\n", modules.join("\n  ")));

@@ -44,6 +44,8 @@ pub async fn generate(project: &Project) -> Result<Fingerprint> {
         .collect();
     files.sort();
 
+    let symbols = index_symbols(root, &files);
+
     let mut hot_zones = Vec::new();
     let mut warm_zones = Vec::new();
     let mut cold_zones = Vec::new();
@@ -82,7 +84,37 @@ pub async fn generate(project: &Project) -> Result<Fingerprint> {
         files,
         modules,
         head: current_head(root),
+        symbols,
+        format: FINGERPRINT_FORMAT,
     })
+}
+
+/// Current fingerprint layout. Bump it when a scan starts recording something
+/// tools depend on, so fingerprints stored by older versions are regenerated.
+pub const FINGERPRINT_FORMAT: u32 = 2;
+
+/// Declarations of every code file. Files that cannot be read are skipped.
+fn index_symbols(root: &Path, files: &[PathBuf]) -> Vec<Symbol> {
+    let mut symbols = Vec::new();
+    for file in files {
+        let Some(ext) = file.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(root.join(file)) else {
+            continue;
+        };
+        symbols.extend(
+            crate::map::outline::declarations(&content, ext)
+                .into_iter()
+                .map(|d| Symbol {
+                    name: d.name,
+                    kind: d.kind,
+                    file: file.clone(),
+                    line: d.start,
+                }),
+        );
+    }
+    symbols
 }
 
 /// Extensions of every language Cogito knows, so a polyglot repository's map

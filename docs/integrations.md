@@ -141,7 +141,7 @@ Any MCP-capable client works if you add the server yourself:
 }
 ```
 
-Cogito exposes four tools, each taking an explicit `path` to the project root.
+Cogito exposes five tools, each taking an explicit `path` to the project root.
 They give the agent the project's layout so it can find its way without
 reading the code:
 
@@ -149,7 +149,8 @@ reading the code:
 |---|---|
 | `project_map` | Modules with entry point, size, most changed files and which modules they use. Read it before exploring the repository |
 | `related_files` | What one file imports, what imports it, and its external packages |
-| `search_code` | Find code by words in file paths, module names and tags |
+| `search_code` | Find code by words: symbols (functions, types, classes) with `file:line`, file paths, module names and tags |
+| `file_outline` | A file's declarations with line ranges, so only the needed range is read |
 | `add_tag` | Label code locations so `search_code` finds them by that word |
 
 The map is stored after each scan and reused until `HEAD` moves, so these calls
