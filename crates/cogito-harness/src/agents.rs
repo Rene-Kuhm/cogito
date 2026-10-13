@@ -372,17 +372,70 @@ export const CogitoPlugin = async ({ directory, $ }) => {
 export default CogitoPlugin;
 "#;
 
+/// The Claude Code PreToolUse guardrail. The decision lives in the binary
+/// (`cogito hook claude-pre-tool-use`) so it is tested Rust, not shell, and
+/// needs no `jq`; Claude Code's hook JSON passes through on stdin.
+const CLAUDE_GUARD_SCRIPT: &str = r#"#!/bin/sh
+# Cogito PreToolUse hook (Read, Grep).
+#
+# The first time Claude reads a large file whole, or greps for a plain name,
+# it gets Cogito's outline or search result instead (exit 2, message on
+# stderr). Repeating the exact same call goes through. Any problem exits 0, so
+# a tool call is never blocked by accident.
+
+command -v cogito >/dev/null 2>&1 || exit 0
+exec cogito hook claude-pre-tool-use
+"#;
+
+/// One hook Cogito registers in an agent's settings.
+#[derive(Debug, Clone)]
+pub struct HookSpec {
+    /// Settings key, e.g. `SessionStart`.
+    pub event: &'static str,
+    /// Which sources or tools the hook applies to (a regex in Claude Code).
+    pub matcher: &'static str,
+    pub script: PathBuf,
+    pub content: &'static str,
+    /// Seconds the agent waits for the hook.
+    pub timeout: u64,
+}
+
 impl Agent {
+    /// Hooks Cogito installs for this agent.
+    pub fn hooks(self, home: &Path) -> Vec<HookSpec> {
+        match self {
+            Agent::ClaudeCode => vec![
+                HookSpec {
+                    event: "SessionStart",
+                    matcher: "^(startup|resume|clear|compact|fork)$",
+                    script: home.join(".claude/hooks/cogito-session-start.sh"),
+                    content: CLAUDE_HOOK_SCRIPT,
+                    timeout: HOOK_TIMEOUT_SECS,
+                },
+                HookSpec {
+                    event: "PreToolUse",
+                    matcher: "^(Read|Grep)$",
+                    script: home.join(".claude/hooks/cogito-pre-tool-use.sh"),
+                    content: CLAUDE_GUARD_SCRIPT,
+                    timeout: GUARD_TIMEOUT_SECS,
+                },
+            ],
+            _ => Vec::new(),
+        }
+    }
+
     /// Files Cogito writes besides the agent's main configuration file.
     pub fn extra_files(self, home: &Path, _binary: &Path) -> Vec<ExtraFile> {
         match self {
-            Agent::ClaudeCode => vec![ExtraFile {
-                path: self
-                    .hook_script_path(home)
-                    .expect("ClaudeCode has a hook script path"),
-                content: CLAUDE_HOOK_SCRIPT.to_string(),
-                executable: true,
-            }],
+            Agent::ClaudeCode => self
+                .hooks(home)
+                .into_iter()
+                .map(|hook| ExtraFile {
+                    path: hook.script,
+                    content: hook.content.to_string(),
+                    executable: true,
+                })
+                .collect(),
             Agent::Opencode => vec![ExtraFile {
                 path: home.join(".config/opencode/plugins/cogito.js"),
                 content: OPENCODE_PLUGIN.to_string(),
@@ -392,20 +445,21 @@ impl Agent {
         }
     }
 
-    /// Whether this agent supports a session-start hook in its config file.
+    /// Whether this agent gets hooks in its config file.
     fn has_session_hook(self) -> bool {
-        matches!(self, Agent::ClaudeCode)
+        !self.hooks(Path::new("")).is_empty()
     }
 
-    /// Canonical path of this agent's session-hook script.
+    /// Canonical path of this agent's session-start hook script.
     ///
     /// Independent of the installed binary so that detecting, writing and
     /// removing the hook entry always agree on the same file.
+    #[cfg(test)]
     pub fn hook_script_path(self, home: &Path) -> Option<PathBuf> {
-        match self {
-            Agent::ClaudeCode => Some(home.join(".claude/hooks/cogito-session-start.sh")),
-            _ => None,
-        }
+        self.hooks(home)
+            .into_iter()
+            .find(|h| h.event == "SessionStart")
+            .map(|h| h.script)
     }
 }
 
@@ -603,33 +657,33 @@ fn hook_registered(agent: Agent, home: &Path) -> Result<bool> {
     if !agent.has_session_hook() {
         return Ok(true);
     }
-    let (Some(hook_path), Some(script)) =
-        (hook_config_path(agent, home), agent.hook_script_path(home))
-    else {
+    let Some(hook_path) = hook_config_path(agent, home) else {
         return Ok(true);
     };
     if !hook_path.exists() {
         return Ok(false);
     }
     let settings = read_json(&hook_path)?;
-    // Registered and synchronous: an `async` hook's output never reaches the
-    // session, so an entry from an earlier version counts as outdated.
-    Ok(settings
-        .get("hooks")
-        .and_then(|h| h.get("SessionStart"))
-        .and_then(|s| s.as_array())
-        .is_some_and(|entries| {
-            entries.iter().any(|e| {
-                e.get("hooks")
-                    .and_then(|h| h.as_array())
-                    .is_some_and(|hooks| {
-                        hooks.iter().any(|h| {
-                            owns_command(h, &script)
-                                && h.get("async").and_then(|a| a.as_bool()) != Some(true)
+    // Every hook registered and synchronous: an `async` hook's output never
+    // reaches the session, so an entry from an earlier version is outdated.
+    Ok(agent.hooks(home).iter().all(|spec| {
+        settings
+            .get("hooks")
+            .and_then(|h| h.get(spec.event))
+            .and_then(|s| s.as_array())
+            .is_some_and(|entries| {
+                entries.iter().any(|e| {
+                    e.get("hooks")
+                        .and_then(|h| h.as_array())
+                        .is_some_and(|hooks| {
+                            hooks.iter().any(|h| {
+                                owns_command(h, &spec.script)
+                                    && h.get("async").and_then(|a| a.as_bool()) != Some(true)
+                            })
                         })
-                    })
+                })
             })
-        }))
+    }))
 }
 
 /// Inspect how `agent` is configured, relative to what `binary` would write.
@@ -829,11 +883,12 @@ pub fn install(
 
     if agent.has_session_hook()
         && let Some(hook_path) = hook_config_path(agent, home)
-        && let Some(hook_script) = agent.hook_script_path(home)
     {
         let _ = backup_file(&hook_path)?;
         let mut settings = read_json_or_default(&hook_path);
-        upsert_session_hook(&mut settings, &hook_script)?;
+        for spec in agent.hooks(home) {
+            upsert_hook(&mut settings, &spec)?;
+        }
         write_json(&hook_path, &settings)?;
     }
 
@@ -892,12 +947,13 @@ pub fn uninstall(agent: Agent, home: &Path) -> Result<Change> {
 
     if agent.has_session_hook()
         && let Some(hook_path) = hook_config_path(agent, home)
-        && let Some(hook_script) = agent.hook_script_path(home)
         && hook_path.exists()
     {
         let _ = backup_file(&hook_path)?;
         let mut settings = read_json(&hook_path)?;
-        remove_session_hook(&mut settings, &hook_script);
+        for spec in agent.hooks(home) {
+            remove_hook(&mut settings, &spec);
+        }
         write_json(&hook_path, &settings)?;
     }
 
@@ -909,10 +965,10 @@ pub fn uninstall(agent: Agent, home: &Path) -> Result<Change> {
 // Helpers
 // ============================================================
 
-/// Insert a `SessionStart` hook into a Claude-Code-style settings object.
-///
-/// Idempotent: an entry whose command already mentions Cogito is left alone.
-fn upsert_session_hook(value: &mut Value, script: &Path) -> Result<()> {
+/// Insert (or repair) one of Cogito's hooks in a Claude-Code-style settings
+/// object. Idempotent.
+fn upsert_hook(value: &mut Value, spec: &HookSpec) -> Result<()> {
+    let script = spec.script.as_path();
     let obj = value.as_object_mut().context("settings is not an object")?;
     let hooks = obj
         .entry("hooks")
@@ -920,10 +976,10 @@ fn upsert_session_hook(value: &mut Value, script: &Path) -> Result<()> {
         .as_object_mut()
         .context("`hooks` is not an object")?;
     let session_start = hooks
-        .entry("SessionStart")
+        .entry(spec.event)
         .or_insert_with(|| json!([]))
         .as_array_mut()
-        .context("`hooks.SessionStart` is not an array")?;
+        .with_context(|| format!("`hooks.{}` is not an array", spec.event))?;
 
     // Match on the exact script path. A substring match on "cogito" would
     // also claim an unrelated hook that merely mentions the word, for example
@@ -941,18 +997,18 @@ fn upsert_session_hook(value: &mut Value, script: &Path) -> Result<()> {
                 for hook in hooks.iter_mut().filter(|h| owns_command(h, script)) {
                     if let Some(hook) = hook.as_object_mut() {
                         hook.remove("async");
-                        hook.insert("timeout".into(), json!(HOOK_TIMEOUT_SECS));
+                        hook.insert("timeout".into(), json!(spec.timeout));
                         hook.insert("command".into(), json!(wanted));
                     }
                 }
             }
         }
         None => session_start.push(json!({
-            "matcher": "^(startup|resume|clear|compact|fork)$",
+            "matcher": spec.matcher,
             "hooks": [{
                 "type": "command",
                 "command": wanted,
-                "timeout": HOOK_TIMEOUT_SECS,
+                "timeout": spec.timeout,
             }]
         })),
     }
@@ -962,6 +1018,9 @@ fn upsert_session_hook(value: &mut Value, script: &Path) -> Result<()> {
 /// Seconds Claude Code waits for the hook. The card prints in milliseconds
 /// from a stored index; this covers a first scan of a large repository.
 const HOOK_TIMEOUT_SECS: u64 = 30;
+
+/// Seconds Claude Code waits for the guardrail before running the tool anyway.
+const GUARD_TIMEOUT_SECS: u64 = 15;
 
 /// Whether one hook object runs Cogito's script.
 fn owns_command(hook: &Value, script: &Path) -> bool {
@@ -986,14 +1045,14 @@ fn entry_owns_script(entry: &Value, script: &Path) -> bool {
         })
 }
 
-/// Remove Cogito-owned entries from a Claude-Code-style `SessionStart` hook list.
-fn remove_session_hook(value: &mut Value, script: &Path) {
+/// Remove one of Cogito's hooks from a Claude-Code-style settings object.
+fn remove_hook(value: &mut Value, spec: &HookSpec) {
     if let Some(arr) = value
         .get_mut("hooks")
-        .and_then(|h| h.get_mut("SessionStart"))
+        .and_then(|h| h.get_mut(spec.event))
         .and_then(|s| s.as_array_mut())
     {
-        arr.retain(|entry| !entry_owns_script(entry, script));
+        arr.retain(|entry| !entry_owns_script(entry, &spec.script));
     }
 }
 
@@ -1713,6 +1772,73 @@ mod tests {
         assert_eq!(
             before, after,
             "an unchanged ~/.claude.json must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn test_claude_gets_the_guardrail_hook_and_loses_both_on_uninstall() {
+        let home = TempDir::new().unwrap();
+        std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
+
+        let settings_path = home.path().join(".claude/settings.json");
+        let settings = read_json(&settings_path).unwrap();
+        let pre = &settings["hooks"]["PreToolUse"][0];
+        assert_eq!(pre["matcher"], "^(Read|Grep)$");
+        assert!(
+            pre["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("cogito-pre-tool-use.sh")
+        );
+        assert!(
+            home.path()
+                .join(".claude/hooks/cogito-pre-tool-use.sh")
+                .exists()
+        );
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
+            Status::Configured
+        );
+
+        // Missing only the guardrail entry: outdated, then repaired.
+        let mut partial = settings.clone();
+        partial["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("PreToolUse");
+        write_json(&settings_path, &partial).unwrap();
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
+            Status::Outdated
+        );
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
+        assert_eq!(
+            status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
+            Status::Configured
+        );
+
+        uninstall(Agent::ClaudeCode, home.path()).unwrap();
+        let settings = read_json(&settings_path).unwrap();
+        assert_eq!(settings["hooks"]["SessionStart"], json!([]));
+        assert_eq!(settings["hooks"]["PreToolUse"], json!([]));
+        assert!(
+            !home
+                .path()
+                .join(".claude/hooks/cogito-pre-tool-use.sh")
+                .exists()
         );
     }
 

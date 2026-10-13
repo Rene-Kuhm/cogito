@@ -3,6 +3,7 @@
 //! Intelligent context harness for AI coding agents.
 
 mod agents;
+mod claude_hook;
 mod commands;
 mod mcp;
 
@@ -145,6 +146,13 @@ enum Commands {
 
     /// Show statistics
     Stats,
+
+    /// Run an agent hook (called by the agent, not by hand)
+    #[command(hide = true)]
+    Hook {
+        /// Which hook: `claude-pre-tool-use`
+        name: String,
+    },
 
     /// Print the project map an agent gets from the `project_map` tool
     Map {
@@ -290,10 +298,17 @@ fn setup_logging(verbose: bool, quiet: bool) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    setup_logging(args.verbose, args.quiet);
+    // A hook's stderr is shown to the model, so hooks log nothing.
+    let quiet = args.quiet || matches!(args.command, Some(Commands::Hook { .. }));
+    setup_logging(args.verbose, quiet);
 
     match args.command {
         Some(Commands::Init) => commands::init().await?,
+        Some(Commands::Hook { name }) => match name.as_str() {
+            "claude-pre-tool-use" => claude_hook::run().await,
+            // An unknown hook must never block the agent.
+            _ => std::process::exit(0),
+        },
         Some(Commands::Scan { watch }) => commands::scan(watch).await?,
         Some(Commands::Fingerprint { verbose }) => commands::fingerprint(verbose).await?,
         Some(Commands::Compress {
