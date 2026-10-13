@@ -598,7 +598,7 @@ fn test_search_like_supplements_fts5() {
     fs::write(
         src.join("session.rs"),
         r#"pub fn requireSession() {}
-pub async function requireSession() {}
+pub async fn requireSessionAsync() {}
 "#,
     )
     .unwrap();
