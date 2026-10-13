@@ -57,22 +57,40 @@ fn is_busy(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Performance and correctness PRAGMAs, in the order they run.
+///
+/// `busy_timeout` comes first: the `journal_mode = WAL` switch takes a write
+/// lock, and without the timeout already in force that switch fails at once
+/// under contention instead of waiting for the lock.
+const PRAGMAS: &str = "
+    PRAGMA busy_timeout = 10000;
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA temp_store = MEMORY;
+    PRAGMA mmap_size = 268435456;
+    PRAGMA page_size = 8192;
+    PRAGMA foreign_keys = ON;
+    PRAGMA optimize;
+";
+
 /// Apply performance and correctness PRAGMAs.
 fn apply_pragmas(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "
-        PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = NORMAL;
-        PRAGMA temp_store = MEMORY;
-        PRAGMA mmap_size = 268435456;
-        PRAGMA page_size = 8192;
-        PRAGMA foreign_keys = ON;
-        PRAGMA busy_timeout = 10000;
-        PRAGMA optimize;
-        ",
-    )
-    .context("Failed to apply PRAGMAs")?;
+    conn.execute_batch(PRAGMAS)
+        .context("Failed to apply PRAGMAs")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod pragma_order_tests {
+    use super::PRAGMAS;
+
+    #[test]
+    fn test_busy_timeout_is_set_before_the_wal_switch() {
+        // The WAL switch needs a write lock; the timeout must already apply.
+        let timeout = PRAGMAS.find("busy_timeout").expect("busy_timeout is set");
+        let wal = PRAGMAS.find("journal_mode").expect("WAL is set");
+        assert!(timeout < wal, "busy_timeout must precede journal_mode");
+    }
 }
 
 /// Run migrations. Each version is idempotent.
