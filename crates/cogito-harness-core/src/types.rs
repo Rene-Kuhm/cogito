@@ -189,14 +189,41 @@ pub struct Fingerprint {
     pub frozen_zones: Vec<Zone>,
     pub language: Language,
     pub generated_at: DateTime<Utc>,
+    /// The project's code files, relative to its root.
+    #[serde(default)]
+    pub files: Vec<PathBuf>,
+    /// Sub-projects found by their manifest (a workspace package, a crate…).
+    #[serde(default)]
+    pub modules: Vec<ModuleInfo>,
+    /// The commit `HEAD` pointed at when the scan ran, if the project is a git
+    /// repository. A different `HEAD` means the stored fingerprint is stale.
+    #[serde(default)]
+    pub head: Option<String>,
+}
+
+/// A sub-project inside the scanned project, identified by its manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleInfo {
+    /// Directory relative to the project root.
+    pub path: PathBuf,
+    /// Name from the manifest (`name` in package.json or Cargo.toml), or the
+    /// directory name when the manifest has none.
+    pub name: String,
+    /// Manifest file name, e.g. `package.json`.
+    pub manifest: String,
 }
 
 /// Data flow between modules
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataFlow {
     pub from: PathBuf,
+    /// The import as written in the source, e.g. `./util` or `@scope/pkg`.
     pub to: PathBuf,
     pub flow_type: FlowType,
+    /// The project file the import points at, relative to the project root,
+    /// when it could be resolved. `None` for external packages.
+    #[serde(default)]
+    pub resolved: Option<PathBuf>,
 }
 
 /// Type of data flow

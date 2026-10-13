@@ -54,7 +54,7 @@ Two halves, both written by setup:
 
 1. **`npm:cogito-harness`** in `settings.json` — a Pi package. On `session_start` it
    scans the project in the background and sets a status line, and it adds
-   `/cogito` with `status`, `scan`, `query`, `stats` and `doctor`.
+   `/cogito` with `status`, `map`, `scan`, `query`, `stats` and `doctor`.
 
    ```
    /cogito status
@@ -141,16 +141,23 @@ Any MCP-capable client works if you add the server yourself:
 }
 ```
 
-Cogito exposes six tools, each taking an explicit `path` to the project root:
+Cogito exposes four tools, each taking an explicit `path` to the project root.
+They give the agent the project's layout so it can find its way without
+reading the code:
 
 | Tool | Purpose |
 |---|---|
-| `scan_project` | Generate the code fingerprint |
-| `compress_context` | Reduce context; AST-aware with a `language` hint |
-| `search_knowledge` | Search tags and decisions (FTS5, porter stemming) |
-| `add_decision` | Record an architectural decision |
-| `add_tag` | Tag code paths |
-| `project_stats` | Stored tag/decision counts |
+| `project_map` | Modules with entry point, size, most changed files and which modules they use. Read it before exploring the repository |
+| `related_files` | What one file imports, what imports it, and its external packages |
+| `search_code` | Find code by words in file paths, module names and tags |
+| `add_tag` | Label code locations so `search_code` finds them by that word |
+
+The map is stored after each scan and reused until `HEAD` moves, so these calls
+read no source files. Cogito is not a memory: decisions and session notes
+belong to the agent's memory tool (for example Engram), and Cogito exposes no
+tools for them. On FTTH-Copilot (a 661-file pnpm monorepo) the map costs about
+1,150 tokens, against roughly 11,000 for reading every `package.json` and
+listing the source files.
 
 State lives in `<project>/.cogito/state.db`. One server process can serve many
 projects; each tool call opens the database for the `path` it was given.

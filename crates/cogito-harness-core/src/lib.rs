@@ -26,6 +26,7 @@
 pub mod compressor;
 pub mod decision;
 pub mod fingerprint;
+pub mod map;
 pub mod persistence;
 pub mod semantic;
 pub mod storage;
@@ -208,6 +209,29 @@ impl Cogito {
             crate::storage::sqlite::save_fingerprint(&conn, fingerprint)?;
         }
         Ok(())
+    }
+
+    /// The project's fingerprint, scanning only when needed.
+    ///
+    /// The stored fingerprint is reused unless `refresh` is set, the project
+    /// was never scanned, the stored one predates the current format, or
+    /// `HEAD` moved since it was taken. Returns whether a scan ran.
+    ///
+    /// Uncommitted edits do not trigger a rescan; pass `refresh` after large
+    /// local changes.
+    pub async fn fingerprint(
+        &self,
+        project: &Project,
+        refresh: bool,
+    ) -> Result<(Fingerprint, bool)> {
+        if !refresh
+            && let Some(stored) = self.stored_fingerprint(project.id)?
+            && !stored.files.is_empty()
+            && stored.head == fingerprint::current_head(&project.path)
+        {
+            return Ok((stored, false));
+        }
+        Ok((self.generate_fingerprint(project).await?, true))
     }
 
     /// The fingerprint stored by the last scan, if any.

@@ -18,9 +18,31 @@ const WARM_MIN_COMMITS: usize = 3;
 
 /// Generate fingerprint for a project
 pub async fn generate(project: &Project) -> Result<Fingerprint> {
-    let entry_points = find_entry_points(&project.path, &project.language)?;
-    let data_flows = analyze_data_flows(&project.path, &project.language)?;
-    let zones = detect_zones_path(&project.path)?;
+    let root = &project.path;
+    let entry_points = find_entry_points(root, &project.language)?;
+    let mut data_flows = analyze_data_flows(root, &project.language)?;
+    let zones = detect_zones_path(root)?;
+
+    // Every project file, relative to the root: the layout is derived from it
+    // and import targets are looked up in it.
+    let all_files: Vec<PathBuf> = project_files(root)
+        .filter_map(|entry| entry.path().strip_prefix(root).ok().map(Path::to_path_buf))
+        .collect();
+    let modules = crate::map::layout::find_modules(root, &all_files);
+    let resolver = crate::map::layout::Resolver::new(&all_files, &modules);
+    for flow in &mut data_flows {
+        let from = flow.from.strip_prefix(root).unwrap_or(&flow.from);
+        flow.resolved = resolver.resolve(from, &flow.to.to_string_lossy(), project.language);
+    }
+    let mut files: Vec<PathBuf> = all_files
+        .into_iter()
+        .filter(|f| {
+            f.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| CODE_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        })
+        .collect();
+    files.sort();
 
     let mut hot_zones = Vec::new();
     let mut warm_zones = Vec::new();
@@ -57,7 +79,24 @@ pub async fn generate(project: &Project) -> Result<Fingerprint> {
         frozen_zones,
         language: project.language,
         generated_at: Utc::now(),
+        files,
+        modules,
+        head: current_head(root),
     })
+}
+
+/// Extensions of every language Cogito knows, so a polyglot repository's map
+/// shows all of its code and not only the main language's.
+const CODE_EXTENSIONS: &[&str] = &[
+    "rs", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "go", "java", "cs", "rb",
+    "php", "kt", "kts", "swift", "vue", "svelte", "sql", "prisma", "graphql", "proto",
+];
+
+/// The commit `HEAD` points at, if `path` is inside a git repository.
+pub fn current_head(path: &Path) -> Option<String> {
+    let repo = git2::Repository::discover(path).ok()?;
+    let commit = repo.head().ok()?.peel_to_commit().ok()?;
+    Some(commit.id().to_string())
 }
 
 /// Find entry points based on language conventions
@@ -203,23 +242,62 @@ fn should_skip(path: &Path) -> bool {
 ///
 /// Symlinks are not followed, and ignored directories are pruned rather than
 /// walked and filtered afterwards: a JS monorepo's `node_modules` can hold more
-/// files than the project, and its workspace links form cycles. Entries that
-/// cannot be read are skipped, so one bad path never fails the whole scan.
+/// files than the project, and its workspace links form cycles. In a git
+/// repository, paths `.gitignore` excludes (generated clients, build output)
+/// are skipped too. Entries that cannot be read are skipped, so one bad path
+/// never fails the whole scan.
 fn project_files(path: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+    let repo = git2::Repository::discover(path).ok();
+    let workdir = repo
+        .as_ref()
+        .and_then(|r| r.workdir())
+        .and_then(|w| w.canonicalize().ok());
+    let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
     WalkDir::new(path)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
             // The root is always walked, whatever it is called.
-            entry.depth() == 0
-                || !entry.file_type().is_dir()
-                || !entry
+            if entry.depth() == 0 {
+                return true;
+            }
+            if entry.file_type().is_dir()
+                && entry
                     .file_name()
                     .to_str()
                     .is_some_and(|name| SKIP_DIRS.contains(&name))
+            {
+                return false;
+            }
+            !is_git_ignored(repo.as_ref(), workdir.as_deref(), &root, path, entry.path())
         })
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_file())
+}
+
+/// Whether git ignores `entry` (a path under `walk_root`).
+fn is_git_ignored(
+    repo: Option<&git2::Repository>,
+    workdir: Option<&Path>,
+    root: &Path,
+    walk_root: &Path,
+    entry: &Path,
+) -> bool {
+    let (Some(repo), Some(workdir)) = (repo, workdir) else {
+        return false;
+    };
+    let Ok(below_root) = entry.strip_prefix(walk_root) else {
+        return false;
+    };
+    let Ok(in_repo) = root
+        .join(below_root)
+        .strip_prefix(workdir)
+        .map(Path::to_path_buf)
+    else {
+        return false;
+    };
+    repo.is_path_ignored(&in_repo).unwrap_or(false)
 }
 
 /// Check if file extension matches language
@@ -234,20 +312,23 @@ fn extract_imports(file_path: &Path, content: &str, language: &Language) -> Resu
 
     match language {
         Language::Rust => {
-            let re = regex::Regex::new(r"use\s+(crate|self|super)::([a-zA-Z0-9_::]+)")?;
+            let re = regex::Regex::new(r"use\s+((?:crate|self|super)::[a-zA-Z0-9_:]+)")?;
             for cap in re.captures_iter(content) {
-                if let Some(name) = cap.get(2) {
+                if let Some(name) = cap.get(1) {
                     flows.push(DataFlow {
                         from: file_path.to_path_buf(),
                         to: PathBuf::from(name.as_str()),
                         flow_type: FlowType::Import,
+                        resolved: None,
                     });
                 }
             }
         }
         Language::TypeScript | Language::JavaScript => {
+            // `import … from`, side-effect `import '…'`, `export … from`,
+            // `require('…')` and dynamic `import('…')`.
             let import_re = regex::Regex::new(
-                r#"(?:import\s+(?:[^'"]+\s+from\s+)?|require\(\s*)["']([^"']+)["']"#,
+                r#"(?:(?:import|export)\s+(?:[^'";]+?\s+from\s+)?|(?:require|import)\(\s*)["']([^"']+)["']"#,
             )?;
             for cap in import_re.captures_iter(content) {
                 if let Some(module) = cap.get(1) {
@@ -255,6 +336,7 @@ fn extract_imports(file_path: &Path, content: &str, language: &Language) -> Resu
                         from: file_path.to_path_buf(),
                         to: PathBuf::from(module.as_str()),
                         flow_type: FlowType::Import,
+                        resolved: None,
                     });
                 }
             }
@@ -272,6 +354,7 @@ fn extract_imports(file_path: &Path, content: &str, language: &Language) -> Resu
                         from: file_path.to_path_buf(),
                         to: PathBuf::from(module.as_str()),
                         flow_type: FlowType::Import,
+                        resolved: None,
                     });
                 }
                 if let Some(cap) = from_re.captures(line)
@@ -281,6 +364,7 @@ fn extract_imports(file_path: &Path, content: &str, language: &Language) -> Resu
                         from: file_path.to_path_buf(),
                         to: PathBuf::from(module.as_str()),
                         flow_type: FlowType::Import,
+                        resolved: None,
                     });
                 }
             }
@@ -306,6 +390,7 @@ fn extract_imports(file_path: &Path, content: &str, language: &Language) -> Resu
                             from: file_path.to_path_buf(),
                             to: PathBuf::from(module.as_str()),
                             flow_type: FlowType::Import,
+                            resolved: None,
                         });
                     }
                 } else if trimmed.starts_with("import ")
@@ -316,6 +401,7 @@ fn extract_imports(file_path: &Path, content: &str, language: &Language) -> Resu
                         from: file_path.to_path_buf(),
                         to: PathBuf::from(module.as_str()),
                         flow_type: FlowType::Import,
+                        resolved: None,
                     });
                 }
             }
@@ -549,6 +635,23 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn test_gitignored_files_are_not_project_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        std::fs::create_dir_all(root.join("db/src/generated")).unwrap();
+        std::fs::write(root.join("db/.gitignore"), "**/src/generated\n").unwrap();
+        std::fs::write(root.join("db/src/index.ts"), "export {};\n").unwrap();
+        std::fs::write(root.join("db/src/generated/client.ts"), "export {};\n").unwrap();
+
+        let files: Vec<PathBuf> = project_files(root)
+            .map(|e| e.path().strip_prefix(root).unwrap().to_path_buf())
+            .filter(|p| p.extension().is_some_and(|e| e == "ts"))
+            .collect();
+        assert_eq!(files, vec![PathBuf::from("db/src/index.ts")]);
     }
 
     #[test]

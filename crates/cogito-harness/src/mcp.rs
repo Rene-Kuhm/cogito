@@ -3,12 +3,17 @@
 //! Runs over stdio so any MCP-capable agent (Claude Code, Cursor, Codex,
 //! opencode, Gemini CLI, …) can use Cogito as a tool provider.
 //!
+//! The tools give an agent the project's layout so it does not have to read
+//! the code to find its way: `project_map`, `related_files`, `search_code`,
+//! and `add_tag` to label code locations. Memory (decisions, session notes)
+//! is deliberately out of scope; that belongs to the agent's memory tool.
+//!
 //! Each tool takes an explicit `path` argument. The server opens that
 //! project's `.cogito/state.db` per call, so one process can serve several
 //! projects without mixing their data.
 
 use anyhow::Result;
-use cogito_harness_core::{Cogito, CompressionOptions, Project};
+use cogito_harness_core::{Cogito, Fingerprint, Project};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -22,66 +27,51 @@ use uuid::Uuid;
 /// Server name advertised to MCP clients.
 pub const SERVER_NAME: &str = "cogito";
 
+/// What the client tells the model about this server.
+const INSTRUCTIONS: &str = "Cogito keeps a map of the project's code so you can find your way \
+without reading it. When you start working in a repository, call project_map before listing \
+directories or opening files to orient yourself; use related_files to see what a file imports \
+and what imports it, and search_code to locate code by path, module or tag. The map is \
+refreshed automatically when HEAD changes; pass refresh=true after large uncommitted changes. \
+Cogito is not a memory: it stores no decisions or session notes, keep those in your memory \
+tool. Every tool takes `path`, the absolute project root.";
+
 // ============================================================
 // Requests
 // ============================================================
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct ScanProjectRequest {
-    /// Absolute path to the project directory
+pub struct ProjectMapRequest {
+    /// Absolute path to the project root
     pub path: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct CompressContextRequest {
-    /// Content to compress
-    pub content: String,
-    /// Maximum tokens in the compressed output
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: usize,
-    /// Language hint for AST-aware compression (e.g. "rust", "typescript", "go")
+    /// Rescan even if the stored map is current (after large uncommitted changes)
     #[serde(default)]
-    pub language: Option<String>,
-}
-
-fn default_max_tokens() -> usize {
-    8000
+    pub refresh: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct SearchKnowledgeRequest {
-    /// Project directory path
+pub struct RelatedFilesRequest {
+    /// Absolute path to the project root
     pub path: String,
-    /// Search query
+    /// File to inspect: a path relative to the root, or a unique suffix such as `auth/server.ts`
+    pub file: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SearchCodeRequest {
+    /// Absolute path to the project root
+    pub path: String,
+    /// Words to look for in file paths, module names and tags, e.g. `auth session`
     pub query: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct AddDecisionRequest {
-    /// Project directory path
-    pub path: String,
-    /// Decision title
-    pub title: String,
-    /// Why this decision was made
-    pub why: String,
-    /// Alternative options considered
-    #[serde(default)]
-    pub alternatives: Vec<String>,
-    /// Affected paths
-    #[serde(default)]
-    pub paths: Vec<String>,
-    /// Tags for categorization
-    #[serde(default)]
-    pub tags: Vec<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct AddTagRequest {
-    /// Project directory path
+    /// Absolute path to the project root
     pub path: String,
-    /// Tag name (e.g. "auth", "billing", "api")
+    /// Tag name, e.g. "auth", "billing"
     pub tag: String,
-    /// Paths to tag
+    /// Project paths the tag points at
     pub paths: Vec<String>,
 }
 
@@ -108,11 +98,24 @@ impl Default for CogitoServer {
 fn open_project(path: &str) -> Result<(Cogito, Project), String> {
     let root = PathBuf::from(path);
     let cogito = Cogito::for_project(&root)
-        .map_err(|e| format!("Failed to open project at {}: {e}", root.display()))?;
+        .map_err(|e| format!("Failed to open project at {}: {e:#}", root.display()))?;
     let project = cogito
         .load_project(root.clone())
-        .map_err(|e| format!("Failed to load project at {}: {e}", root.display()))?;
+        .map_err(|e| format!("Failed to load project at {}: {e:#}", root.display()))?;
     Ok((cogito, project))
+}
+
+/// The project and its fingerprint, scanning only if the stored one is stale.
+async fn mapped_project(
+    path: &str,
+    refresh: bool,
+) -> Result<(Cogito, Project, Fingerprint), String> {
+    let (cogito, project) = open_project(path)?;
+    let (fingerprint, _) = cogito
+        .fingerprint(&project, refresh)
+        .await
+        .map_err(|e| format!("Failed to scan {}: {e}", project.path.display()))?;
+    Ok((cogito, project, fingerprint))
 }
 
 #[tool_router]
@@ -123,164 +126,71 @@ impl CogitoServer {
         }
     }
 
-    /// Generate a code fingerprint for a project.
     #[tool(
-        description = "Generate a code fingerprint (entry points, data flows, hot/cold zones) for a project. Returns a summary of the project structure and its most changed files according to git history, and stores the result for the project."
+        description = "Map of the project's code: modules with their entry point, size, most changed files and which modules they use, plus the most changed files overall. Read this before exploring the repository."
     )]
-    async fn scan_project(
+    async fn project_map(
         &self,
-        Parameters(req): Parameters<ScanProjectRequest>,
+        Parameters(req): Parameters<ProjectMapRequest>,
     ) -> Result<String, String> {
-        let (cogito, project) = open_project(&req.path)?;
-
-        let fingerprint = cogito
-            .generate_fingerprint(&project)
-            .await
-            .map_err(|e| format!("Failed to generate fingerprint: {e}"))?;
-
-        let mut out = format!(
-            "Project: {} ({})\n\
-             Entry points: {}\n\
-             Data flows: {}\n\
-             Hot zones: {}\n\
-             Cold zones: {}\n\
-             Frozen zones: {}\n\
-             Generated: {}",
-            project.name,
-            project.language,
-            fingerprint.entry_points.len(),
-            fingerprint.data_flows.len(),
-            fingerprint.hot_zones.len(),
-            fingerprint.cold_zones.len(),
-            fingerprint.frozen_zones.len(),
-            fingerprint.generated_at,
-        );
-
-        if !fingerprint.hot_zones.is_empty() {
-            out.push_str("\n\nMost active files:\n");
-            for zone in fingerprint.hot_zones.iter().take(10) {
-                let rel = zone.path.strip_prefix(&project.path).unwrap_or(&zone.path);
-                out.push_str(&format!(
-                    "  • {} ({} changes)\n",
-                    rel.display(),
-                    zone.change_count
-                ));
-            }
-        }
-
-        Ok(out)
+        let (_, project, fingerprint) = mapped_project(&req.path, req.refresh).await?;
+        let map = cogito_harness_core::map::build(&project.path, &project.name, &fingerprint);
+        Ok(cogito_harness_core::map::render(&map))
     }
 
-    /// Compress context to save tokens.
     #[tool(
-        description = "Compress code/text context while preserving meaning. When a `language` is given and supported (rust, typescript, javascript, python, go, csharp, java, ruby, php, kotlin, swift), function bodies are collapsed to their signatures (AST-aware). Otherwise comments and whitespace are stripped."
+        description = "A file's neighbourhood: the project files it imports, the files that import it, and the external packages it uses."
     )]
-    async fn compress_context(
+    async fn related_files(
         &self,
-        Parameters(req): Parameters<CompressContextRequest>,
+        Parameters(req): Parameters<RelatedFilesRequest>,
     ) -> Result<String, String> {
-        let options = CompressionOptions {
-            max_tokens: req.max_tokens,
-            preserve_imports: true,
-            preserve_types: true,
-            hot_zones_priority: true,
-        };
-
-        let language = req
-            .language
-            .as_deref()
-            .and_then(cogito_harness_core::compressor::parse_language);
-
-        let result = cogito_harness_core::compressor::compress_with_language(
-            &req.content,
-            options,
-            language,
-        )
-        .map_err(|e| format!("Failed to compress: {e}"))?;
-
-        Ok(format!(
-            "Original tokens: {}\n\
-             Compressed tokens: {}\n\
-             Savings: {:.1}%\n\n\
-             --- Compressed Content ---\n{}",
-            result.original_tokens,
-            result.compressed_tokens,
-            result.savings_percent,
-            result.content
+        let (_, project, fingerprint) = mapped_project(&req.path, false).await?;
+        let file = cogito_harness_core::map::find_file(&project.path, &fingerprint, &req.file)?;
+        Ok(cogito_harness_core::map::render_related(
+            &project.path,
+            &fingerprint,
+            &file,
         ))
     }
 
-    /// Search project knowledge (tags + decisions).
     #[tool(
-        description = "Search project knowledge base: semantic tags and architectural decisions. Returns matches from both knowledge sources. Uses SQLite FTS5 with porter stemming, so 'scalable' also matches 'scalability'."
+        description = "Find code by words: matching file paths (most changed first), modules and tags."
     )]
-    async fn search_knowledge(
+    async fn search_code(
         &self,
-        Parameters(req): Parameters<SearchKnowledgeRequest>,
+        Parameters(req): Parameters<SearchCodeRequest>,
     ) -> Result<String, String> {
-        let (cogito, project) = open_project(&req.path)?;
-
+        let (cogito, project, fingerprint) = mapped_project(&req.path, false).await?;
+        let (files, modules) =
+            cogito_harness_core::map::search_paths(&project.path, &fingerprint, &req.query);
         let tags = cogito
             .search_tags(project.id, &req.query)
             .map_err(|e| format!("Failed to search tags: {e}"))?;
-        let decisions = cogito
-            .search_decisions(project.id, &req.query)
-            .map_err(|e| format!("Failed to search decisions: {e}"))?;
 
-        let mut out = format!("Search: {}\n\n", req.query);
-        out.push_str(&format!("Tags ({}):\n", tags.len()));
-        for tag in &tags {
-            out.push_str(&format!(
-                "  • {} ({}) - {} paths\n",
-                tag.tag,
-                tag.domain,
-                tag.paths.len()
-            ));
+        if files.is_empty() && modules.is_empty() && tags.is_empty() {
+            return Ok(format!("Nothing matches \"{}\".", req.query));
         }
-        out.push_str(&format!("\nDecisions ({}):\n", decisions.len()));
-        for d in &decisions {
-            out.push_str(&format!("  • {} - {}\n", d.title, d.why));
+        let mut out = String::new();
+        if !tags.is_empty() {
+            out.push_str("Tags:\n");
+            for tag in &tags {
+                let paths: Vec<String> =
+                    tag.paths.iter().map(|p| p.display().to_string()).collect();
+                out.push_str(&format!("  {}: {}\n", tag.tag, paths.join(", ")));
+            }
+        }
+        if !modules.is_empty() {
+            out.push_str(&format!("Modules:\n  {}\n", modules.join("\n  ")));
+        }
+        if !files.is_empty() {
+            out.push_str(&format!("Files:\n  {}\n", files.join("\n  ")));
         }
         Ok(out)
     }
 
-    /// Record an architectural decision.
     #[tool(
-        description = "Record an architectural decision with title, rationale, alternatives, and tags. Helps the AI agent understand WHY past decisions were made."
-    )]
-    async fn add_decision(
-        &self,
-        Parameters(req): Parameters<AddDecisionRequest>,
-    ) -> Result<String, String> {
-        let (cogito, project) = open_project(&req.path)?;
-
-        let mut builder = cogito_harness_core::decision::builder(project.id)
-            .title(&req.title)
-            .why(&req.why)
-            .author(&whoami::username());
-        for alt in &req.alternatives {
-            builder = builder.alternative(alt);
-        }
-        for tag in &req.tags {
-            builder = builder.tag(tag);
-        }
-        for p in &req.paths {
-            builder = builder.path(PathBuf::from(p));
-        }
-
-        let added = cogito
-            .add_decision(builder.build())
-            .map_err(|e| format!("Failed to add decision: {e}"))?;
-
-        Ok(format!(
-            "Decision added\n  ID: {}\n  Title: {}\n  Why: {}\n  Project: {}",
-            added.id, added.title, added.why, project.name
-        ))
-    }
-
-    /// Tag project paths.
-    #[tool(
-        description = "Add a semantic tag (e.g. 'auth', 'billing') to project paths. Tags are searchable and help the AI agent find relevant code quickly."
+        description = "Label project paths with a tag (e.g. 'auth' → apps/web/lib/auth) so search_code finds them by that word later. For code locations only; not for notes or decisions."
     )]
     async fn add_tag(&self, Parameters(req): Parameters<AddTagRequest>) -> Result<String, String> {
         let (cogito, project) = open_project(&req.path)?;
@@ -300,44 +210,10 @@ impl CogitoServer {
             .map_err(|e| format!("Failed to add tag: {e}"))?;
 
         Ok(format!(
-            "Tag added\n  Tag: {}\n  Domain: {}\n  Paths: {}\n  Project: {}",
-            added.tag,
-            added.domain,
+            "Tagged {} path(s) as '{}' in {}",
             added.paths.len(),
+            added.tag,
             project.name
-        ))
-    }
-
-    /// Project storage statistics.
-    #[tool(
-        description = "Report how much knowledge Cogito has stored for a project: number of tags and decisions, and when the project was last scanned (with its hot zone count)."
-    )]
-    async fn project_stats(
-        &self,
-        Parameters(req): Parameters<ScanProjectRequest>,
-    ) -> Result<String, String> {
-        let (cogito, project) = open_project(&req.path)?;
-        let stats = cogito
-            .stats(project.id)
-            .map_err(|e| format!("Failed to read stats: {e}"))?;
-
-        let fingerprint = match &stats.fingerprint_generated_at {
-            Some(at) => format!("{} hot zones, scanned {at}", stats.hot_zones_count),
-            None => "not scanned yet (use scan_project)".to_string(),
-        };
-
-        Ok(format!(
-            "Project: {} ({})\n\
-             Storage: {}\n\
-             Tags: {}\n\
-             Decisions: {}\n\
-             Fingerprint: {}",
-            project.name,
-            project.language,
-            cogito.cogito_dir().join("state.db").display(),
-            stats.tags_count,
-            stats.decisions_count,
-            fingerprint,
         ))
     }
 }
@@ -345,20 +221,11 @@ impl CogitoServer {
 #[tool_handler]
 impl ServerHandler for CogitoServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::InitializeResult::new(
-            ServerCapabilities::builder().enable_tools().build(),
-        )
-        // rmcp's `from_build_env` would report the crate name as "rmcp";
-        // identify as cogito so clients show the right server.
-        .with_server_info(Implementation::new(SERVER_NAME, env!("CARGO_PKG_VERSION")))
-        .with_instructions(
-            "Cogito is a context harness for AI coding agents. It stores, per project: \
-             a code fingerprint (entry points, data flows, hot/cold zones), semantic tags, \
-             and architectural decisions. \
-             Tools: scan_project, compress_context, search_knowledge, add_decision, add_tag, project_stats. \
-             Every tool takes an explicit `path` to the project root; state lives in `<path>/.cogito/state.db`."
-                .to_string(),
-        )
+        rmcp::model::InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+            // rmcp's `from_build_env` would report the crate name as "rmcp";
+            // identify as cogito so clients show the right server.
+            .with_server_info(Implementation::new(SERVER_NAME, env!("CARGO_PKG_VERSION")))
+            .with_instructions(INSTRUCTIONS.to_string())
     }
 }
 
