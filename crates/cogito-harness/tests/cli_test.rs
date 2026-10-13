@@ -607,3 +607,50 @@ fn test_setup_does_not_leave_backup_files_in_project() {
         backup_entries
     );
 }
+
+#[test]
+fn test_setup_writes_agents_md_only_at_a_repo_root() {
+    let home = fake_home();
+    let codex = home.path().join(".codex");
+    std::fs::create_dir_all(&codex).unwrap();
+
+    // Outside any git repository: Codex is configured, AGENTS.md is not written.
+    let plain = TempDir::new().unwrap();
+    let out = Command::new(cogito_bin())
+        .args(["setup", "codex"])
+        .env("COGITO_HOME", home.path())
+        .current_dir(plain.path())
+        .output()
+        .expect("setup");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!plain.path().join("AGENTS.md").exists());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("AGENTS.md: skipped"));
+
+    // Inside a repo subdirectory: skipped too.
+    let repo = setup_test_project();
+    let sub = repo.path().join("src");
+    let out = Command::new(cogito_bin())
+        .args(["setup", "codex"])
+        .env("COGITO_HOME", home.path())
+        .current_dir(&sub)
+        .output()
+        .expect("setup");
+    assert!(out.status.success());
+    assert!(!sub.join("AGENTS.md").exists());
+    assert!(!repo.path().join("src/AGENTS.md").exists());
+
+    // At the repo root: the block is written there.
+    let out = Command::new(cogito_bin())
+        .args(["setup", "codex"])
+        .env("COGITO_HOME", home.path())
+        .current_dir(repo.path())
+        .output()
+        .expect("setup");
+    assert!(out.status.success());
+    let text = fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
+    assert!(text.contains("Cogito"), "{text}");
+}

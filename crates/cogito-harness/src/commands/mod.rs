@@ -672,9 +672,8 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool, with_pi_package: boo
             );
         }
 
-        // Project root for AGENTS.md block: the current working directory.
-        // Agents that read AGENTS.md (Codex, opencode) get a block here.
-        let project_root = std::env::current_dir()?;
+        // AGENTS.md goes to the project root only; see agents_md_root.
+        let agents_root = crate::agents::agents_md_root(&std::env::current_dir()?, &home);
 
         if dry_run {
             let status = crate::agents::status(agent, &home, &binary)?;
@@ -685,14 +684,23 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool, with_pi_package: boo
             };
 
             if crate::agents::reads_agents_md(agent) {
-                // Print the AGENTS.md action first (from the function), then our summary line.
-                let _ = crate::agents::install_agents_md_block(&project_root, true);
-                println!(
-                    "  {} [{}] -> {}, AGENTS.md block would be written",
-                    agent.display(),
-                    status.label(),
-                    agents_action
-                );
+                match &agents_root {
+                    Some(root) => {
+                        let _ = crate::agents::install_agents_md_block(root, true);
+                        println!(
+                            "  {} [{}] -> {}, AGENTS.md block would be written",
+                            agent.display(),
+                            status.label(),
+                            agents_action
+                        );
+                    }
+                    None => println!(
+                        "  {} [{}] -> {}, AGENTS.md skipped (not a git repository root)",
+                        agent.display(),
+                        status.label(),
+                        agents_action
+                    ),
+                }
             } else {
                 println!(
                     "  {} [{}] -> would {}",
@@ -729,12 +737,19 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool, with_pi_package: boo
             }
         }
 
-        // Install the AGENTS.md block for agents that read it.
+        // Install the AGENTS.md block for agents that read it, at the project root.
         if crate::agents::reads_agents_md(agent) {
+            let Some(root) = &agents_root else {
+                println!(
+                    "    AGENTS.md: skipped, {} is not a git repository root (run setup from your project's root)",
+                    std::env::current_dir()?.display()
+                );
+                continue;
+            };
             if dry_run {
-                let _ = crate::agents::install_agents_md_block(&project_root, true);
+                let _ = crate::agents::install_agents_md_block(root, true);
             } else {
-                match crate::agents::install_agents_md_block(&project_root, false) {
+                match crate::agents::install_agents_md_block(root, false) {
                     Ok(crate::agents::Change::Written { .. }) => {
                         println!("    AGENTS.md: block installed");
                     }
@@ -821,8 +836,8 @@ pub fn uninstall(agents: Vec<String>, yes: bool) -> Result<()> {
     }
 
     println!();
-    // Project root for AGENTS.md block: the current working directory.
-    let project_root = std::env::current_dir()?;
+    // AGENTS.md is removed only from the root it would have been written to.
+    let agents_root = crate::agents::agents_md_root(&std::env::current_dir()?, &home);
 
     for agent in selected {
         match crate::agents::uninstall(agent, &home) {
@@ -839,8 +854,8 @@ pub fn uninstall(agents: Vec<String>, yes: bool) -> Result<()> {
         }
 
         // Remove the AGENTS.md block for agents that read it.
-        if crate::agents::reads_agents_md(agent) {
-            match crate::agents::remove_agents_md_block(&project_root) {
+        if let (true, Some(root)) = (crate::agents::reads_agents_md(agent), &agents_root) {
+            match crate::agents::remove_agents_md_block(root) {
                 Ok(crate::agents::Change::Written { .. }) => {
                     println!("    AGENTS.md: block removed");
                 }

@@ -748,6 +748,22 @@ pub fn agents_md_path(project_root: &Path) -> PathBuf {
     project_root.join("AGENTS.md")
 }
 
+/// Where Cogito may write `AGENTS.md`, if anywhere.
+///
+/// Only the root of a git repository qualifies: that is where a project's
+/// `AGENTS.md` lives, and where Codex and opencode look for it. Running setup
+/// from anywhere else (a subdirectory, or the home directory even when it is
+/// a dotfiles repository) must not create or modify a file the user did not
+/// ask for. `None` means "do not write"; callers say so.
+pub fn agents_md_root(cwd: &Path, home: &Path) -> Option<PathBuf> {
+    let same = |a: &Path, b: &Path| {
+        a.canonicalize().unwrap_or_else(|_| a.to_path_buf())
+            == b.canonicalize().unwrap_or_else(|_| b.to_path_buf())
+    };
+    let is_repo_root = cwd.join(".git").exists();
+    (is_repo_root && !same(cwd, home)).then(|| cwd.to_path_buf())
+}
+
 /// Whether `agent` reads AGENTS.md at session start.
 pub fn reads_agents_md(agent: Agent) -> bool {
     matches!(agent, Agent::Codex | Agent::Opencode)
@@ -2500,5 +2516,46 @@ mod tests {
         assert!(!reads_agents_md(Agent::GentleShell));
         assert!(!reads_agents_md(Agent::Gemini));
         assert!(!reads_agents_md(Agent::Crush));
+    }
+}
+
+#[cfg(test)]
+mod agents_md_root_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_only_a_git_repo_root_other_than_home_qualifies() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+        let sub = project.path().join("src");
+        std::fs::create_dir(&sub).unwrap();
+
+        assert_eq!(
+            agents_md_root(project.path(), home.path()),
+            Some(project.path().to_path_buf()),
+            "a repo root is where AGENTS.md belongs"
+        );
+        assert_eq!(
+            agents_md_root(&sub, home.path()),
+            None,
+            "subdirectories are not roots"
+        );
+
+        let plain = TempDir::new().unwrap();
+        assert_eq!(
+            agents_md_root(plain.path(), home.path()),
+            None,
+            "no git, no write"
+        );
+    }
+
+    #[test]
+    fn test_home_is_never_a_target_even_when_it_is_a_repo() {
+        // Dotfiles setups make $HOME a git repository; it must still be skipped.
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir(home.path().join(".git")).unwrap();
+        assert_eq!(agents_md_root(home.path(), home.path()), None);
     }
 }
