@@ -482,3 +482,89 @@ fn test_flip_rule_regex_wins_on_count() {
     // flip rule: regex.len() > ts.len(), so we get regex
     assert_eq!(decls.len(), 210_000);
 }
+
+// -------------------------------------------------------------------------
+// Impl blocks
+// -------------------------------------------------------------------------
+
+/// Rust: impl From<X> for Y should name the header clause, not "for".
+#[test]
+fn test_rust_impl_from_for() {
+    let src = r#"struct Declaration;
+struct IndexedDeclaration;
+
+impl From<Declaration> for IndexedDeclaration {
+    fn from(d: Declaration) -> Self {
+        Self
+    }
+}
+
+impl From<IndexedDeclaration> for Declaration {
+    fn from(d: IndexedDeclaration) -> Self {
+        Self
+    }
+}
+"#;
+    let decls: Vec<_> = declarations(src, "rs").into_iter().map(fields).collect();
+
+    // First impl: "From<Declaration> for IndexedDeclaration"
+    assert!(
+        decls
+            .iter()
+            .any(|(n, k, _, _)| { n == "From<Declaration> for IndexedDeclaration" && k == "impl" }),
+        "should name impl From<Declaration> for IndexedDeclaration: {decls:?}"
+    );
+
+    // Second impl: "From<IndexedDeclaration> for Declaration"
+    assert!(
+        decls
+            .iter()
+            .any(|(n, k, _, _)| { n == "From<IndexedDeclaration> for Declaration" && k == "impl" }),
+        "should name impl From<IndexedDeclaration> for Declaration: {decls:?}"
+    );
+}
+
+/// Rust: plain impl Foo should name just the type.
+#[test]
+fn test_rust_impl_plain() {
+    let src = r#"struct Foo;
+impl Debug for Foo {}
+impl Display for Foo {}
+"#;
+    let decls: Vec<_> = declarations(src, "rs").into_iter().map(fields).collect();
+
+    // impl Debug for Foo
+    assert!(
+        decls
+            .iter()
+            .any(|(n, k, _, _)| n == "Debug for Foo" && k == "impl"),
+        "should name impl Debug for Foo: {decls:?}"
+    );
+
+    // impl Display for Foo
+    assert!(
+        decls
+            .iter()
+            .any(|(n, k, _, _)| n == "Display for Foo" && k == "impl"),
+        "should name impl Display for Foo: {decls:?}"
+    );
+}
+
+/// Rust: impl<T> Foo<T> should include the generic parameters.
+#[test]
+fn test_rust_impl_generic() {
+    let src = r#"struct Foo<T>;
+impl<T> Foo<T> {
+    fn new() -> Self { todo!() }
+}
+"#;
+    let decls: Vec<_> = declarations(src, "rs").into_iter().map(fields).collect();
+
+    // impl<T> Foo<T>
+    assert!(
+        decls
+            .iter()
+            .any(|(n, k, _, _)| n == "<T> Foo<T>" && k == "impl"),
+        "should name impl<T> Foo<T> as \"<T> Foo<T>\": {decls:?}"
+    );
+}

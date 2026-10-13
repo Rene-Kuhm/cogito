@@ -134,7 +134,7 @@ impl Cogito {
     }
 
     /// Borrow the connection, if any.
-    fn connection(&self) -> Option<parking_lot::MutexGuard<'_, rusqlite::Connection>> {
+    pub fn connection(&self) -> Option<parking_lot::MutexGuard<'_, rusqlite::Connection>> {
         self.sqlite.as_ref().map(|c| c.lock())
     }
 
@@ -265,6 +265,30 @@ impl Cogito {
             return Ok((stored.unwrap(), false));
         }
         Ok((self.generate_fingerprint(project).await?, true))
+    }
+
+    /// Sync the index for `project`, returning a report.
+    ///
+    /// This is the cheap freshness entry point: it checks whether the working
+    /// tree has changed and re-indexes only what is necessary, but it does NOT
+    /// regenerate the fingerprint. Use this before any query that needs the
+    /// index up to date. `Cogito::fingerprint` is for `project_map` and for
+    /// explicit scan/refresh paths.
+    pub async fn sync_index(&self, project: &Project) -> Result<crate::index::SyncReport> {
+        // Load stored fingerprint to determine the allow_skip_when_clean flag.
+        let stored = self.stored_fingerprint(project.id)?;
+        let can_skip = stored
+            .as_ref()
+            .map(|s| {
+                s.format >= fingerprint::FINGERPRINT_FORMAT
+                    && s.head == fingerprint::current_head(&project.path)
+            })
+            .unwrap_or(false);
+
+        let conn = self
+            .connection()
+            .ok_or_else(|| anyhow::anyhow!("No SQLite connection"))?;
+        crate::index::sync(&conn, project.id, &project.path, can_skip)
     }
 
     /// The fingerprint stored by the last scan, if any.

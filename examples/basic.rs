@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo run --example basic
 
-use cogito_harness_core::Cogito;
+use cogito_harness_core::{Cogito, index};
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -29,11 +29,17 @@ async fn main() -> anyhow::Result<()> {
     let map_text = cogito_harness_core::map::render(&map);
     println!("\nProject Map:\n{}", map_text);
 
-    // Search for symbols
+    // Search using the index
     println!("\nSearching for 'map'...");
-    let results = cogito_harness_core::map::search_paths(&project.path, &fingerprint, "map");
-    let search_text = cogito_harness_core::map::render_search(&results, "map");
-    println!("{}", search_text);
+    let _ = cogito.sync_index(&project).await?;
+    if let Some(conn) = cogito.connection() {
+        let hits = index::search(&conn, project.id, "map", 12)?;
+        let modules = fingerprint.modules.clone();
+        let files_first = false; // simplified for this example
+        let search_text =
+            cogito_harness_core::map::render_search(&hits, &modules, "map", files_first);
+        println!("{}", search_text);
+    }
 
     println!("\n✓ All examples completed successfully!");
 

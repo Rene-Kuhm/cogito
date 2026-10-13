@@ -91,7 +91,7 @@ fn kind_to_vocab(kind: &str) -> String {
         "static_item" => "static".to_string(),
         "mod_item" => "mod".to_string(),
         "macro_definition" => "macro_rules!".to_string(),
-        "function_declaration" => "function".to_string(),
+        "function_declaration" | "symbol" => "function".to_string(),
         "class_declaration" | "abstract_class_declaration" => "class".to_string(),
         "interface_declaration" => "interface".to_string(),
         "type_alias_declaration" => "type".to_string(),
@@ -201,6 +201,10 @@ fn is_declaration_kind(kind: &str) -> bool {
             | "func_declaration"
             | "protocol_declaration"
             | "property_declaration"
+            | "export_clause"
+            | "export_statement"
+            | "export_default_statement"
+            | "export" // Common export wrapper node
     )
 }
 
@@ -305,30 +309,30 @@ fn get_name(node: &Node, content: &str) -> Option<String> {
     let kind = node.kind();
     match kind {
         "impl_item" => {
-            let mut cursor = node.walk();
-            let mut parts: Vec<String> = Vec::new();
-            let mut seen_impl = false;
-            for child in node.children(&mut cursor) {
-                if child.kind() == "impl" {
-                    seen_impl = true;
-                    continue;
-                }
-                if seen_impl {
-                    if child.kind() == "type_identifier"
-                        || child.kind() == "primitive_type"
-                        || child.kind() == "identifier"
-                    {
-                        parts.push(content[child.byte_range()].to_string());
-                    }
-                    if child.kind() == "for" {
-                        parts.push("for".to_string());
-                    }
-                }
-            }
-            if parts.is_empty() {
+            // Extract the impl header (everything between "impl" and the opening brace or where block starts)
+            // This captures: impl [generics] Type [for Type]
+            let impl_range = node.range();
+            let impl_content = &content[impl_range.start_byte..impl_range.end_byte];
+
+            // Find the "impl" keyword position
+            let impl_start = impl_content.find("impl")?;
+            let after_impl = &impl_content[impl_start + 4..];
+
+            // Find where the impl block body starts (opening brace or where keyword)
+            let body_start = after_impl
+                .find('{')
+                .or_else(|| after_impl.find("where"))
+                .unwrap_or(after_impl.len());
+
+            let header = &after_impl[..body_start];
+
+            // Normalize whitespace and remove leading/trailing whitespace
+            let normalized: String = header.split_whitespace().collect::<Vec<_>>().join(" ");
+
+            if normalized.is_empty() {
                 None
             } else {
-                Some(parts.join(" "))
+                Some(normalized)
             }
         }
         "macro_definition" => {
@@ -366,8 +370,25 @@ fn get_name(node: &Node, content: &str) -> Option<String> {
         "decorated_definition" => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                if child.kind() == "function_definition" || child.kind() == "class_definition" {
+                if child.kind() == "function_definition"
+                    || child.kind() == "function_declaration"
+                    || child.kind() == "class_definition"
+                    || child.kind() == "class_declaration"
+                {
                     return get_name(&child, content);
+                }
+            }
+            None
+        }
+        // Export statements: recurse into the declared item
+        "export_clause" | "export_statement" | "export_default_statement" | "export" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                // Recurse into any declaration child
+                if is_declaration_kind(child.kind())
+                    && let Some(name) = get_name(&child, content)
+                {
+                    return Some(name);
                 }
             }
             None
@@ -396,6 +417,21 @@ fn collect_declarations(tree: &Tree, content: &str, declarations: &mut Vec<Decla
 fn collect_declarations_recursive(node: &Node, content: &str, declarations: &mut Vec<Declaration>) {
     let kind = node.kind();
     if is_declaration_kind(kind) {
+        // For export statements, recurse into the inner declaration and use its kind
+        if kind == "export_clause"
+            || kind == "export_statement"
+            || kind == "export_default_statement"
+            || kind == "export"
+        {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if is_declaration_kind(child.kind()) {
+                    collect_declarations_recursive(&child, content, declarations);
+                }
+            }
+            return;
+        }
+
         if let Some(name) = get_name(node, content) {
             let vocab = kind_to_vocab(kind);
             let (start, end) = node_span(node);

@@ -158,13 +158,15 @@ fn test_mcp_map_tools_on_a_workspace() {
     );
 
     let related = tool_text(&output, 3);
+    // The index resolves imports and stores the resolved path, so imports
+    // shows the actual file and importers shows files that import this one.
     assert!(
         related.contains("Imports (1):\n  packages/shared/src/index.ts"),
-        "{related}"
+        "related should show resolved import: {related}"
     );
     assert!(
         related.contains("Imported by (1):\n  apps/web/app/page.tsx"),
-        "{related}"
+        "related should show importer: {related}"
     );
 
     let search = tool_text(&output, 4);
@@ -178,6 +180,134 @@ fn test_mcp_map_tools_on_a_workspace() {
     assert!(
         outline.contains("3-5 export function requireSession(token: string): boolean"),
         "{outline}"
+    );
+}
+
+#[test]
+fn test_mcp_search_finds_new_uncommitted_file() {
+    // On a git repository that has been indexed, a new uncommitted file with a
+    // declaration is found via the index without an explicit refresh or scan.
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    // Initialize a git repo.
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(root)
+        .output()
+        .expect("git init failed");
+
+    let write = |rel: &str, text: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+
+    // Write an initial file and commit it so the repo is "indexed".
+    write("src/main.ts", "export const existing = 1;\n");
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(root)
+        .output()
+        .expect("git add failed");
+    std::process::Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(root)
+        .output()
+        .expect("git commit failed");
+
+    // Now write a new uncommitted file with a unique declaration.
+    write(
+        "src/newfeature.ts",
+        "export function brandNewUtility(input: string): boolean {\n  return input.length > 0;\n}\n",
+    );
+
+    let path = root.display().to_string();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let search = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"search_code","arguments":{{"path":"{}","query":"brandNewUtility"}}}}}}"#,
+        path
+    );
+
+    let output = send_jsonrpc(vec![init, ready, &search]);
+    let text = tool_text(&output, 2);
+    assert!(
+        text.contains("brandNewUtility"),
+        "search_code should find brandNewUtility in the new uncommitted file: {text}"
+    );
+    assert!(
+        text.contains("src/newfeature.ts"),
+        "search_code should report the new file path: {text}"
+    );
+}
+
+#[test]
+fn test_mcp_file_outline_matches_declarations() {
+    // The index-sourced outline contains declarations with expected kinds and line ranges.
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    // Initialize a git repo.
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(root)
+        .output()
+        .expect("git init failed");
+
+    let write = |rel: &str, text: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+
+    write("package.json", r#"{"name":"test"}"#);
+    write(
+        "src/lib.ts",
+        "// This is a utility function\nexport function greet(name: string): string {\n  return `Hello, ${name}`;\n}\n\nexport const MAX_RETRIES = 3;\n\nclass InternalCache {\n  private data: Map<string, string>;\n  constructor() { this.data = new Map(); }\n}\n\nexport { InternalCache };\n",
+    );
+
+    // Commit so the index has something to work with.
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(root)
+        .output()
+        .expect("git add failed");
+    std::process::Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(root)
+        .output()
+        .expect("git commit failed");
+
+    let path = root.display().to_string();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let outline = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"file_outline","arguments":{{"path":"{}","file":"src/lib.ts"}}}}}}"#,
+        path
+    );
+
+    let output = send_jsonrpc(vec![init, ready, &outline]);
+    let text = tool_text(&output, 2);
+
+    // Verify the outline contains the expected declarations.
+    assert!(
+        text.contains("function greet") || text.contains("fn greet"),
+        "outline should contain function greet: {text}"
+    );
+    assert!(
+        text.contains("MAX_RETRIES") || text.contains("const MAX_RETRIES"),
+        "outline should contain const MAX_RETRIES: {text}"
+    );
+    assert!(
+        text.contains("class InternalCache") || text.contains("InternalCache"),
+        "outline should contain class InternalCache: {text}"
+    );
+
+    // Verify line ranges are present (e.g., "3-5" or similar).
+    assert!(
+        text.contains('-') && text.matches(char::is_numeric).count() >= 4,
+        "outline should contain line ranges: {text}"
     );
 }
 

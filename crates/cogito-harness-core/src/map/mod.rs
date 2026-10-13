@@ -17,12 +17,8 @@ use std::path::{Path, PathBuf};
 /// Lines of hot files shown per module, and in the project-wide list.
 const HOT_PER_MODULE: usize = 3;
 const HOT_OVERALL: usize = 10;
-/// Cap on each list in `related` and `search` output.
+/// Cap on each list in `related` output.
 const LIST_LIMIT: usize = 25;
-/// Caps on `search` output: enough to locate code, small enough that a
-/// search costs less than the grep it replaces.
-const SYMBOL_LIMIT: usize = 12;
-const SEARCH_FILE_LIMIT: usize = 15;
 /// A file changed once is not "hot"; listing it would only spend tokens.
 const MIN_HOT_CHANGES: usize = 2;
 
@@ -342,24 +338,67 @@ fn key_docs(docs: &[PathBuf]) -> Vec<String> {
     root
 }
 
-/// Render `search_paths` results as agent text.
-pub fn render_search(found: &SearchResults, query: &str) -> String {
-    if found.files.is_empty() && found.modules.is_empty() && found.symbols.is_empty() {
+/// Render ranked search hits and modules as agent text.
+///
+/// Symbols are rendered as `path:line`. File paths and module names are rendered
+/// by name. `modules` are used only for the module section (may be empty).
+/// `files_first` should be `true` when the first file hit was named exactly like
+/// the query (so files lead the output).
+///
+/// Modules are filtered to only those where any query token (split on whitespace)
+/// appears in the module's name or path, case-insensitively. When the query is
+/// empty or has no tokens, no modules are included.
+pub fn render_search(
+    hits: &[crate::index::SearchHit],
+    modules: &[crate::types::ModuleInfo],
+    query: &str,
+    files_first: bool,
+) -> String {
+    let symbols: Vec<String> = hits
+        .iter()
+        .filter(|h| h.is_symbol)
+        .map(|h| format!("{} {} {}:{}", h.kind, h.name, h.path.display(), h.line))
+        .collect();
+    let files: Vec<String> = hits
+        .iter()
+        .filter(|h| !h.is_symbol)
+        .map(|h| format!("{}", h.path.display()))
+        .collect();
+
+    // Filter modules by query tokens: include only if any token appears in name or path.
+    let query_tokens: Vec<&str> = query.split_whitespace().collect();
+    let module_names: Vec<String> = modules
+        .iter()
+        .filter(|m| {
+            if query_tokens.is_empty() {
+                return false;
+            }
+            let path_str = m.path.to_string_lossy().to_lowercase();
+            let name_str = m.name.to_lowercase();
+            query_tokens.iter().any(|tok| {
+                path_str.contains(&tok.to_lowercase()) || name_str.contains(&tok.to_lowercase())
+            })
+        })
+        .map(|m| format!("{} ({})", m.path.display(), m.name))
+        .collect();
+
+    if symbols.is_empty() && files.is_empty() && module_names.is_empty() {
         return format!("Nothing matches \"{query}\".\n");
     }
+
     let mut out = String::new();
     let section = |title: &str, items: &[String], out: &mut String| {
         if !items.is_empty() {
             out.push_str(&format!("{title}:\n  {}\n", items.join("\n  ")));
         }
     };
-    if found.files_first {
-        section("Files", &found.files, &mut out);
+    if files_first {
+        section("Files", &files, &mut out);
     }
-    section("Symbols", &found.symbols, &mut out);
-    section("Modules", &found.modules, &mut out);
-    if !found.files_first {
-        section("Files", &found.files, &mut out);
+    section("Symbols", &symbols, &mut out);
+    section("Modules", &module_names, &mut out);
+    if !files_first {
+        section("Files", &files, &mut out);
     }
     out
 }
@@ -392,41 +431,34 @@ pub fn find_file(root: &Path, fp: &Fingerprint, query: &str) -> Result<PathBuf, 
     }
 }
 
-/// A file's neighbourhood: what it imports and what imports it.
-pub fn render_related(root: &Path, fp: &Fingerprint, file: &Path) -> String {
-    let modules = effective_modules(fp);
-    let changes = change_counts(root, fp);
-
-    let mut imports = BTreeSet::new();
-    let mut external = BTreeSet::new();
-    let mut importers = BTreeSet::new();
-    for flow in &fp.data_flows {
-        let from = rel(root, &flow.from);
-        if from == file {
-            match &flow.resolved {
-                Some(target) => {
-                    imports.insert(target.clone());
-                }
-                None => {
-                    external.insert(flow.to.display().to_string());
-                }
-            }
-        }
-        if flow.resolved.as_deref() == Some(file) && from != file {
-            importers.insert(from);
-        }
-    }
-
+/// Render a file's neighbourhood: what it imports and what imports it.
+///
+/// `imports`, `importers`, and `external` are provided by the caller (typically
+/// from the index). `fp` is used only for the optional header line (module name,
+/// change count). Pass `None` for `fp` to omit the header.
+pub fn render_related(
+    root: &Path,
+    fp: Option<&Fingerprint>,
+    file: &Path,
+    imports: &[String],
+    importers: &[String],
+    external: &[String],
+) -> String {
     let mut out = file.display().to_string();
-    if let Some(m) = module_of(&modules, file) {
-        out.push_str(&format!(" · module {}", m.path.display()));
-    }
-    if let Some(c) = changes.get(file) {
-        out.push_str(&format!(" · {c} changes"));
+
+    if let Some(fp) = fp {
+        let modules = effective_modules(fp);
+        let changes = change_counts(root, fp);
+        if let Some(m) = module_of(&modules, file) {
+            out.push_str(&format!(" · module {}", m.path.display()));
+        }
+        if let Some(c) = changes.get(file) {
+            out.push_str(&format!(" · {c} changes"));
+        }
     }
     out.push('\n');
 
-    let list = |title: &str, items: Vec<String>, out: &mut String| {
+    let list = |title: &str, items: &[String], out: &mut String| {
         if items.is_empty() {
             return;
         }
@@ -438,204 +470,54 @@ pub fn render_related(root: &Path, fp: &Fingerprint, file: &Path) -> String {
             out.push_str(&format!("  … {} more\n", items.len() - LIST_LIMIT));
         }
     };
-    let shown = |set: BTreeSet<PathBuf>| set.into_iter().map(|p| p.display().to_string()).collect();
-    list("Imports", shown(imports), &mut out);
-    list("Imported by", shown(importers), &mut out);
-    list("External", external.into_iter().collect(), &mut out);
+    list("Imports", imports, &mut out);
+    list("Imported by", importers, &mut out);
+    list("External", external, &mut out);
     out
 }
 
-/// Whether a lowercase path is a test file or lives in a test directory.
-fn is_test(path: &str) -> bool {
-    path.split('/').any(|part| {
-        matches!(
-            part,
-            "test" | "tests" | "__tests__" | "e2e" | "spec" | "specs"
-        ) || part.contains(".test.")
-            || part.contains(".spec.")
-            || part.ends_with("_test.go")
-            || part.starts_with("test_")
-    })
-}
-
-/// Files and modules whose path or name matches `query`, best first.
+/// Render a file's outline from its declarations.
 ///
-/// Every whitespace-separated term is matched case-insensitively against the
-/// path; a file ranks by how many terms it matches, then by how often it
-/// changed.
-pub fn search_paths(root: &Path, fp: &Fingerprint, query: &str) -> SearchResults {
-    let terms: Vec<String> = query
-        .split_whitespace()
-        .map(str::to_lowercase)
-        .filter(|t| t.len() >= 2)
-        .collect();
-    if terms.is_empty() {
-        return SearchResults::default();
-    }
-    let changes = change_counts(root, fp);
-
-    // A file whose name is a search term ("README" → README.md) is what the
-    // caller is looking for; it ranks above everything else.
-    let named = |f: &Path| {
-        let lower = |s: Option<&std::ffi::OsStr>| s.and_then(|s| s.to_str()).map(str::to_lowercase);
-        let (stem, name) = (lower(f.file_stem()), lower(f.file_name()));
-        terms
-            .iter()
-            .any(|t| stem.as_deref() == Some(t.as_str()) || name.as_deref() == Some(t.as_str()))
-    };
-    let mut scored: Vec<(bool, usize, bool, usize, &PathBuf)> = fp
-        .files
-        .iter()
-        .chain(&fp.docs)
-        .filter_map(|f| {
-            let path = f.display().to_string().to_lowercase();
-            let hits = terms.iter().filter(|t| path.contains(t.as_str())).count();
-            (hits > 0).then(|| {
-                (
-                    named(f),
-                    hits,
-                    is_test(&path),
-                    changes.get(f).copied().unwrap_or(0),
-                    f,
-                )
-            })
-        })
-        .collect();
-    // Named files first, shallowest first; then more terms matched; source
-    // before tests; then the busier file.
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| {
-                if a.0 && b.0 {
-                    a.4.components().count().cmp(&b.4.components().count())
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .then_with(|| b.1.cmp(&a.1))
-            .then_with(|| a.2.cmp(&b.2))
-            .then_with(|| b.3.cmp(&a.3))
-            .then_with(|| a.4.cmp(b.4))
-    });
-    let files_first = scored.first().is_some_and(|f| f.0);
-    let files = scored
-        .iter()
-        .take(SEARCH_FILE_LIMIT)
-        .map(|(_, _, _, c, f)| {
-            if *c > 0 {
-                format!("{} ({c} changes)", f.display())
-            } else {
-                f.display().to_string()
-            }
-        })
-        .collect();
-
-    let modules = effective_modules(fp)
-        .into_iter()
-        .filter(|m| {
-            let hay = format!("{} {}", m.path.display(), m.name).to_lowercase();
-            terms.iter().any(|t| hay.contains(t.as_str()))
-        })
-        .map(|m| format!("{} ({})", m.path.display(), m.name))
-        .collect();
-
-    // Symbols: source before tests; then an exact name, a prefix, a
-    // substring; then the busier file.
-    let mut symbols: Vec<(u8, bool, usize, &crate::types::Symbol)> = fp
-        .symbols
-        .iter()
-        .filter_map(|sym| {
-            let name = sym.name.to_lowercase();
-            let rank = terms
-                .iter()
-                .filter_map(|t| {
-                    if name == *t {
-                        Some(0)
-                    } else if name.starts_with(t.as_str()) {
-                        Some(1)
-                    } else if name.contains(t.as_str()) {
-                        Some(2)
-                    } else {
-                        None
-                    }
-                })
-                .min()?;
-            let path = sym.file.display().to_string().to_lowercase();
-            Some((
-                rank,
-                is_test(&path),
-                changes.get(&sym.file).copied().unwrap_or(0),
-                sym,
-            ))
-        })
-        .collect();
-    symbols.sort_by(|a, b| {
-        a.1.cmp(&b.1)
-            .then_with(|| a.0.cmp(&b.0))
-            .then_with(|| b.2.cmp(&a.2))
-            .then_with(|| a.3.file.cmp(&b.3.file))
-            .then_with(|| a.3.line.cmp(&b.3.line))
-    });
-    let symbols = symbols
-        .iter()
-        .take(SYMBOL_LIMIT)
-        .map(|(_, _, _, s)| format!("{} {} {}:{}", s.kind, s.name, s.file.display(), s.line))
-        .collect();
-
-    SearchResults {
-        files,
-        modules,
-        symbols,
-        files_first,
-    }
-}
-
-/// What `search_paths` found, each list best first.
-#[derive(Debug, Default)]
-pub struct SearchResults {
-    pub files: Vec<String>,
-    pub modules: Vec<String>,
-    pub symbols: Vec<String>,
-    /// A file is named exactly like a search term, so files lead the output.
-    pub files_first: bool,
-}
-
-/// One file's declarations with their line ranges, read from disk now so the
-/// outline matches the file even with uncommitted edits.
-pub fn render_outline(root: &Path, fp: &Fingerprint, file: &Path) -> Result<String, String> {
-    let content = std::fs::read_to_string(root.join(file))
-        .map_err(|e| format!("Cannot read {}: {e}", file.display()))?;
+/// `declarations` come from the index or from disk parsing. `fp` is used only
+/// for the optional header line (module, change count, importer count). Pass
+/// `None` for `fp` to omit those fields. `importer_count` is the number of
+/// files that import this one (from the index's importers query).
+pub fn render_outline(
+    root: &Path,
+    fp: Option<&Fingerprint>,
+    file: &Path,
+    declarations: &[outline::Declaration],
+    importer_count: usize,
+) -> String {
     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let declarations = outline::declarations(&content, ext);
+    let total_lines = if let Some(fp) = fp {
+        let changes = change_counts(root, fp);
+        let modules = effective_modules(fp);
+        let mut out = file.display().to_string();
+        if let Some(m) = module_of(&modules, file) {
+            out.push_str(&format!(" · module {}", m.path.display()));
+        }
+        if let Some(c) = changes.get(file) {
+            out.push_str(&format!(" · {c} changes"));
+        }
+        if importer_count > 0 {
+            out.push_str(&format!(" · imported by {importer_count}"));
+        }
+        out.push('\n');
+        out
+    } else {
+        format!("{}\n", file.display())
+    };
 
-    let modules = effective_modules(fp);
-    let importers = fp
-        .data_flows
-        .iter()
-        .filter(|f| f.resolved.as_deref() == Some(file) && rel(root, &f.from) != file)
-        .map(|f| rel(root, &f.from))
-        .collect::<BTreeSet<_>>()
-        .len();
-
-    let mut out = format!("{} · {} lines", file.display(), content.lines().count());
-    if let Some(m) = module_of(&modules, file) {
-        out.push_str(&format!(" · module {}", m.path.display()));
-    }
-    if let Some(c) = change_counts(root, fp).get(file) {
-        out.push_str(&format!(" · {c} changes"));
-    }
-    if importers > 0 {
-        out.push_str(&format!(" · imported by {importers}"));
-    }
-    out.push('\n');
+    let mut out = total_lines;
 
     if declarations.is_empty() {
         out.push_str("No declarations recognised; read the file directly.\n");
-        return Ok(out);
+        return out;
     }
 
     if outline::is_doc(ext) {
-        for d in &declarations {
+        for d in declarations {
             let level = d.kind.trim_start_matches('h').parse::<usize>().unwrap_or(1);
             out.push_str(&format!(
                 "  {}-{} {} {}\n",
@@ -646,7 +528,7 @@ pub fn render_outline(root: &Path, fp: &Fingerprint, file: &Path) -> Result<Stri
             ));
         }
         out.push_str("Read only the section you need.\n");
-        return Ok(out);
+        return out;
     }
 
     // Consecutive one-line declarations of the same kind collapse into one
@@ -692,7 +574,7 @@ pub fn render_outline(root: &Path, fp: &Fingerprint, file: &Path) -> Result<Stri
         i = j + 1;
     }
     out.push_str("Read only the line range you need.\n");
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
@@ -797,25 +679,6 @@ mod tests {
     }
 
     #[test]
-    fn test_search_ranks_source_before_tests() {
-        let found = search_paths(Path::new(""), &fingerprint(), "auth");
-        assert_eq!(
-            found.files,
-            [
-                "apps/web/lib/auth/server.ts (9 changes)",
-                "apps/web/tests/auth.test.ts (12 changes)"
-            ]
-        );
-        assert!(found.modules.is_empty());
-
-        let found = search_paths(Path::new(""), &fingerprint(), "requiresession");
-        assert_eq!(
-            found.symbols,
-            ["function requireSession apps/web/lib/auth/server.ts:10"]
-        );
-    }
-
-    #[test]
     fn test_find_file_by_unique_suffix() {
         let fp = fingerprint();
         assert_eq!(
@@ -849,13 +712,206 @@ mod doc_tests {
 
     #[test]
     fn test_render_search_puts_a_named_file_first() {
-        let found = SearchResults {
-            files: vec!["README.md (32 changes)".into()],
-            modules: vec![],
-            symbols: vec!["h2 Write the README docs/plan.md:4".into()],
-            files_first: true,
-        };
-        let text = render_search(&found, "README");
+        let hits = vec![
+            crate::index::SearchHit {
+                kind: "file".to_string(),
+                is_symbol: false,
+                name: "README.md".into(),
+                path: PathBuf::from("README.md"),
+                line: 0,
+                score: 1.0,
+                is_test: false,
+            },
+            crate::index::SearchHit {
+                kind: "symbol".to_string(),
+                is_symbol: true,
+                name: "Write the README".into(),
+                path: PathBuf::from("docs/plan.md"),
+                line: 4,
+                score: 0.5,
+                is_test: false,
+            },
+        ];
+        let text = render_search(&hits, &[], "README", true);
         assert!(text.starts_with("Files:\n  README.md"), "{text}");
+    }
+
+    #[test]
+    fn test_render_search_symbols_render_as_path_line() {
+        let hits = vec![crate::index::SearchHit {
+            kind: "function".to_string(),
+            is_symbol: true,
+            name: "requireSession".into(),
+            path: PathBuf::from("apps/web/lib/auth/server.ts"),
+            line: 10,
+            score: 3.0,
+            is_test: false,
+        }];
+        let text = render_search(&hits, &[], "requireSession", false);
+        assert!(text.contains("apps/web/lib/auth/server.ts:10"), "{text}");
+    }
+
+    #[test]
+    fn test_render_search_modules_render_by_name() {
+        let modules = vec![crate::types::ModuleInfo {
+            path: PathBuf::from("apps/web"),
+            name: "@m/web".into(),
+            manifest: "package.json".into(),
+        }];
+        let text = render_search(&[], &modules, "web", false);
+        assert!(text.contains("apps/web (@m/web)"), "{text}");
+    }
+
+    #[test]
+    fn test_render_search_modules_filtered_by_query() {
+        let modules = vec![
+            crate::types::ModuleInfo {
+                path: PathBuf::from("apps/web"),
+                name: "@m/web".into(),
+                manifest: "package.json".into(),
+            },
+            crate::types::ModuleInfo {
+                path: PathBuf::from("packages/shared"),
+                name: "@m/shared".into(),
+                manifest: "package.json".into(),
+            },
+            crate::types::ModuleInfo {
+                path: PathBuf::from("packages/api"),
+                name: "@m/api".into(),
+                manifest: "package.json".into(),
+            },
+        ];
+
+        // Query matching no module renders no module section.
+        let text = render_search(&[], &modules, "nonexistent", false);
+        assert!(
+            !text.contains("Modules:"),
+            "should have no Modules section: {text}"
+        );
+        assert!(
+            text.contains("Nothing matches"),
+            "should say Nothing matches: {text}"
+        );
+
+        // Query matching one module name renders exactly that module.
+        let text = render_search(&[], &modules, "web", false);
+        assert!(
+            text.contains("apps/web (@m/web)"),
+            "should show web module: {text}"
+        );
+        assert!(
+            !text.contains("packages/shared"),
+            "should not show shared: {text}"
+        );
+        assert!(
+            !text.contains("packages/api"),
+            "should not show api: {text}"
+        );
+
+        // Query matching a path segment renders all modules with that segment.
+        let text = render_search(&[], &modules, "packages", false);
+        assert!(
+            text.contains("packages/shared"),
+            "should show shared: {text}"
+        );
+        assert!(text.contains("packages/api"), "should show api: {text}");
+        assert!(!text.contains("apps/web"), "should not show web: {text}");
+
+        // Empty query renders no modules.
+        let text = render_search(&[], &modules, "", false);
+        assert!(
+            !text.contains("Modules:"),
+            "empty query should have no Modules section: {text}"
+        );
+
+        // Query with only whitespace renders no modules.
+        let text = render_search(&[], &modules, "   ", false);
+        assert!(
+            !text.contains("Modules:"),
+            "whitespace-only query should have no Modules section: {text}"
+        );
+    }
+
+    #[test]
+    fn test_render_outline_doc_sections() {
+        let decls = vec![
+            outline::Declaration {
+                kind: "h1".into(),
+                name: "Overview".into(),
+                start: 1,
+                end: 5,
+                signature: None,
+            },
+            outline::Declaration {
+                kind: "h2".into(),
+                name: "Usage".into(),
+                start: 10,
+                end: 20,
+                signature: None,
+            },
+        ];
+        let text = render_outline(
+            Path::new("docs/guide.md"),
+            None,
+            Path::new("docs/guide.md"),
+            &decls,
+            0,
+        );
+        assert!(text.contains("# Overview"), "{text}");
+        assert!(text.contains("## Usage"), "{text}");
+    }
+
+    #[test]
+    fn test_render_outline_code_declarations() {
+        let decls = vec![
+            outline::Declaration {
+                kind: "function".into(),
+                name: "main".into(),
+                start: 1,
+                end: 10,
+                signature: Some("fn main()".into()),
+            },
+            outline::Declaration {
+                kind: "const".into(),
+                name: "A".into(),
+                start: 15,
+                end: 15,
+                signature: None,
+            },
+            outline::Declaration {
+                kind: "const".into(),
+                name: "B".into(),
+                start: 16,
+                end: 16,
+                signature: None,
+            },
+        ];
+        let text = render_outline(
+            Path::new("src/main.rs"),
+            None,
+            Path::new("src/main.rs"),
+            &decls,
+            0,
+        );
+        assert!(text.contains("fn main()"), "{text}");
+        assert!(text.contains("const ×2: A, B"), "{text}");
+    }
+
+    #[test]
+    fn test_render_related_lists_imports_importers_externals() {
+        let imports = vec!["packages/shared/src/index.ts".into()];
+        let importers = vec!["apps/web/app/page.tsx".into()];
+        let external = vec!["@m/shared".into()];
+        let text = render_related(
+            Path::new(""),
+            None,
+            Path::new("apps/web/lib/session.ts"),
+            &imports,
+            &importers,
+            &external,
+        );
+        assert!(text.contains("packages/shared/src/index.ts"), "{text}");
+        assert!(text.contains("apps/web/app/page.tsx"), "{text}");
+        assert!(text.contains("@m/shared"), "{text}");
     }
 }

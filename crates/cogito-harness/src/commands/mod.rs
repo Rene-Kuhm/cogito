@@ -216,11 +216,49 @@ pub async fn outline(file: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
-    let (fingerprint, _) = cogito.fingerprint(&project, false).await?;
+    let _ = cogito.sync_index(&project).await?;
+
+    // Need a fingerprint for find_file. Try stored first, then fall back to scan.
+    let stored = cogito.stored_fingerprint(project.id)?;
+    let fingerprint = match stored.as_ref() {
+        Some(fp) => fp.clone(),
+        None => {
+            let (fp, _) = cogito.fingerprint(&project, false).await?;
+            fp
+        }
+    };
     let file = cogito_harness_core::map::find_file(&project.path, &fingerprint, file)
         .map_err(|e| anyhow::anyhow!(e))?;
-    let text = cogito_harness_core::map::render_outline(&project.path, &fingerprint, &file)
-        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Try index first.
+    #[allow(clippy::collapsible_if)]
+    if let Some(conn) = cogito.connection() {
+        if let Ok(decls) = cogito_harness_core::index::outline(&conn, project.id, &file) {
+            if !decls.is_empty() {
+                let importer_count =
+                    cogito_harness_core::index::importers(&conn, project.id, &file)
+                        .map(|i| i.len())
+                        .unwrap_or(0);
+                let text = cogito_harness_core::map::render_outline(
+                    &project.path,
+                    stored.as_ref(),
+                    &file,
+                    &decls.into_iter().map(Into::into).collect::<Vec<_>>(),
+                    importer_count,
+                );
+                print!("{text}");
+                return Ok(());
+            }
+        }
+    }
+
+    // Index had no declarations: read from disk.
+    let content = std::fs::read_to_string(project.path.join(&file))
+        .map_err(|e| anyhow::anyhow!("Cannot read {}: {e}", file.display()))?;
+    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let decls = cogito_harness_core::map::outline::declarations(&content, ext);
+    let text =
+        cogito_harness_core::map::render_outline(&project.path, stored.as_ref(), &file, &decls, 0);
     print!("{text}");
     Ok(())
 }
@@ -230,9 +268,35 @@ pub async fn search(query: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
-    let (fingerprint, _) = cogito.fingerprint(&project, false).await?;
-    let found = cogito_harness_core::map::search_paths(&project.path, &fingerprint, query);
-    print!("{}", cogito_harness_core::map::render_search(&found, query));
+    let _ = cogito.sync_index(&project).await?;
+
+    let stored = cogito.stored_fingerprint(project.id)?;
+
+    let hits = if let Some(conn) = cogito.connection() {
+        cogito_harness_core::index::search(&conn, project.id, query, 12)?
+    } else {
+        vec![]
+    };
+
+    let query_lower = query.to_lowercase();
+    let files_first = hits.iter().any(|h| {
+        h.kind != "symbol"
+            && h.path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.to_lowercase() == query_lower)
+                .unwrap_or(false)
+    });
+
+    let modules: Vec<_> = stored
+        .as_ref()
+        .map(|fp| fp.modules.clone())
+        .unwrap_or_default();
+
+    print!(
+        "{}",
+        cogito_harness_core::map::render_search(&hits, &modules, query, files_first)
+    );
     Ok(())
 }
 
@@ -241,12 +305,54 @@ pub async fn related(file: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
-    let (fingerprint, _) = cogito.fingerprint(&project, false).await?;
+    let _ = cogito.sync_index(&project).await?;
+
+    // Need a fingerprint for find_file. Try stored first, then fall back to scan.
+    let stored = cogito.stored_fingerprint(project.id)?;
+    let fingerprint = match stored.as_ref() {
+        Some(fp) => fp.clone(),
+        None => {
+            let (fp, _) = cogito.fingerprint(&project, false).await?;
+            fp
+        }
+    };
     let file = cogito_harness_core::map::find_file(&project.path, &fingerprint, file)
         .map_err(|e| anyhow::anyhow!(e))?;
+
+    let (imports, importers, external) = if let Some(conn) = cogito.connection() {
+        let imports: Vec<String> =
+            cogito_harness_core::index::imports(&conn, project.id, &file).unwrap_or_default();
+        let importers: Vec<String> =
+            cogito_harness_core::index::importers(&conn, project.id, &file)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.display().to_string())
+                .collect();
+        let external: Vec<String> = stored
+            .as_ref()
+            .map(|fp| {
+                fp.data_flows
+                    .iter()
+                    .filter(|flow| flow.from == file && flow.resolved.is_none())
+                    .map(|flow| flow.to.display().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        (imports, importers, external)
+    } else {
+        (vec![], vec![], vec![])
+    };
+
     print!(
         "{}",
-        cogito_harness_core::map::render_related(&project.path, &fingerprint, &file)
+        cogito_harness_core::map::render_related(
+            &project.path,
+            stored.as_ref(),
+            &file,
+            &imports,
+            &importers,
+            &external,
+        )
     );
     Ok(())
 }

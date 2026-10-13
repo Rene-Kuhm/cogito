@@ -6,13 +6,13 @@
 //! (even with a newer mtime) are never re-parsed.
 
 use crate::fingerprint::project_file_paths;
-use crate::map::layout::Resolver;
+use crate::map::layout::{Resolver, find_modules};
 use crate::map::outline::{declarations, is_doc};
 use crate::map::symbols::Declaration;
 use crate::types::Language;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,8 +46,11 @@ impl SyncReport {
 /// One search result.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
-    /// `"symbol"`, `"file"`, or `"doc"`.
-    pub kind: &'static str,
+    /// The symbol kind for symbol hits (e.g., `"function"`, `"class"`), or
+    /// the file type for file/doc hits (`"file"` or `"doc"`).
+    pub kind: String,
+    /// Whether this is a symbol hit (vs a file/doc hit).
+    pub is_symbol: bool,
     /// The matched symbol name or file name.
     pub name: String,
     /// Path to the file containing the match.
@@ -75,6 +78,18 @@ pub struct IndexedDeclaration {
 
 impl From<Declaration> for IndexedDeclaration {
     fn from(d: Declaration) -> Self {
+        Self {
+            kind: d.kind,
+            name: d.name,
+            start: d.start,
+            end: d.end,
+            signature: d.signature,
+        }
+    }
+}
+
+impl From<IndexedDeclaration> for crate::map::outline::Declaration {
+    fn from(d: IndexedDeclaration) -> Self {
         Self {
             kind: d.kind,
             name: d.name,
@@ -199,6 +214,10 @@ pub fn sync(
         .collect();
     report.scanned = current.len();
 
+    // Find workspace modules for import resolution
+    let files_vec: Vec<PathBuf> = current.iter().cloned().collect();
+    let modules = find_modules(root, &files_vec);
+
     // Collect already-indexed paths
     let mut indexed: HashSet<PathBuf> = HashSet::new();
     let mut indexed_stmt = conn.prepare("SELECT path FROM indexed_files WHERE project_id = ?1")?;
@@ -282,7 +301,9 @@ pub fn sync(
                 }
 
                 // Content actually changed: reparse
-                reparse_file(conn, project_id, &abs, rel_path, ext, &content)?;
+                reparse_file(
+                    conn, project_id, &root_abs, &abs, rel_path, ext, &content, &modules,
+                )?;
                 report.modified += 1;
                 report.reparsed += 1;
             }
@@ -291,7 +312,9 @@ pub fn sync(
                 let Ok(content) = fs::read(&abs) else {
                     continue;
                 };
-                reparse_file(conn, project_id, &abs, rel_path, ext, &content)?;
+                reparse_file(
+                    conn, project_id, &root_abs, &abs, rel_path, ext, &content, &modules,
+                )?;
                 report.added += 1;
                 report.reparsed += 1;
             }
@@ -302,13 +325,16 @@ pub fn sync(
 }
 
 /// Index (or re-index) a single file.
+#[allow(clippy::too_many_arguments)]
 fn reparse_file(
     conn: &Connection,
     project_id: Uuid,
+    root: &Path,
     abs: &Path,
     rel_path: &Path,
     ext: &str,
     content: &[u8],
+    modules: &[crate::types::ModuleInfo],
 ) -> Result<()> {
     let content_hash = fnv1a(content);
     let size = content.len() as i64;
@@ -373,12 +399,11 @@ fn reparse_file(
     )?;
 
     if let Ok(lang) = Language::detect(abs) {
-        let root = abs
-            .parent()
-            .and_then(|p| p.ancestors().nth(1))
-            .unwrap_or_else(|| Path::new("."));
-        let files: Vec<PathBuf> = Vec::new();
-        let resolver = Resolver::new(root, &files, &[]);
+        // Build file list for the resolver - all files in the project
+        let files: Vec<PathBuf> = project_file_paths(root)
+            .filter(|p| !p.starts_with(".cogito"))
+            .collect();
+        let resolver = Resolver::new(root, &files, modules);
 
         let raw_imports = crate::fingerprint::extract_imports(abs, &content_str, &lang)?;
         for flow in raw_imports {
@@ -510,7 +535,8 @@ fn fts_search(
                 for row in rows.flatten() {
                     let path = PathBuf::from(&row.1);
                     hits.push(SearchHit {
-                        kind: "symbol",
+                        kind: row.3.clone(),
+                        is_symbol: true,
                         name: row.0.clone(),
                         path: path.clone(),
                         line: row.2 as usize,
@@ -564,7 +590,8 @@ fn fts_search(
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
                     hits.push(SearchHit {
-                        kind: if row.1 == 1 { "doc" } else { "file" },
+                        kind: if row.1 == 1 { "doc" } else { "file" }.to_string(),
+                        is_symbol: false,
                         name: filename.clone(),
                         path: path.clone(),
                         line: 0,
@@ -635,7 +662,8 @@ fn like_fallback(
                 for row in rows.flatten() {
                     let path = PathBuf::from(&row.1);
                     hits.push(SearchHit {
-                        kind: "symbol",
+                        kind: row.3.clone(),
+                        is_symbol: true,
                         name: row.0.clone(),
                         path: path.clone(),
                         line: row.2 as usize,
@@ -692,7 +720,8 @@ fn like_fallback(
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
                     hits.push(SearchHit {
-                        kind: if row.1 == 1 { "doc" } else { "file" },
+                        kind: if row.1 == 1 { "doc" } else { "file" }.to_string(),
+                        is_symbol: false,
                         name: filename.clone(),
                         path: path.clone(),
                         line: 0,
@@ -745,8 +774,8 @@ pub fn search(
     // then match-tier (higher = better), then path, then line.
     hits.sort_by(|a, b| {
         // Class: symbol = 0, file/doc = 1
-        let a_class = if a.kind == "symbol" { 0 } else { 1 };
-        let b_class = if b.kind == "symbol" { 0 } else { 1 };
+        let a_class = if a.is_symbol { 0 } else { 1 };
+        let b_class = if b.is_symbol { 0 } else { 1 };
         if a_class != b_class {
             return a_class.cmp(&b_class);
         }
@@ -809,16 +838,23 @@ pub fn outline(
 // ---------------------------------------------------------------------------
 
 /// All import specs in a file.
+/// Results are deduplicated and deterministically ordered.
+/// Prefers resolved paths over raw specs when available.
 pub fn imports(conn: &Connection, project_id: Uuid, path: &Path) -> Result<Vec<String>> {
     let path_str = path.to_string_lossy();
-    let mut stmt =
-        conn.prepare(r#"SELECT spec FROM indexed_imports WHERE project_id = ?1 AND path = ?2"#)?;
+    let mut stmt = conn.prepare(
+        r#"SELECT COALESCE(resolved, spec) FROM indexed_imports WHERE project_id = ?1 AND path = ?2"#,
+    )?;
     let rows = stmt.query_map(params![project_id.to_string(), path_str], |row| row.get(0))?;
-    let result: Result<Vec<_>, _> = rows.collect();
-    Ok(result?)
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for row in rows {
+        set.insert(row?);
+    }
+    Ok(set.into_iter().collect())
 }
 
 /// All files that import the given path (by resolved path or spec).
+/// Results are deduplicated and deterministically ordered.
 pub fn importers(conn: &Connection, project_id: Uuid, path: &Path) -> Result<Vec<PathBuf>> {
     let path_str = path.to_string_lossy();
     let mut stmt = conn.prepare(
@@ -828,8 +864,11 @@ pub fn importers(conn: &Connection, project_id: Uuid, path: &Path) -> Result<Vec
     let rows = stmt.query_map(params![project_id.to_string(), path_str], |row| {
         Ok(PathBuf::from(row.get::<_, String>(0)?))
     })?;
-    let result: Result<Vec<_>, _> = rows.collect();
-    Ok(result?)
+    let mut set: BTreeSet<PathBuf> = BTreeSet::new();
+    for row in rows {
+        set.insert(row?);
+    }
+    Ok(set.into_iter().collect())
 }
 
 // ---------------------------------------------------------------------------

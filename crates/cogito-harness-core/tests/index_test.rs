@@ -361,7 +361,7 @@ fn test_doc_file_indexed() {
     let hits = index::search(&conn_guard, project_id, "Getting Started", 10).unwrap();
     assert!(
         hits.iter()
-            .any(|h| h.kind == "symbol" && h.name.contains("Getting Started")),
+            .any(|h| h.is_symbol && h.name.contains("Getting Started")),
         "Should find heading 'Getting Started': {:?}",
         hits
     );
@@ -700,6 +700,213 @@ fn test_sync_no_skip_on_dirty_worktree() {
     let report = index::sync(&conn, project_id, root, true).unwrap();
     assert!(report.changed(), "Dirty worktree: should detect change");
     assert!(report.added > 0, "Should have found the new file");
+
+    drop(conn);
+    drop(tmp);
+}
+
+// ---------------------------------------------------------------------------
+// Import resolution tests
+// ---------------------------------------------------------------------------
+
+/// Test: in a TypeScript workspace, the resolver resolves a workspace package
+/// import to its actual file path and tracks importers correctly.
+#[test]
+fn test_typescript_import_resolution() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // Workspace structure:
+    // packages/shared/src/index.ts  -- exports x
+    // apps/web/app/page.tsx         -- imports from @m/shared
+    let shared_src = root.join("packages/shared/src");
+    let web_app = root.join("apps/web/app");
+    fs::create_dir_all(&shared_src).unwrap();
+    fs::create_dir_all(&web_app).unwrap();
+
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"mono","private":true}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("packages/shared/package.json"),
+        r#"{"name":"@m/shared"}"#,
+    )
+    .unwrap();
+    fs::write(shared_src.join("index.ts"), "export const x = 1;\n").unwrap();
+
+    fs::write(root.join("apps/web/package.json"), r#"{"name":"@m/web"}"#).unwrap();
+    fs::write(root.join("apps/web/tsconfig.json"), "{}").unwrap();
+    fs::write(
+        web_app.join("page.tsx"),
+        "import { x } from '@m/shared';\n\nexport default function Page() { return x; }\n",
+    )
+    .unwrap();
+
+    let (cogito, project_id) = init_cogito(root);
+    let conn = cogito.sqlite().unwrap().lock();
+
+    index::sync(&conn, project_id, root, false).unwrap();
+
+    // Query imports for page.tsx: should show the resolved path
+    let shared_file = PathBuf::from("packages/shared/src/index.ts");
+    let page_file = PathBuf::from("apps/web/app/page.tsx");
+
+    let imports = index::imports(&conn, project_id, &page_file).unwrap();
+    assert_eq!(
+        imports.len(),
+        1,
+        "page.tsx should have 1 import: {:?}",
+        imports
+    );
+    assert_eq!(
+        imports[0], "packages/shared/src/index.ts",
+        "Import should be the resolved path, not the raw spec: {}",
+        imports[0]
+    );
+
+    // Query importers of shared/src/index.ts: should show page.tsx
+    let importers = index::importers(&conn, project_id, &shared_file).unwrap();
+    assert_eq!(
+        importers.len(),
+        1,
+        "shared/index.ts should have 1 importer: {:?}",
+        importers
+    );
+    assert_eq!(
+        importers[0], page_file,
+        "Importer should be page.tsx: {:?}",
+        importers[0]
+    );
+
+    drop(conn);
+    drop(tmp);
+}
+
+/// Test: a relative Python import resolves correctly and importers are tracked.
+#[test]
+fn test_python_relative_import_resolution() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // Python package structure:
+    // mypackage/__init__.py  -- defines helper
+    // mypackage/utils.py     -- imports from .helper
+    let pkg = root.join("mypackage");
+    fs::create_dir_all(&pkg).unwrap();
+
+    fs::write(pkg.join("__init__.py"), "# mypackage\n").unwrap();
+    fs::write(pkg.join("helper.py"), "def greet():\n    return 'hello'\n").unwrap();
+    fs::write(
+        pkg.join("utils.py"),
+        "from .helper import greet\n\nprint(greet())\n",
+    )
+    .unwrap();
+
+    let (cogito, project_id) = init_cogito(root);
+    let conn = cogito.sqlite().unwrap().lock();
+
+    index::sync(&conn, project_id, root, false).unwrap();
+
+    let utils_file = PathBuf::from("mypackage/utils.py");
+    let helper_file = PathBuf::from("mypackage/helper.py");
+
+    // Query imports for utils.py: should show the resolved path
+    let imports = index::imports(&conn, project_id, &utils_file).unwrap();
+    assert_eq!(
+        imports.len(),
+        1,
+        "utils.py should have 1 import: {:?}",
+        imports
+    );
+    assert_eq!(
+        imports[0], "mypackage/helper.py",
+        "Import should be the resolved path: {}",
+        imports[0]
+    );
+
+    // Query importers of helper.py: should show utils.py
+    let importers = index::importers(&conn, project_id, &helper_file).unwrap();
+    assert_eq!(
+        importers.len(),
+        1,
+        "helper.py should have 1 importer: {:?}",
+        importers
+    );
+    assert_eq!(
+        importers[0], utils_file,
+        "Importer should be utils.py: {:?}",
+        importers[0]
+    );
+
+    drop(conn);
+    drop(tmp);
+}
+
+/// Test: a bare external package name (no workspace package) stays unresolved.
+/// When we query for a file that doesn't exist but is referenced as an external
+/// import, the imports query correctly returns the raw spec (not a resolved path).
+#[test]
+fn test_external_package_stays_unresolved() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    fs::write(root.join("package.json"), r#"{"name":"myapp"}"#).unwrap();
+    // A file that imports a package not in the workspace
+    fs::write(
+        src.join("app.ts"),
+        "import React from 'react';\n\nexport const App = () => null;\n",
+    )
+    .unwrap();
+
+    let (cogito, project_id) = init_cogito(root);
+    let conn = cogito.sqlite().unwrap().lock();
+
+    index::sync(&conn, project_id, root, false).unwrap();
+
+    let app_file = PathBuf::from("src/app.ts");
+
+    // The import should be stored with raw spec, resolved should be NULL
+    let imports = index::imports(&conn, project_id, &app_file).unwrap();
+    assert_eq!(
+        imports.len(),
+        1,
+        "app.ts should have 1 import: {:?}",
+        imports
+    );
+    // COALESCE(resolved, spec) returns spec when resolved is NULL
+    assert_eq!(
+        imports[0], "react",
+        "External import should return raw spec, not resolved path: {}",
+        imports[0]
+    );
+
+    // A non-existent file path (like 'react' the external package) should not
+    // be treated as a real file. The importers query finds files with matching
+    // spec, but this is expected: external imports are stored by spec.
+    let external_pkg = PathBuf::from("react");
+    let importers = index::importers(&conn, project_id, &external_pkg).unwrap();
+    // app.ts imports 'react' by spec, so it shows up as an importer of 'react'
+    // This is correct behavior: importers query finds files by spec OR resolved path
+    assert_eq!(
+        importers.len(),
+        1,
+        "Files that import external package by spec should be found: {:?}",
+        importers
+    );
+
+    // Key check: querying for a non-existent real file path returns nothing
+    let fake_file = PathBuf::from("node_modules/react/index.js");
+    let fake_importers = index::importers(&conn, project_id, &fake_file).unwrap();
+    assert!(
+        fake_importers.is_empty(),
+        "No importers should exist for non-imported fake path: {:?}",
+        fake_importers
+    );
 
     drop(conn);
     drop(tmp);

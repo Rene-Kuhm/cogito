@@ -105,6 +105,17 @@ async fn mapped_project(
     Ok((cogito, project, fingerprint))
 }
 
+/// The project and its stored fingerprint (no scan), for index-only queries.
+fn indexed_project(
+    path: &str,
+) -> Result<(cogito_harness_core::Cogito, Project, Option<Fingerprint>), String> {
+    let (cogito, project) = open_project(path)?;
+    let stored = cogito
+        .stored_fingerprint(project.id)
+        .map_err(|e| format!("Failed to load stored fingerprint: {e}"))?;
+    Ok((cogito, project, stored))
+}
+
 #[tool_router]
 impl CogitoServer {
     pub fn new() -> Self {
@@ -132,12 +143,54 @@ impl CogitoServer {
         &self,
         Parameters(req): Parameters<RelatedFilesRequest>,
     ) -> Result<String, String> {
-        let (_, project, fingerprint) = mapped_project(&req.path, false).await?;
+        let (cogito, project, stored) = indexed_project(&req.path)?;
+        let _ = cogito
+            .sync_index(&project)
+            .await
+            .map_err(|e| format!("Index sync failed: {e}"))?;
+
+        // We need a fingerprint for find_file. Fall back to scanning if needed.
+        let fingerprint = match stored.as_ref() {
+            Some(fp) => fp.clone(),
+            None => {
+                let (_, _, fp) = mapped_project(&req.path, false).await?;
+                fp
+            }
+        };
         let file = cogito_harness_core::map::find_file(&project.path, &fingerprint, &req.file)?;
+
+        let conn = cogito
+            .connection()
+            .ok_or_else(|| "No SQLite connection".to_string())?;
+        let imports: Vec<String> = cogito_harness_core::index::imports(&conn, project.id, &file)
+            .map_err(|e| format!("Failed to query imports: {e}"))?;
+        let importers: Vec<String> =
+            cogito_harness_core::index::importers(&conn, project.id, &file)
+                .map_err(|e| format!("Failed to query importers: {e}"))?
+                .into_iter()
+                .map(|p| p.display().to_string())
+                .collect();
+
+        // External specs come from the stored fingerprint's data_flows where
+        // no resolution exists. If we don't have a stored fingerprint, show none.
+        let external: Vec<String> = stored
+            .as_ref()
+            .map(|fp| {
+                fp.data_flows
+                    .iter()
+                    .filter(|flow| flow.from == file && flow.resolved.is_none())
+                    .map(|flow| flow.to.display().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(cogito_harness_core::map::render_related(
             &project.path,
-            &fingerprint,
+            stored.as_ref(),
             &file,
+            &imports,
+            &importers,
+            &external,
         ))
     }
 
@@ -148,9 +201,54 @@ impl CogitoServer {
         &self,
         Parameters(req): Parameters<RelatedFilesRequest>,
     ) -> Result<String, String> {
-        let (_, project, fingerprint) = mapped_project(&req.path, false).await?;
+        let (cogito, project, stored) = indexed_project(&req.path)?;
+        let _ = cogito
+            .sync_index(&project)
+            .await
+            .map_err(|e| format!("Index sync failed: {e}"))?;
+
+        // We need a fingerprint for find_file. Fall back to scanning if needed.
+        let fingerprint = match stored.as_ref() {
+            Some(fp) => fp.clone(),
+            None => {
+                let (_, _, fp) = mapped_project(&req.path, false).await?;
+                fp
+            }
+        };
         let file = cogito_harness_core::map::find_file(&project.path, &fingerprint, &req.file)?;
-        cogito_harness_core::map::render_outline(&project.path, &fingerprint, &file)
+
+        // Try the index first.
+        #[allow(clippy::collapsible_if)]
+        if let Some(conn) = cogito.connection() {
+            if let Ok(decls) = cogito_harness_core::index::outline(&conn, project.id, &file) {
+                if !decls.is_empty() {
+                    let importer_count =
+                        cogito_harness_core::index::importers(&conn, project.id, &file)
+                            .map(|i| i.len())
+                            .unwrap_or(0);
+                    return Ok(cogito_harness_core::map::render_outline(
+                        &project.path,
+                        stored.as_ref(),
+                        &file,
+                        &decls.into_iter().map(Into::into).collect::<Vec<_>>(),
+                        importer_count,
+                    ));
+                }
+            }
+        };
+
+        // Index had no declarations or no index: read and parse from disk.
+        let content = std::fs::read_to_string(project.path.join(&file))
+            .map_err(|e| format!("Cannot read {}: {e}", file.display()))?;
+        let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let decls = cogito_harness_core::map::outline::declarations(&content, ext);
+        Ok(cogito_harness_core::map::render_outline(
+            &project.path,
+            stored.as_ref(),
+            &file,
+            &decls,
+            0,
+        ))
     }
 
     #[tool(
@@ -160,9 +258,42 @@ impl CogitoServer {
         &self,
         Parameters(req): Parameters<SearchCodeRequest>,
     ) -> Result<String, String> {
-        let (_, project, fingerprint) = mapped_project(&req.path, false).await?;
-        let found = cogito_harness_core::map::search_paths(&project.path, &fingerprint, &req.query);
-        Ok(cogito_harness_core::map::render_search(&found, &req.query))
+        let (cogito, project, stored) = indexed_project(&req.path)?;
+        let _ = cogito
+            .sync_index(&project)
+            .await
+            .map_err(|e| format!("Index sync failed: {e}"))?;
+
+        let hits = if let Some(conn) = cogito.connection() {
+            cogito_harness_core::index::search(&conn, project.id, &req.query, 12)
+                .map_err(|e| format!("Search failed: {e}"))?
+        } else {
+            vec![]
+        };
+
+        // Determine files_first: true when a file is named exactly like the query.
+        let query_lower = req.query.to_lowercase();
+        let files_first = hits.iter().any(|h| {
+            h.kind != "symbol"
+                && h.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_lowercase() == query_lower)
+                    .unwrap_or(false)
+        });
+
+        // Module names from the stored fingerprint, not from a new scan.
+        let modules: Vec<_> = stored
+            .as_ref()
+            .map(|fp| fp.modules.clone())
+            .unwrap_or_default();
+
+        Ok(cogito_harness_core::map::render_search(
+            &hits,
+            &modules,
+            &req.query,
+            files_first,
+        ))
     }
 }
 
