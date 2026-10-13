@@ -115,6 +115,12 @@ enum Commands {
         /// Show what would change without writing anything
         #[arg(long)]
         dry_run: bool,
+        /// Declare Pi's npm package even if the registry check cannot confirm
+        /// it is installable. Only use this when you know it is published:
+        /// Pi runs `npm install` for every declared package, and a 404 there
+        /// stops the agent from starting.
+        #[arg(long)]
+        with_pi_package: bool,
     },
 
     /// Remove Cogito from one or more AI agents
@@ -284,7 +290,8 @@ async fn main() -> Result<()> {
             all,
             yes,
             dry_run,
-        }) => commands::setup(agents, all || yes, dry_run)?,
+            with_pi_package,
+        }) => commands::setup(agents, all || yes, dry_run, with_pi_package)?,
         Some(Commands::Uninstall { agents, yes }) => commands::uninstall(agents, yes)?,
         Some(Commands::Serve { port, mcp }) => commands::serve(port, mcp).await?,
         Some(Commands::Stats) => commands::stats(args.json).await?,

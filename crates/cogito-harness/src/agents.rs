@@ -34,6 +34,111 @@ pub const SERVER_KEY: &str = "cogito";
 /// The npm package that gives Gentle Shell first-class support.
 pub const PI_PACKAGE: &str = "npm:cogito-harness";
 
+/// Bare npm name behind [`PI_PACKAGE`].
+pub const PI_PACKAGE_NAME: &str = "cogito-harness";
+
+/// What `install` should do about Pi's npm package.
+///
+/// A bare boolean is not enough: `Leave` has to exist so that a registry we
+/// could not reach does not silently delete a declaration the user added by
+/// hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PiPackageAction {
+    /// Ensure the package is declared.
+    Declare,
+    /// Ensure it is not declared. Used when the registry positively says 404,
+    /// so a declaration that would break Pi can be repaired.
+    Remove,
+    /// Touch nothing. Used when npm could not be reached.
+    Leave,
+}
+
+/// Outcome of asking npm whether a package exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NpmCheck {
+    /// The registry has it.
+    Published,
+    /// The registry answered 404.
+    NotFound,
+    /// npm is missing, the registry is unreachable, or the check timed out.
+    /// The reason is for display only.
+    Unavailable(String),
+}
+
+/// Ask npm whether `name` exists in the configured registry.
+///
+/// Declaring a package Pi cannot install is not harmless: Pi runs
+/// `npm install` for every entry in `packages`, so a 404 aborts package
+/// resolution and the agent fails to start. Setup therefore checks first.
+///
+/// `npm view` is used rather than a direct request to registry.npmjs.org so
+/// that whatever registry, mirror or scope the user configured is respected.
+fn npm_check(name: &str) -> NpmCheck {
+    use std::process::{Command, Stdio};
+
+    let mut child = match Command::new("npm")
+        .args([
+            "view",
+            name,
+            "version",
+            // Do not let a slow registry hang setup.
+            "--fetch-timeout=8000",
+            "--fetch-retries=0",
+            "--no-audit",
+            "--no-fund",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return NpmCheck::Unavailable(format!("npm not runnable: {e}")),
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    NpmCheck::Published
+                } else {
+                    // npm exits non-zero for 404 and for network errors alike.
+                    // Either way we must not declare the package.
+                    NpmCheck::NotFound
+                };
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return NpmCheck::Unavailable("npm timed out after 12s".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return NpmCheck::Unavailable(format!("npm did not run: {e}")),
+        }
+    }
+}
+
+/// Public wrapper: is the Pi package installable right now?
+pub fn pi_package_check() -> NpmCheck {
+    npm_check(PI_PACKAGE_NAME)
+}
+
+/// Whether Pi's settings already declare the Cogito package.
+pub fn pi_package_declared(home: &Path) -> bool {
+    let path = Agent::GentleShell.config_path(home);
+    read_json(&path)
+        .ok()
+        .and_then(|v| {
+            v.get("packages")
+                .and_then(|p| p.as_array())
+                .map(|arr| arr.iter().any(|e| e.as_str() == Some(PI_PACKAGE)))
+        })
+        .unwrap_or(false)
+}
+
 /// Every agent Cogito knows how to configure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agent {
@@ -483,15 +588,10 @@ pub fn status(agent: Agent, home: &Path, binary: &Path) -> Result<Status> {
     let want = desired_server_entry(agent, &bin);
 
     if agent.uses_pi_package() {
-        let value = read_json(&path)?;
-        let package_ok = value
-            .get("packages")
-            .and_then(|p| p.as_array())
-            .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(PI_PACKAGE)));
-        if !package_ok {
-            return Ok(Status::NotConfigured);
-        }
-
+        // The npm package is optional: it adds the status line and `/cogito`,
+        // while the MCP entry is what provides the tools. Requiring the
+        // package here would report a working setup as missing whenever the
+        // package is not published or not declared.
         let Some(mcp_path) = agent.mcp_config_path(home) else {
             return Ok(Status::NotConfigured);
         };
@@ -540,8 +640,29 @@ pub fn status(agent: Agent, home: &Path, binary: &Path) -> Result<Status> {
 }
 
 /// Configure `agent` to use the `cogito` binary at `binary`.
-pub fn install(agent: Agent, home: &Path, binary: &Path) -> Result<Change> {
-    if status(agent, home, binary)? == Status::Configured {
+/// Install or repair `agent`'s configuration.
+///
+/// `pi_package` only affects Pi / Gentle Shell: it decides what happens to the
+/// npm package in `settings.json`. The caller resolves that from the registry,
+/// because declaring a package npm cannot install makes Pi fail to start.
+pub fn install(
+    agent: Agent,
+    home: &Path,
+    binary: &Path,
+    pi_package: PiPackageAction,
+) -> Result<Change> {
+    let package_settled = if !agent.uses_pi_package() {
+        true
+    } else {
+        let declared = pi_package_declared(home);
+        match pi_package {
+            PiPackageAction::Declare => declared,
+            PiPackageAction::Remove => !declared,
+            PiPackageAction::Leave => true,
+        }
+    };
+
+    if status(agent, home, binary)? == Status::Configured && package_settled {
         return Ok(Change::AlreadyCorrect);
     }
 
@@ -550,20 +671,26 @@ pub fn install(agent: Agent, home: &Path, binary: &Path) -> Result<Change> {
     let bin = binary.display().to_string();
 
     if agent.uses_pi_package() {
-        // (1) Declare the pi package that provides the session adapter.
-        let mut value = read_json_or_default(&path);
-        let packages = value
-            .as_object_mut()
-            .context("settings.json is not an object")?
-            .entry("packages")
-            .or_insert_with(|| json!([]));
-        let arr = packages
-            .as_array_mut()
-            .context("`packages` is not an array")?;
-        if !arr.iter().any(|v| v.as_str() == Some(PI_PACKAGE)) {
-            arr.push(json!(PI_PACKAGE));
+        // (1) Reconcile the pi package that provides the session adapter.
+        if pi_package != PiPackageAction::Leave {
+            let mut value = read_json_or_default(&path);
+            let obj = value
+                .as_object_mut()
+                .context("settings.json is not an object")?;
+            let packages = obj.entry("packages").or_insert_with(|| json!([]));
+            let arr = packages
+                .as_array_mut()
+                .context("`packages` is not an array")?;
+            let present = arr.iter().any(|v| v.as_str() == Some(PI_PACKAGE));
+            match pi_package {
+                PiPackageAction::Declare if !present => arr.push(json!(PI_PACKAGE)),
+                PiPackageAction::Remove if present => {
+                    arr.retain(|v| v.as_str() != Some(PI_PACKAGE));
+                }
+                _ => {}
+            }
+            write_json(&path, &value)?;
         }
-        write_json(&path, &value)?;
 
         // (2) Register the MCP server. Pi reads MCP servers from its own file.
         if let Some(mcp_path) = agent.mcp_config_path(home) {
@@ -875,7 +1002,13 @@ mod tests {
             Status::NotConfigured
         );
 
-        let change = install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        let change = install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
         assert!(matches!(change, Change::Written { backup: Some(_) }));
         assert_eq!(
             status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
@@ -893,7 +1026,13 @@ mod tests {
 
         // Idempotent
         assert!(matches!(
-            install(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
+            install(
+                Agent::ClaudeCode,
+                home.path(),
+                &bin(),
+                PiPackageAction::Leave
+            )
+            .unwrap(),
             Change::AlreadyCorrect
         ));
 
@@ -916,7 +1055,7 @@ mod tests {
         )
         .unwrap();
 
-        install(Agent::Codex, home.path(), &bin()).unwrap();
+        install(Agent::Codex, home.path(), &bin(), PiPackageAction::Leave).unwrap();
         let text = std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
 
         assert!(
@@ -954,7 +1093,13 @@ mod tests {
             Status::NotConfigured
         );
 
-        install(Agent::GentleShell, home.path(), &bin()).unwrap();
+        install(
+            Agent::GentleShell,
+            home.path(),
+            &bin(),
+            PiPackageAction::Declare,
+        )
+        .unwrap();
 
         // 1. the pi package is declared
         let settings = read_json(&home.path().join(".gentle-shell/agent/settings.json")).unwrap();
@@ -1000,7 +1145,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, r#"{"$schema":"x"}"#).unwrap();
 
-            install(agent, home.path(), &bin()).unwrap();
+            install(agent, home.path(), &bin(), PiPackageAction::Leave).unwrap();
             let value = read_json(&path).unwrap();
             assert_eq!(value["$schema"], "x", "existing keys survive");
             assert!(
@@ -1021,7 +1166,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, r#"{"security":{}}"#).unwrap();
 
-        install(Agent::Gemini, home.path(), &bin()).unwrap();
+        install(Agent::Gemini, home.path(), &bin(), PiPackageAction::Leave).unwrap();
         let value = read_json(&path).unwrap();
         assert_eq!(value["security"], json!({}));
         assert_eq!(
@@ -1051,7 +1196,13 @@ mod tests {
             Status::NotConfigured
         );
 
-        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
 
         // 1. The hook script exists and is executable.
         let script = home.path().join(".claude/hooks/cogito-session-start.sh");
@@ -1088,7 +1239,13 @@ mod tests {
         );
 
         // Idempotent: installing again must not duplicate the hook
-        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
         let settings = read_json(&home.path().join(".claude/settings.json")).unwrap();
         assert_eq!(
             settings["hooks"]["SessionStart"].as_array().unwrap().len(),
@@ -1112,7 +1269,7 @@ mod tests {
         std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
         std::fs::write(&cfg, r#"{"$schema":"x"}"#).unwrap();
 
-        install(Agent::Opencode, home.path(), &bin()).unwrap();
+        install(Agent::Opencode, home.path(), &bin(), PiPackageAction::Leave).unwrap();
 
         let plugin = home.path().join(".config/opencode/plugins/cogito.js");
         assert!(plugin.exists(), "opencode plugin written");
@@ -1170,7 +1327,13 @@ mod tests {
         .unwrap();
 
         // Install must ADD ours, not consider the foreign one sufficient.
-        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
         let settings = read_json(&home.path().join(".claude/settings.json")).unwrap();
         let entries = settings["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(
@@ -1201,7 +1364,13 @@ mod tests {
         std::fs::create_dir_all(home.path().join(".gentle-shell/agent")).unwrap();
         std::fs::write(home.path().join(".gentle-shell/agent/settings.json"), "{}").unwrap();
 
-        install(Agent::GentleShell, home.path(), &bin()).unwrap();
+        install(
+            Agent::GentleShell,
+            home.path(),
+            &bin(),
+            PiPackageAction::Declare,
+        )
+        .unwrap();
 
         let mcp = read_json(&home.path().join(".gentle-shell/agent/mcp.json")).unwrap();
         let entry = &mcp["mcpServers"][SERVER_KEY];
@@ -1233,7 +1402,13 @@ mod tests {
         )
         .unwrap();
 
-        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
 
         let text = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
         let zeta = text.find("\"zeta\"").expect("zeta present");
@@ -1268,7 +1443,13 @@ mod tests {
             "a stale entry must not be reported as configured"
         );
 
-        let change = install(Agent::GentleShell, home.path(), &bin()).unwrap();
+        let change = install(
+            Agent::GentleShell,
+            home.path(),
+            &bin(),
+            PiPackageAction::Declare,
+        )
+        .unwrap();
         assert!(
             matches!(change, Change::Written { .. }),
             "install must repair a stale entry"
@@ -1294,7 +1475,13 @@ mod tests {
             format!(r#"{{"packages":["{PI_PACKAGE}"]}}"#),
         )
         .unwrap();
-        install(Agent::GentleShell, home.path(), &bin()).unwrap();
+        install(
+            Agent::GentleShell,
+            home.path(),
+            &bin(),
+            PiPackageAction::Declare,
+        )
+        .unwrap();
 
         // What Pi's `/mcp` writes when the user turns the server off and picks
         // another exposure, plus a field of their own.
@@ -1318,7 +1505,13 @@ mod tests {
             status(Agent::GentleShell, home.path(), &other).unwrap(),
             Status::Outdated
         );
-        install(Agent::GentleShell, home.path(), &other).unwrap();
+        install(
+            Agent::GentleShell,
+            home.path(),
+            &other,
+            PiPackageAction::Leave,
+        )
+        .unwrap();
         let entry = &read_json(&mcp_path).unwrap()["mcpServers"][SERVER_KEY];
         assert_eq!(entry["command"], "/opt/other/cogito");
         assert_eq!(entry["enabled"], false);
@@ -1340,7 +1533,7 @@ mod tests {
             status(Agent::Codex, home.path(), &bin()).unwrap(),
             Status::Outdated
         );
-        install(Agent::Codex, home.path(), &bin()).unwrap();
+        install(Agent::Codex, home.path(), &bin(), PiPackageAction::Leave).unwrap();
 
         let text = std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
         assert!(text.contains("/usr/local/bin/cogito"), "{text}");
@@ -1356,7 +1549,13 @@ mod tests {
     fn test_missing_claude_hook_entry_is_outdated_and_restored() {
         let home = TempDir::new().unwrap();
         std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
-        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
 
         // The script is still on disk, but settings no longer run it.
         let settings_path = home.path().join(".claude/settings.json");
@@ -1368,7 +1567,13 @@ mod tests {
             "a hook script nothing runs is not configured"
         );
 
-        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
         let script = Agent::ClaudeCode.hook_script_path(home.path()).unwrap();
         let settings = read_json(&settings_path).unwrap();
         assert!(
@@ -1391,7 +1596,13 @@ mod tests {
         std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
         std::fs::create_dir_all(home.path().join(".claude/hooks")).unwrap();
 
-        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
         assert_eq!(
             status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
             Status::Configured
@@ -1407,7 +1618,13 @@ mod tests {
             "an out-of-date hook script must be reported"
         );
 
-        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
         let rewritten = std::fs::read_to_string(&script).unwrap();
         assert!(
             rewritten.contains("-e .git"),
@@ -1424,7 +1641,13 @@ mod tests {
         let home = TempDir::new().unwrap();
         std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
 
-        install(Agent::ClaudeCode, home.path(), &bin()).unwrap();
+        install(
+            Agent::ClaudeCode,
+            home.path(),
+            &bin(),
+            PiPackageAction::Leave,
+        )
+        .unwrap();
         assert_eq!(
             status(Agent::ClaudeCode, home.path(), &bin()).unwrap(),
             Status::Configured
@@ -1461,6 +1684,87 @@ mod tests {
     }
 
     #[test]
+    fn test_pi_package_is_not_declared_by_default() {
+        // Pi runs `npm install` for every declared package, and a 404 aborts
+        // package resolution. Declaring an unpublished name would stop the
+        // agent from starting, so the MCP half is configured on its own.
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".gentle-shell/agent")).unwrap();
+        std::fs::write(
+            home.path().join(".gentle-shell/agent/settings.json"),
+            r#"{"tuiMode":"fullscreen","packages":["npm:other"]}"#,
+        )
+        .unwrap();
+
+        install(
+            Agent::GentleShell,
+            home.path(),
+            &bin(),
+            PiPackageAction::Remove,
+        )
+        .unwrap();
+
+        let settings = read_json(&home.path().join(".gentle-shell/agent/settings.json")).unwrap();
+        let packages = settings["packages"].as_array().unwrap();
+        assert!(packages.iter().any(|v| v == "npm:other"), "existing kept");
+        assert!(
+            !packages.iter().any(|v| v == PI_PACKAGE),
+            "must not declare an unverified package: {settings}"
+        );
+
+        // The MCP half still lands, so the tools work.
+        let mcp = read_json(&home.path().join(".gentle-shell/agent/mcp.json")).unwrap();
+        assert_eq!(mcp["mcpServers"][SERVER_KEY]["exposure"], "direct");
+
+        // And the agent must read as configured: the package is optional.
+        assert_eq!(
+            status(Agent::GentleShell, home.path(), &bin()).unwrap(),
+            Status::Configured
+        );
+        assert!(!pi_package_declared(home.path()));
+    }
+
+    #[test]
+    fn test_pi_package_declarable_on_request() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".gentle-shell/agent")).unwrap();
+        std::fs::write(home.path().join(".gentle-shell/agent/settings.json"), "{}").unwrap();
+
+        install(
+            Agent::GentleShell,
+            home.path(),
+            &bin(),
+            PiPackageAction::Declare,
+        )
+        .unwrap();
+        assert!(pi_package_declared(home.path()));
+
+        // Repairing with the package off must remove it again, otherwise a
+        // bad declaration could never be backed out.
+        install(
+            Agent::GentleShell,
+            home.path(),
+            &bin(),
+            PiPackageAction::Remove,
+        )
+        .unwrap();
+        assert!(
+            !pi_package_declared(home.path()),
+            "package must be removable by re-running setup without it"
+        );
+    }
+
+    #[test]
+    fn test_npm_check_reports_missing_package_as_not_found() {
+        // A name that cannot exist must not read as published.
+        let check = npm_check("cogito-harness-definitely-not-published-xyz");
+        assert!(
+            !matches!(check, NpmCheck::Published),
+            "an unpublished package must not read as published, got {check:?}"
+        );
+    }
+
+    #[test]
     fn test_missing_agent_reports_not_installed() {
         let home = TempDir::new().unwrap();
         assert_eq!(
@@ -1473,7 +1777,7 @@ mod tests {
     fn test_install_creates_missing_parent_dirs() {
         let home = TempDir::new().unwrap();
         // No .config/crush at all; agent_present() is false but install must still work
-        let change = install(Agent::Crush, home.path(), &bin()).unwrap();
+        let change = install(Agent::Crush, home.path(), &bin(), PiPackageAction::Leave).unwrap();
         assert!(matches!(change, Change::Written { .. }));
         assert!(home.path().join(".config/crush/crush.json").exists());
     }

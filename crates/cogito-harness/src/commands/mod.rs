@@ -631,6 +631,40 @@ pub async fn doctor() -> Result<()> {
         println!("  {mark} {:<20} {}", agent.display(), status.label());
     }
 
+    // The Pi package is optional and separate from the MCP entry, so it gets
+    // its own line rather than making Gentle Shell look unconfigured.
+    if crate::agents::Agent::GentleShell.agent_present(&home) {
+        let declared = crate::agents::pi_package_declared(&home);
+        if declared {
+            println!();
+            println!(
+                "  ✓ {} declared in {}",
+                crate::agents::PI_PACKAGE,
+                crate::agents::Agent::GentleShell
+                    .config_path(&home)
+                    .display()
+            );
+        } else {
+            let check = crate::agents::pi_package_check();
+            println!();
+            println!("  · {} not declared", crate::agents::PI_PACKAGE);
+            println!(
+                "    {}",
+                match check {
+                    crate::agents::NpmCheck::Published => {
+                        "available on npm — re-run `cogito setup` to declare it"
+                    }
+                    crate::agents::NpmCheck::NotFound => {
+                        "not on npm yet; the MCP tools work without it"
+                    }
+                    crate::agents::NpmCheck::Unavailable(_) => {
+                        "npm unreachable; the MCP tools work without it"
+                    }
+                }
+            );
+        }
+    }
+
     println!();
     if outdated > 0 {
         println!(
@@ -685,7 +719,7 @@ fn looks_installed(binary: &Path) -> bool {
 }
 
 /// Install Cogito into the requested (or all detected) agents.
-pub fn setup(agents: Vec<String>, all: bool, dry_run: bool) -> Result<()> {
+pub fn setup(agents: Vec<String>, all: bool, dry_run: bool, with_pi_package: bool) -> Result<()> {
     let home = crate::agents::home_dir()?;
     let binary = std::env::current_exe().context("Cannot locate the cogito binary")?;
 
@@ -725,16 +759,64 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool) -> Result<()> {
     }
     println!();
 
+    // Resolve the Pi package once, before writing anything.
+    //
+    // Pi runs `npm install` for every entry in `settings.json`, so declaring a
+    // package the registry does not have makes the agent fail to start. The
+    // package is therefore only declared when npm can actually install it.
+    let needs_pi_package = selected.iter().any(|a| a.uses_pi_package());
+    let pi_package = if needs_pi_package {
+        Some(crate::agents::pi_package_check())
+    } else {
+        None
+    };
+    let pi_action = match (&pi_package, with_pi_package) {
+        // An explicit request wins: the user knows it is available.
+        (Some(_), true) => crate::agents::PiPackageAction::Declare,
+        (Some(check), false) => match check {
+            crate::agents::NpmCheck::Published => crate::agents::PiPackageAction::Declare,
+            // Positively absent: also clear a declaration that would break Pi.
+            crate::agents::NpmCheck::NotFound => crate::agents::PiPackageAction::Remove,
+            // Could not tell: leave whatever the user has alone.
+            crate::agents::NpmCheck::Unavailable(_) => crate::agents::PiPackageAction::Leave,
+        },
+        (None, _) => crate::agents::PiPackageAction::Leave,
+    };
+
+    if let Some(check) = &pi_package {
+        println!("Pi package  {}", crate::agents::PI_PACKAGE);
+        match check {
+            crate::agents::NpmCheck::Published => {
+                println!("            found on npm; it will be declared");
+            }
+            crate::agents::NpmCheck::NotFound => {
+                println!("            not on npm yet; only the MCP half will be configured");
+                println!("            (declaring it now would make Pi fail to install packages)");
+                println!("            re-run setup after it is published, or force it with");
+                println!("            --with-pi-package if you know it is available");
+            }
+            crate::agents::NpmCheck::Unavailable(reason) => {
+                println!("            could not check npm ({reason})");
+                println!("            skipping it; the MCP half is configured either way");
+                println!("            use --with-pi-package to declare it regardless");
+            }
+        }
+        println!();
+    }
+
     for agent in selected {
-        if agent.uses_pi_package() {
+        if agent.uses_pi_package() && pi_action == crate::agents::PiPackageAction::Declare {
             println!("  {}:", agent.display());
             println!(
-                "    registers the npm package `{}` in {}",
+                "    declares the npm package `{}` in {}",
                 crate::agents::PI_PACKAGE,
                 agent.config_path(&home).display()
             );
+        } else if agent.uses_pi_package() {
+            println!("  {}:", agent.display());
             println!(
-                "    note: that package is not published yet — the agent will skip it until it is"
+                "    MCP only; `{}` is not declared",
+                crate::agents::PI_PACKAGE
             );
         }
 
@@ -753,7 +835,7 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool) -> Result<()> {
             continue;
         }
 
-        match crate::agents::install(agent, &home, &binary) {
+        match crate::agents::install(agent, &home, &binary, pi_action) {
             Ok(crate::agents::Change::AlreadyCorrect) => {
                 println!("  {} — already up to date", agent.display());
                 configured.push(agent);
