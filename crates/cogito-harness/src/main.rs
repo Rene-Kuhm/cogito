@@ -244,8 +244,17 @@ fn setup_logging(verbose: bool, quiet: bool) {
         EnvFilter::new("info")
     };
 
+    // Logs go to stderr. stdout carries program output: JSON for `--json`, and
+    // for `cogito mcp` the JSON-RPC stream itself, where any other line is a
+    // protocol error for the client.
+    let stderr_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stderr());
     tracing_subscriber::registry()
-        .with(fmt::layer().with_target(true))
+        .with(
+            fmt::layer()
+                .with_target(true)
+                .with_writer(std::io::stderr)
+                .with_ansi(stderr_is_terminal),
+        )
         .with(filter)
         .init();
 }

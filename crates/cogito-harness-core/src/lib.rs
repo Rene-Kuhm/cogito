@@ -191,7 +191,31 @@ impl Cogito {
 
     /// Generate fingerprint for a project
     pub async fn generate_fingerprint(&self, project: &Project) -> Result<Fingerprint> {
-        fingerprint::generate(project).await
+        let fingerprint = fingerprint::generate(project).await?;
+        // Store it, so stats and later sessions see the latest scan. A failed
+        // write does not fail the scan: the fingerprint itself is still valid.
+        if let Err(e) = self.store_fingerprint(project, &fingerprint) {
+            tracing::warn!("[cogito] Could not store the fingerprint: {e:#}");
+        }
+        Ok(fingerprint)
+    }
+
+    /// Persist `fingerprint` as `project`'s current one.
+    fn store_fingerprint(&self, project: &Project, fingerprint: &Fingerprint) -> Result<()> {
+        // The fingerprint row references the project row.
+        self.register_project(project)?;
+        if let Some(conn) = self.connection() {
+            crate::storage::sqlite::save_fingerprint(&conn, fingerprint)?;
+        }
+        Ok(())
+    }
+
+    /// The fingerprint stored by the last scan, if any.
+    pub fn stored_fingerprint(&self, project_id: Uuid) -> Result<Option<Fingerprint>> {
+        match self.connection() {
+            Some(conn) => crate::storage::sqlite::load_fingerprint(&conn, project_id),
+            None => Ok(None),
+        }
     }
 
     /// Compress context
@@ -248,6 +272,7 @@ impl Cogito {
                 tags_count: 0,
                 decisions_count: 0,
                 hot_zones_count: 0,
+                fingerprint_generated_at: None,
             }),
         }
     }

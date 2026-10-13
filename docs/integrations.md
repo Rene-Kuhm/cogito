@@ -86,7 +86,7 @@ Two halves, both written by setup:
 Three files:
 
 - `~/.claude.json` gets `mcpServers.cogito`.
-- `~/.claude/hooks/cogito-session-start.sh` warms the fingerprint. It exits 0
+- `~/.claude/hooks/cogito-session-start.sh` refreshes the stored fingerprint. It exits 0
   when `cogito` is missing and backgrounds the scan with `nohup`, so it can
   never fail or slow a session.
 - `~/.claude/settings.json` gets a `SessionStart` entry running that script

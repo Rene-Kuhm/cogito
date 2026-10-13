@@ -125,7 +125,7 @@ impl CogitoServer {
 
     /// Generate a code fingerprint for a project.
     #[tool(
-        description = "Generate a code fingerprint (entry points, data flows, hot/cold zones) for a project. Returns a summary of the project structure and zone analysis based on git history."
+        description = "Generate a code fingerprint (entry points, data flows, hot/cold zones) for a project. Returns a summary of the project structure and its most changed files according to git history, and stores the result for the project."
     )]
     async fn scan_project(
         &self,
@@ -310,7 +310,7 @@ impl CogitoServer {
 
     /// Project storage statistics.
     #[tool(
-        description = "Report how much knowledge Cogito has stored for a project: number of tags, decisions and cached hot zones."
+        description = "Report how much knowledge Cogito has stored for a project: number of tags and decisions, and when the project was last scanned (with its hot zone count)."
     )]
     async fn project_stats(
         &self,
@@ -321,18 +321,23 @@ impl CogitoServer {
             .stats(project.id)
             .map_err(|e| format!("Failed to read stats: {e}"))?;
 
+        let fingerprint = match &stats.fingerprint_generated_at {
+            Some(at) => format!("{} hot zones, scanned {at}", stats.hot_zones_count),
+            None => "not scanned yet (use scan_project)".to_string(),
+        };
+
         Ok(format!(
             "Project: {} ({})\n\
              Storage: {}\n\
              Tags: {}\n\
              Decisions: {}\n\
-             Cached hot zones: {}",
+             Fingerprint: {}",
             project.name,
             project.language,
             cogito.cogito_dir().join("state.db").display(),
             stats.tags_count,
             stats.decisions_count,
-            stats.hot_zones_count,
+            fingerprint,
         ))
     }
 }

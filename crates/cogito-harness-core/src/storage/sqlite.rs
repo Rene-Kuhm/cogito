@@ -9,7 +9,7 @@
 //! - WAL mode for concurrent reads
 //! - mmap for fast reads
 
-use crate::types::{Decision, SemanticTag};
+use crate::types::{Decision, Fingerprint, SemanticTag};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
@@ -258,6 +258,55 @@ pub fn upsert_project(
 }
 
 // ============================
+// Fingerprint operations
+// ============================
+
+/// Store `fp` as the project's current fingerprint, replacing any earlier one.
+pub fn save_fingerprint(conn: &Connection, fp: &Fingerprint) -> Result<()> {
+    let data = serde_json::to_vec(fp).context("Failed to serialize fingerprint")?;
+    conn.execute(
+        r#"
+        INSERT INTO fingerprints (
+            project_id, data, entry_points_count, data_flows_count,
+            hot_zones_count, cold_zones_count, generated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(project_id) DO UPDATE SET
+            data = excluded.data,
+            entry_points_count = excluded.entry_points_count,
+            data_flows_count = excluded.data_flows_count,
+            hot_zones_count = excluded.hot_zones_count,
+            cold_zones_count = excluded.cold_zones_count,
+            generated_at = excluded.generated_at
+        "#,
+        params![
+            fp.project_id.to_string(),
+            data,
+            fp.entry_points.len() as i64,
+            fp.data_flows.len() as i64,
+            fp.hot_zones.len() as i64,
+            fp.cold_zones.len() as i64,
+            fp.generated_at.to_rfc3339(),
+        ],
+    )
+    .context("Failed to store fingerprint")?;
+    Ok(())
+}
+
+/// The project's stored fingerprint, if it has been scanned.
+pub fn load_fingerprint(conn: &Connection, project_id: Uuid) -> Result<Option<Fingerprint>> {
+    let data: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT data FROM fingerprints WHERE project_id = ?1",
+            params![project_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    data.map(|bytes| serde_json::from_slice(&bytes).context("Failed to read stored fingerprint"))
+        .transpose()
+}
+
+// ============================
 // Decision operations
 // ============================
 
@@ -466,6 +515,9 @@ pub struct Stats {
     pub tags_count: i64,
     pub decisions_count: i64,
     pub hot_zones_count: i64,
+    /// When the stored fingerprint was generated (RFC 3339), or `None` if the
+    /// project has never been scanned.
+    pub fingerprint_generated_at: Option<String>,
 }
 
 pub fn get_stats(conn: &Connection, project_id: Uuid) -> Result<Stats> {
@@ -487,19 +539,24 @@ pub fn get_stats(conn: &Connection, project_id: Uuid) -> Result<Stats> {
         )
         .unwrap_or(0);
 
-    let hot_zones_count: i64 = conn
+    let fingerprint: Option<(i64, String)> = conn
         .query_row(
-            "SELECT COALESCE(hot_zones_count, 0) FROM fingerprints WHERE project_id = ?1",
+            "SELECT hot_zones_count, generated_at FROM fingerprints WHERE project_id = ?1",
             params![pid_str],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .unwrap_or(0);
+        .optional()?;
+    let (hot_zones_count, fingerprint_generated_at) = match fingerprint {
+        Some((count, at)) => (count, Some(at)),
+        None => (0, None),
+    };
 
     Ok(Stats {
         project_id,
         tags_count,
         decisions_count,
         hot_zones_count,
+        fingerprint_generated_at,
     })
 }
 
