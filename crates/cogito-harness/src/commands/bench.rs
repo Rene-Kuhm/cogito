@@ -13,6 +13,7 @@
 //!   3. Call `file_outline` on each matched file
 //!   4. Read only the line ranges that the match actually occupies
 
+use crate::tokenizer::TokenCounter;
 use anyhow::{Context, Result};
 use cogito_harness_core::{Cogito, Fingerprint, Project, index::SearchHit, map};
 use serde::{Deserialize, Serialize};
@@ -21,46 +22,6 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tiktoken_rs::{CoreBPE, cl100k_base};
-
-/// Token counter using tiktoken-rs with cl100k_base vocabulary.
-/// Falls back to byte-count / 4 estimate if the tokenizer fails to initialise.
-pub struct TokenCounter {
-    inner: Option<CoreBPE>,
-}
-
-impl TokenCounter {
-    /// Create a new token counter. Logs a warning and falls back to byte/4
-    /// estimation if tiktoken-rs fails to load.
-    pub fn new() -> Self {
-        let inner = cl100k_base().ok();
-        if inner.is_none() {
-            eprintln!(
-                "warning: tiktoken-rs failed to initialise cl100k_base; \
-                 falling back to byte_count/4 estimate"
-            );
-        }
-        Self { inner }
-    }
-
-    /// Count tokens in `text`. Returns (tokens, raw_bytes) for transparency.
-    pub fn count(&self, text: &str) -> (usize, usize) {
-        let bytes = text.len();
-        match &self.inner {
-            Some(encoder) => {
-                let tokens = encoder.encode_ordinary(text).len();
-                (tokens, bytes)
-            }
-            None => (bytes / 4, bytes),
-        }
-    }
-}
-
-impl Default for TokenCounter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// One search term's benchmark result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -787,11 +748,7 @@ impl Default for BenchOptions {
 /// Run the benchmark with the given options (async to support tokio runtime).
 pub async fn run_benchmark_async(opts: BenchOptions) -> Result<BenchmarkResult> {
     let counter = TokenCounter::new();
-    let tokenizer = if counter.inner.is_some() {
-        "cl100k_base".to_string()
-    } else {
-        "byte_count/4_estimate".to_string()
-    };
+    let tokenizer = counter.name().to_string();
 
     let start = std::time::Instant::now();
     let mut repos = Vec::new();

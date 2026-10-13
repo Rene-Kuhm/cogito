@@ -6,6 +6,7 @@ mod agents;
 mod claude_hook;
 mod commands;
 mod mcp;
+mod tokenizer;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
