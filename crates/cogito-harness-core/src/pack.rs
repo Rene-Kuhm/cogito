@@ -74,22 +74,61 @@ pub enum Reason {
 }
 
 impl Reason {
-    /// Multiplier applied to the rarity of the matched terms.
-    ///
-    /// Deliberately close together: ten, three and one keep the brief's order
-    /// for comparable evidence without letting a weak match in a higher tier
-    /// bury a strong one in a lower tier.
-    fn multiplier(self) -> u64 {
-        match self {
-            Reason::Name => 10,
-            Reason::Path => 3,
-            Reason::Neighbour => 1,
+    /// Evidence strength: how the term matched times how rare it was.
+    fn score(self, weight: u64, tiers: TierWeights) -> u64 {
+        tiers.of(self).saturating_mul(weight)
+    }
+}
+
+/// How strongly each tier counts against the others.
+///
+/// Deliberately close together: the brief's `name > path > neighbour` order holds
+/// for comparable evidence, without letting a weak match in a higher tier bury a
+/// strong one in a lower tier. A parameter rather than constants inside the
+/// comparison, so the choice can be measured instead of asserted; the recall
+/// harness runs alternatives through `COGITO_PACK_TIERS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierWeights {
+    pub name: u64,
+    pub path: u64,
+    pub neighbour: u64,
+}
+
+impl Default for TierWeights {
+    fn default() -> Self {
+        Self {
+            name: 10,
+            path: 3,
+            neighbour: 1,
+        }
+    }
+}
+
+impl TierWeights {
+    fn of(self, reason: Reason) -> u64 {
+        match reason {
+            Reason::Name => self.name,
+            Reason::Path => self.path,
+            Reason::Neighbour => self.neighbour,
         }
     }
 
-    /// Evidence strength: how the term matched times how rare it was.
-    fn score(self, weight: u64) -> u64 {
-        self.multiplier().saturating_mul(weight)
+    /// Parse `name/path/neighbour`, e.g. `5/2/1`. `None` when the shape is wrong.
+    pub fn parse(spec: &str) -> Option<Self> {
+        let mut parts = spec.split('/').map(|p| p.trim().parse::<u64>());
+        let weights = Self {
+            name: parts.next()?.ok()?,
+            path: parts.next()?.ok()?,
+            neighbour: parts.next()?.ok()?,
+        };
+        if parts.next().is_some()
+            || weights.name == 0
+            || weights.path == 0
+            || weights.neighbour == 0
+        {
+            return None;
+        }
+        Some(weights)
     }
 }
 
@@ -145,6 +184,8 @@ pub struct Request<'a> {
     pub budget: usize,
     /// Stored fingerprint, when one exists, for change counts in the tie-break.
     pub fingerprint: Option<&'a Fingerprint>,
+    /// Relative strength of the name, path and neighbour tiers.
+    pub tier_weights: TierWeights,
 }
 
 /// A candidate before its text is loaded.
@@ -228,7 +269,7 @@ pub fn build(req: Request<'_>, count: &dyn Fn(&str) -> usize) -> Result<Pack> {
         .into_iter()
         .collect();
     let changes = change_counts(req.fingerprint);
-    let found = candidates(&req, &terms, &indexed, &changes)?;
+    let found = candidates(&req, &terms, &indexed, &changes, req.tier_weights)?;
     pack.candidates = found.len();
 
     // Load text, clamp ranges to what the file really has, and spend budget in
@@ -439,6 +480,7 @@ fn candidates(
     terms: &[String],
     indexed: &BTreeSet<PathBuf>,
     changes: &BTreeMap<PathBuf, usize>,
+    tiers: TierWeights,
 ) -> Result<Vec<Candidate>> {
     let mut found: Vec<Candidate> = Vec::new();
     let mut symbol_hits: BTreeMap<(PathBuf, usize), Accum> = BTreeMap::new();
@@ -602,8 +644,8 @@ fn candidates(
     // iteration order.
     found.sort_by(|a, b| {
         b.reason
-            .score(b.weight)
-            .cmp(&a.reason.score(a.weight))
+            .score(b.weight, tiers)
+            .cmp(&a.reason.score(a.weight, tiers))
             .then(b.terms.cmp(&a.terms))
             .then(a.is_test.cmp(&b.is_test))
             .then(changes_of(changes, b).cmp(&changes_of(changes, a)))

@@ -61,6 +61,7 @@ fn build_pack(
             task,
             budget,
             fingerprint,
+            tier_weights: pack::TierWeights::default(),
         },
         &words,
     )
@@ -155,6 +156,7 @@ fn with_synced_budgets(cogito: &Cogito, root: &Path, id: Uuid) {
                 task: "where is the session store",
                 budget,
                 fingerprint: None,
+                tier_weights: pack::TierWeights::default(),
             },
             &words,
         )

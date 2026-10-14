@@ -4,6 +4,7 @@
   "metric": {
     "name": "recall@budget",
     "definition": "expected entries that appear in the pack, over the total expected entries, per task, with the pack built at that task's budget. The reported average is the mean over all tasks.",
+    "by_language": "Averages are reported separately for `en` and `es` tasks. A Spanish description of English code shares no token with it, so mixing the two hides the difference that matters.",
     "file_hit": "any emitted fragment whose path equals the expected path",
     "symbol_hit": "any emitted fragment whose name equals the expected symbol, case-insensitive",
     "why_mixed": "Some tasks name the identifier; most only describe behaviour. Recall on the descriptive tasks is the honest signal for what a lexical ranker cannot do, so the set is deliberately biased toward them."
@@ -24,6 +25,7 @@
     {
       "id": "rg-01",
       "repo": "ripgrep",
+      "language": "en",
       "budget": 2000,
       "task": "Where is SearcherBuilder defined and what does it configure?",
       "names_the_identifier": true,
@@ -36,6 +38,7 @@
     {
       "id": "rg-02",
       "repo": "ripgrep",
+      "language": "en",
       "budget": 2000,
       "task": "How does the search stop early when a file looks binary?",
       "names_the_identifier": false,
@@ -48,6 +51,7 @@
     {
       "id": "rg-03",
       "repo": "ripgrep",
+      "language": "es",
       "budget": 2000,
       "task": "¿Dónde se leen las reglas de .gitignore mientras se recorre el árbol de directorios?",
       "names_the_identifier": false,
@@ -60,6 +64,7 @@
     {
       "id": "rg-04",
       "repo": "ripgrep",
+      "language": "es",
       "budget": 2000,
       "task": "¿Cómo implementa RegexMatcher el trait Matcher usando PCRE2?",
       "names_the_identifier": true,
@@ -72,6 +77,7 @@
     {
       "id": "rg-05",
       "repo": "ripgrep",
+      "language": "en",
       "budget": 2000,
       "task": "How are the command-line flags turned into a configured search?",
       "names_the_identifier": false,
@@ -84,6 +90,7 @@
     {
       "id": "bat-01",
       "repo": "bat",
+      "language": "en",
       "budget": 2000,
       "task": "Where is HighlightingAssets defined and how are syntaxes and themes loaded from it?",
       "names_the_identifier": true,
@@ -96,6 +103,7 @@
     {
       "id": "bat-02",
       "repo": "bat",
+      "language": "es",
       "budget": 1000,
       "task": "¿Cómo decide bat si conviene paginar la salida?",
       "names_the_identifier": false,
@@ -108,6 +116,7 @@
     {
       "id": "bat-03",
       "repo": "bat",
+      "language": "en",
       "budget": 2000,
       "task": "How is a range like 3:10 or :5 parsed from the command line?",
       "names_the_identifier": false,
@@ -120,6 +129,7 @@
     {
       "id": "bat-04",
       "repo": "bat",
+      "language": "es",
       "budget": 2000,
       "task": "¿Cómo se mapea el nombre de un archivo a una sintaxis concreta?",
       "names_the_identifier": false,
@@ -132,6 +142,7 @@
     {
       "id": "bat-05",
       "repo": "bat",
+      "language": "en",
       "budget": 4000,
       "task": "How does the pretty printer compose the grid, the header and the line numbers?",
       "names_the_identifier": false,
