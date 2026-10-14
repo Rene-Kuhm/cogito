@@ -224,7 +224,9 @@ ranked, with the reason each was chosen and inside a token budget (2000 by
 default, 8000 maximum). Measured recall over ten labelled tasks on ripgrep and
 bat: 66.7% overall, and the split matters more than the average — 83.3% on the
 six English tasks against 41.7% on the four Spanish ones. The tables and the
-limits are in [`docs/benchmarks.md`](docs/benchmarks.md).
+limits are in [`docs/benchmarks.md`](docs/benchmarks.md), including what was
+tried and reverted. The main limit: a question in Spanish about code written in
+English gets much less out of it than the same question in English.
 
 ---
 

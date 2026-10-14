@@ -273,6 +273,45 @@ could separate the three.
 - **`rg-03` finds the gitignore matcher but not the walker** that reads the
   rules while traversing, because only the first shares a word with the task.
 
+### What was tried and did not hold
+
+Three changes to the ranking were measured and kept out of the product, so the
+numbers above describe the code that ships:
+
+- **Ordering by coverage first** (how many distinct task terms a candidate
+  matches, before how rare they are): the labelled set stayed at 66.7%, and a
+  second set of new tasks in a private project stayed at the same numbers. It
+  moved nothing, so it was reverted.
+- **A Spanish-to-English glossary of about fifty development terms**, added to
+  the task terms next to the originals: the labelled set stayed at 66.7%. On a
+  second set of five tasks written before the measurement, in areas the
+  glossary had not been built from, recall fell by 13.4 points, because one
+  added English word (`device`) pulled a large, weakly relevant group of
+  fragments into the budget. It was reverted. Tuning the glossary on the same
+  tasks would only fit those tasks.
+- **Earlier checks on the naming rule.** A word inside a longer word must not
+  match: `defined` must not match `undefined`. That rule is kept, with tests.
+
+The lesson the three share: a term that the code does not spell the same way
+can add noise faster than it adds signal, and a change that helps the tasks it
+was tuned on is not evidence on tasks it has not seen.
+
+### Where the product stops
+
+Stated as limits, not as roadmap:
+
+- **Queries in Spanish about English code** get markedly less recall than
+  English queries, on the public set and on every other set measured.
+- **A broad question can fill its budget with the first candidates** that share
+  a common word, and drop a more relevant one that matches a rarer word only
+  once. The budget is respected, but the choice inside it is lexical.
+- **Concepts that the code names differently from the question** (a flag
+  module, a configured search, a registry of adapters) need a step from meaning
+  to identifier that the ranker does not take.
+- **Measured on two repositories and ten tasks.** The numbers are calibrated on
+  this set. Other repositories will differ, and a new set should be written
+  before a change is tried on it.
+
 The honest summary: this is a lexical ranker. It is strong when the task shares
 vocabulary with the code, which is the usual case for an agent that has just
 read an error message or a symbol name, and it does not bridge morphology across
