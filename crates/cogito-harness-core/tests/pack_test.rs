@@ -513,6 +513,39 @@ fn test_task_terms_drop_stopwords_and_short_words_in_both_languages() {
     assert_eq!(spanish, sorted, "terms must be sorted for determinism");
 }
 
+#[test]
+fn test_task_terms_gain_the_english_glossary_equivalent() {
+    let spanish = pack::task_terms("adaptador de OLT");
+    assert!(
+        spanish.contains(&"adapter".to_string()),
+        "the English equivalent must be searched too: {spanish:?}"
+    );
+    assert!(spanish.contains(&"olt".to_string()), "{spanish:?}");
+    assert!(
+        spanish.contains(&"adaptador".to_string()),
+        "the Spanish term must stay: the translation is additive: {spanish:?}"
+    );
+
+    // An identifier is one token, and it is already the language of the code:
+    // the glossary must leave an English question exactly as it was.
+    let english = pack::task_terms("OltAdapterRegistry");
+    assert_eq!(
+        english,
+        vec!["oltadapterregistry".to_string()],
+        "an English task must not gain terms: {english:?}"
+    );
+
+    // A mixed task that already says `adapter` gains nothing new, and the
+    // glossary only ever translates Spanish into English, never the reverse.
+    let mixed = pack::task_terms("where is the adapter registry defined");
+    assert!(mixed.contains(&"adapter".to_string()), "{mixed:?}");
+    assert!(mixed.contains(&"registry".to_string()), "{mixed:?}");
+    assert!(
+        !mixed.contains(&"adaptador".to_string()),
+        "the glossary is one-way: {mixed:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Code against documents
 // ---------------------------------------------------------------------------
