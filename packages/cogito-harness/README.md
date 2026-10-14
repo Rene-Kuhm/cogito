@@ -45,7 +45,7 @@ cogito setup gentle-shell
 ## MCP tools
 
 This package is the *session* adapter. The MCP tools
-(`project_map`, `search_code`, `file_outline`, `related_files`, `add_tag`)
+(`project_map`, `search_code`, `file_outline`, `related_files`)
 come from Pi's
 built-in MCP and are registered by `cogito setup`, which writes:
 

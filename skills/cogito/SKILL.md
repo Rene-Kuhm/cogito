@@ -97,7 +97,6 @@ the `cogito mcp` server is configured, prefer the MCP tools over the CLI:
 | `related_files` | What one file imports, what imports it, and its external packages |
 | `search_code` | Find code by words: symbols (functions, types, classes) with `file:line`, file paths, module names and tags |
 | `file_outline` | A file's declarations with line ranges, so only the needed range is read |
-| `add_tag` | Label code locations so `search_code` finds them by that word |
 
 The MCP server is `cogito mcp` (same binary, `mcp` subcommand). It uses the
 same `.cogito/state.db` as the CLI, so both stay in sync. `cogito setup` writes
