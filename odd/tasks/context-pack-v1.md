@@ -76,12 +76,30 @@ report states the numbers, the limits, and any departure from the brief.
 
 ## Measured
 
-Average **recall@budget 66.7%** over the ten labelled tasks (59.2% before the
-term weighting, 66.7% after). The three tasks that name the identifier score
-100%; the four misses are `rg-05` (needs the flags-to-HiArgs semantic step),
-`bat-02` and `bat-04` (Spanish descriptions of English code sharing no token),
-and `rg-03` (finds the gitignore matcher but not the walker). Full table and the
-measured explanation of each miss: `docs/benchmarks.md`.
+Every figure below comes from one run of the recall harness; the three tables are
+in `docs/benchmarks.md`.
+
+- Overall **66.7%** recall@budget over ten tasks (59.2% before the term
+  weighting).
+- **English 83.3%** over six tasks; **Spanish 41.7%** over four. The split is the
+  finding: an English task about English code works, a Spanish description of it
+  does not.
+- Tier weights, same ten tasks: `10/3/1` → 66.7%, `5/2/1` → 61.7%, `20/5/1` →
+  66.7%. Spread 5.0 percentage points, under the 10 the harness declares as its
+  margin, so the default is **stable on this set and not shown to be optimal**:
+  with ten tasks a single task moves the overall average by up to ten points.
+- The three tasks that name the identifier all score 100%. The misses are
+  `rg-05` (needs the flags-to-HiArgs semantic step), `bat-02` and `bat-04`
+  (Spanish descriptions of English code) and `rg-03` (finds the gitignore matcher
+  but not the walker).
+
+## Corrections to earlier commit messages
+
+For the pull request description, since the messages are not rewritten:
+
+- `8782872` says "The five-tool surface becomes six". That is wrong at both ends.
+  The surface was **four** tools (`project_map`, `related_files`, `file_outline`,
+  `search_code`) and adding `context_pack` made it **five**.
 
 ## Departures from the brief, with reasons
 

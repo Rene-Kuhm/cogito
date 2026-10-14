@@ -206,25 +206,59 @@ miss. The harness drives the real MCP tool through a real process, so it measure
 the path an agent gets, including the real `cl100k_base` tokenizer, and it runs
 every task twice and requires identical answers.
 
-| task | repo | budget | used | expected | hits | recall |
-|---|---|---:|---:|---:|---:|---:|
-| rg-01 | ripgrep | 2000 | 882 | 2 | 2 | 100% |
-| rg-02 | ripgrep | 2000 | 1994 | 2 | 2 | 100% |
-| rg-03 | ripgrep | 2000 | 1972 | 3 | 2 | 67% |
-| rg-04 | ripgrep | 2000 | 1989 | 2 | 2 | 100% |
-| rg-05 | ripgrep | 2000 | 2000 | 4 | 0 | 0% |
-| bat-01 | bat | 2000 | 1988 | 2 | 2 | 100% |
-| bat-02 | bat | 1000 | 989 | 2 | 0 | 0% |
-| bat-03 | bat | 2000 | 1978 | 2 | 2 | 100% |
-| bat-04 | bat | 2000 | 90 | 2 | 0 | 0% |
-| bat-05 | bat | 4000 | 3998 | 2 | 2 | 100% |
+Three tables come out of one run of that command.
 
-**Average recall@budget over ten tasks: 66.7%.**
+### Every task, with its budget and what it spent
+
+| task | lang | budget | used | expected | hits | recall |
+|---|---|---:|---:|---:|---:|---:|
+| rg-01 | en | 2000 | 882 | 2 | 2 | 100% |
+| rg-02 | en | 2000 | 1994 | 2 | 2 | 100% |
+| rg-03 | es | 2000 | 1972 | 3 | 2 | 67% |
+| rg-04 | es | 2000 | 1989 | 2 | 2 | 100% |
+| rg-05 | en | 2000 | 2000 | 4 | 0 | 0% |
+| bat-01 | en | 2000 | 1988 | 2 | 2 | 100% |
+| bat-02 | es | 1000 | 989 | 2 | 0 | 0% |
+| bat-03 | en | 2000 | 1978 | 2 | 2 | 100% |
+| bat-04 | es | 2000 | 90 | 2 | 0 | 0% |
+| bat-05 | en | 4000 | 3998 | 2 | 2 | 100% |
+
+### By language
+
+| lang | tasks | recall |
+|---|---:|---:|
+| en | 6 | 83.3% |
+| es | 4 | 41.7% |
+| all | 10 | 66.7% |
+
+The split is the finding. One average over both languages hides that an English
+task about English code works well and a Spanish description of the same code
+does not: `bat-04`, `¿cómo se mapea el nombre de un archivo a una sintaxis
+concreta?`, shares no token with `src/syntax_mapping.rs` or `SyntaxMapping`.
+
+### Tier weight sensitivity
+
+The relative strength of the name, path and neighbour tiers is a judgement, so
+it is measured rather than asserted. `COGITO_PACK_TIERS` lets the harness run
+alternatives through the real tool:
+
+| weights | overall | en | es |
+|---|---:|---:|---:|
+| 10/3/1 (default) | 66.7% | 83.3% | 41.7% |
+| 5/2/1 | 61.7% | 75.0% | 41.7% |
+| 20/5/1 | 66.7% | 83.3% | 41.7% |
+
+The spread is 5.0 percentage points, under the 10 the harness declares as its
+margin, so the default holds on this set. That is a weak claim and worth saying
+plainly: with ten tasks a single task moves the overall average by up to ten
+points, so this shows the choice is **stable, not optimal**. A different set
+could separate the three.
 
 ### What the misses are, measured
 
-- **Three tasks name the identifier and all three score 100%.** When the word is
-  in the code, the pack finds it.
+- **Vocabulary overlap decides more than anything else.** The three tasks that
+  name the identifier all score 100%, and the six English tasks average 83.3%
+  against 41.7% for the four Spanish ones.
 - **`rg-05` needs a semantic step.** "How are the command-line flags turned into
   a configured search?" expects `crates/core/flags/hiargs.rs` and its `HiArgs`
   and `LowArgs` types. The word `flags` is not discriminating here: 1323 indexed
@@ -232,10 +266,9 @@ every task twice and requires identical answers.
   shares that directory, so the rarest word in the task is `configured` and
   `ConfiguredHIR` wins. Reaching the expected answer needs the leap a person
   makes and a lexer cannot: flags means the flags module means those two types.
-- **`bat-02` and `bat-04` are Spanish descriptions of English code.** A task
-  phrased `¿cómo decide bat si conviene paginar la salida?` shares no token with
-  `paging.rs` or `PagingMode`. `bat-04` found no candidate at all and used 90
-  tokens, which is the correct behaviour: it says so instead of returning
+- **`bat-02` and `bat-04` are Spanish descriptions of English code**, which is
+  the whole reason the table is split. `bat-04` found no candidate at all and
+  used 90 tokens, which is the correct behaviour: it says so instead of returning
   something generic to fill the budget.
 - **`rg-03` finds the gitignore matcher but not the walker** that reads the
   rules while traversing, because only the first shares a word with the task.
@@ -243,4 +276,5 @@ every task twice and requires identical answers.
 The honest summary: this is a lexical ranker. It is strong when the task shares
 vocabulary with the code, which is the usual case for an agent that has just
 read an error message or a symbol name, and it does not bridge morphology across
-languages or multi-step domain knowledge.
+languages or multi-step domain knowledge. Closing that needs embeddings or the
+reference graph, not more tuning of this ranking.
