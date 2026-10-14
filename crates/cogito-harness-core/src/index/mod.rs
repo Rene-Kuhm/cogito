@@ -194,19 +194,21 @@ pub fn sync(
     root: &Path,
     allow_skip_when_clean: bool,
 ) -> Result<SyncReport> {
-    // Fast path: skip the walk entirely when the worktree is clean.
-    if allow_skip_when_clean && !worktree_changed(root) {
-        let scanned = conn
-            .query_row(
-                "SELECT COUNT(*) FROM indexed_files WHERE project_id = ?1",
-                params![project_id.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap_or(0) as usize;
-
+    // Fast path: skip the walk entirely when the worktree is clean. The caller's
+    // "clean" judgement comes from the stored fingerprint, which says nothing
+    // about the index: a project scanned before the index existed has a current
+    // fingerprint and an empty index. Skip only when the index has rows.
+    let indexed = conn
+        .query_row(
+            "SELECT COUNT(*) FROM indexed_files WHERE project_id = ?1",
+            params![project_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+    if allow_skip_when_clean && indexed > 0 && !worktree_changed(root) {
         return Ok(SyncReport {
-            scanned,
-            unchanged: scanned,
+            scanned: indexed,
+            unchanged: indexed,
             ..Default::default()
         });
     }
