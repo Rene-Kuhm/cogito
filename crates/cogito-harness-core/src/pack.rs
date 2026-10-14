@@ -61,6 +61,14 @@ const WHOLE_FILE_MAX_LINES: usize = 120;
 /// Longest task echo in the header, in characters.
 const TASK_ECHO_MAX: usize = 120;
 
+/// How much weaker a document is than code with the same kind of match.
+///
+/// Ten is one tier: a heading is treated as roughly one step down from the
+/// symbol it otherwise looks like, so a document still wins when it matches
+/// clearly better and loses when the evidence is comparable. A task that asks
+/// about documentation switches the penalty off entirely.
+const DOC_PENALTY: u64 = 10;
+
 /// Why a fragment was chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
@@ -71,13 +79,6 @@ pub enum Reason {
     /// One import hop away from a candidate, so it is context rather than an
     /// answer.
     Neighbour,
-}
-
-impl Reason {
-    /// Evidence strength: how the term matched times how rare it was.
-    fn score(self, weight: u64, tiers: TierWeights) -> u64 {
-        tiers.of(self).saturating_mul(weight)
-    }
 }
 
 /// How strongly each tier counts against the others.
@@ -206,7 +207,26 @@ struct Candidate {
     /// words fills its budget with whatever happens to sort first. Integers, not
     /// floats, so the comparison stays exact and reproducible.
     weight: u64,
+    /// Whether this fragment is documentation rather than code.
+    ///
+    /// Headings arrive from the index as symbols and were scored like a
+    /// function, which is how an archived proposal's h1 outranked the detector
+    /// it describes. Documents rank one tier down unless the task asks for
+    /// documentation.
+    is_doc: bool,
     is_test: bool,
+}
+
+impl Candidate {
+    /// How strong this candidate's evidence is, every factor included.
+    fn evidence(&self, tiers: TierWeights, asks_for_docs: bool) -> u64 {
+        let base = tiers.of(self.reason).saturating_mul(self.weight);
+        if asks_for_docs || !self.is_doc {
+            base.saturating_mul(DOC_PENALTY)
+        } else {
+            base
+        }
+    }
 }
 
 /// Rarity of one matched term, in parts per million: rarer is larger.
@@ -269,7 +289,15 @@ pub fn build(req: Request<'_>, count: &dyn Fn(&str) -> usize) -> Result<Pack> {
         .into_iter()
         .collect();
     let changes = change_counts(req.fingerprint);
-    let found = candidates(&req, &terms, &indexed, &changes, req.tier_weights)?;
+    let asks_for_docs = asks_for_documentation(req.task);
+    let found = candidates(
+        &req,
+        &terms,
+        &indexed,
+        &changes,
+        req.tier_weights,
+        asks_for_docs,
+    )?;
     pack.candidates = found.len();
 
     // Load text, clamp ranges to what the file really has, and spend budget in
@@ -652,6 +680,29 @@ fn path_matches(path: &Path, term: &str) -> bool {
         .contains(&term.to_lowercase())
 }
 
+/// Whether a fragment's file is documentation rather than code.
+fn is_doc_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(crate::map::outline::is_doc)
+}
+
+/// Whether the task asks about documentation rather than about code.
+///
+/// When it does, documents are not penalised, because the document is the
+/// answer. Short forms match as whole words so `doc` does not fire on `docker`;
+/// the `documenta…` and `guía` families match by prefix, which covers
+/// `documentado`, `documentada`, `documentación` and `documentar`.
+fn asks_for_documentation(task: &str) -> bool {
+    const WORDS: &[&str] = &["doc", "docs", "spec", "specs", "readme", "markdown"];
+    const PREFIXES: &[&str] = &["documenta", "guia", "guía"];
+    task.split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .any(|word| {
+            WORDS.contains(&word.as_str()) || PREFIXES.iter().any(|prefix| word.starts_with(prefix))
+        })
+}
+
 /// Lowercase, alphanumerics only.
 fn squash(text: &str) -> String {
     text.chars()
@@ -670,6 +721,7 @@ fn candidates(
     indexed: &BTreeSet<PathBuf>,
     changes: &BTreeMap<PathBuf, usize>,
     tiers: TierWeights,
+    asks_for_docs: bool,
 ) -> Result<Vec<Candidate>> {
     let mut found: Vec<Candidate> = Vec::new();
     let mut symbol_hits: BTreeMap<(PathBuf, usize), Accum> = BTreeMap::new();
@@ -735,6 +787,7 @@ fn candidates(
             detail: acc.detail(),
             terms: acc.terms.len(),
             weight: acc.weight,
+            is_doc: is_doc_path(path),
             is_test: acc.is_test,
         });
     }
@@ -757,6 +810,7 @@ fn candidates(
                     detail: "path match · whole short file".to_string(),
                     terms: acc.terms.len(),
                     weight: acc.weight,
+                    is_doc: is_doc_path(path),
                     is_test: acc.is_test,
                 });
             }
@@ -784,6 +838,7 @@ fn candidates(
                 },
                 terms: acc.terms.len(),
                 weight: acc.weight,
+                is_doc: is_doc_path(path),
                 is_test: acc.is_test,
             });
         }
@@ -822,6 +877,7 @@ fn candidates(
                     detail: detail.clone(),
                     terms: 0,
                     weight: 0,
+                    is_doc: is_doc_path(&path),
                     is_test: index::is_test_path(&path),
                 });
             }
@@ -832,9 +888,8 @@ fn candidates(
     // comparisons make the order total, so the result never depends on hash
     // iteration order.
     found.sort_by(|a, b| {
-        b.reason
-            .score(b.weight, tiers)
-            .cmp(&a.reason.score(a.weight, tiers))
+        b.evidence(tiers, asks_for_docs)
+            .cmp(&a.evidence(tiers, asks_for_docs))
             .then(b.terms.cmp(&a.terms))
             .then(a.is_test.cmp(&b.is_test))
             .then(changes_of(changes, b).cmp(&changes_of(changes, a)))

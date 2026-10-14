@@ -512,3 +512,58 @@ fn test_task_terms_drop_stopwords_and_short_words_in_both_languages() {
     sorted.sort();
     assert_eq!(spanish, sorted, "terms must be sorted for determinism");
 }
+
+// ---------------------------------------------------------------------------
+// Code against documents
+// ---------------------------------------------------------------------------
+
+/// A project where one word matches a code declaration and a document heading
+/// equally well, so only the code-versus-document rule can separate them.
+fn doc_and_code_project() -> (TempDir, PathBuf, Cogito, Uuid) {
+    project(&[
+        (
+            "src/thing.rs",
+            "pub fn widget_builder() -> usize {\n    1\n}\n",
+        ),
+        (
+            "docs/guide.md",
+            "# Guide\n\n## Widget setup\n\nHow to configure it.\n",
+        ),
+    ])
+}
+
+#[test]
+fn test_code_outranks_a_document_for_the_same_match() {
+    let (_tmp, root, cogito, id) = doc_and_code_project();
+    let built = pack_for(&cogito, &root, id, "widget", 2000);
+    let paths = fragment_paths(&built);
+
+    let code = paths.iter().position(|p| p.contains("src/thing.rs"));
+    let doc = paths.iter().position(|p| p.contains("docs/guide.md"));
+    assert!(
+        code.is_some() && doc.is_some(),
+        "both must appear: {paths:?}"
+    );
+    assert!(
+        code.unwrap() < doc.unwrap(),
+        "with the same kind of match, code outranks a document: {paths:?}"
+    );
+}
+
+#[test]
+fn test_a_task_that_asks_for_documentation_does_not_penalise_documents() {
+    let (_tmp, root, cogito, id) = doc_and_code_project();
+    let built = pack_for(&cogito, &root, id, "widget spec", 2000);
+    let paths = fragment_paths(&built);
+
+    let code = paths.iter().position(|p| p.contains("src/thing.rs"));
+    let doc = paths.iter().position(|p| p.contains("docs/guide.md"));
+    assert!(
+        code.is_some() && doc.is_some(),
+        "both must appear: {paths:?}"
+    );
+    assert!(
+        doc.unwrap() < code.unwrap(),
+        "a task that asks for a spec must not push the document down: {paths:?}"
+    );
+}
