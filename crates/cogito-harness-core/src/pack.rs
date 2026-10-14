@@ -623,14 +623,6 @@ pub fn task_terms(task: &str) -> Vec<String> {
     terms.into_iter().take(MAX_TERMS).collect()
 }
 
-/// A term shorter than this must equal the whole name to match it.
-///
-/// Three letters and fewer are too common to be evidence on their own: `ont`
-/// matched `ONT_SN_REGEX` and `OntFormFactor` in a question about signal drift,
-/// and those fragments displaced the detector that answers it. An exact name
-/// still matches, so a short symbol can be found by its own name.
-const MIN_WORD_TERM: usize = 4;
-
 /// Whether `term` names a word in a declaration name.
 ///
 /// A name is split into its words (`requireSession`, `require_session`,
@@ -641,9 +633,6 @@ fn name_matches(name: &str, term: &str) -> bool {
     let needle = squash(term);
     if needle.is_empty() {
         return false;
-    }
-    if needle.chars().count() < MIN_WORD_TERM {
-        return squash(name) == needle;
     }
     let words = name_words(name);
     (0..words.len()).any(|start| {
