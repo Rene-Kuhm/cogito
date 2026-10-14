@@ -58,6 +58,10 @@ fn test_mcp_initialize() {
         output.contains("capabilities"),
         "Should include capabilities"
     );
+    assert!(
+        output.contains("context_pack"),
+        "the server instructions must name context_pack as the first option for a task: {output}"
+    );
 }
 
 /// The tools a `tools/list` response advertises, by name.
@@ -85,12 +89,13 @@ fn test_mcp_lists_the_map_tools_only() {
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
     ];
 
-    // The surface is the project map. Decision and note tools are absent on
-    // purpose: they belong to the agent's memory, not to Cogito.
+    // The surface is the project map plus the context pack. Decision, tag and
+    // note tools are absent on purpose: they belong to the agent's memory, not
+    // to Cogito.
     assert_eq!(
         tool_names(&send_jsonrpc(messages)),
         [
-            "add_tag",
+            "context_pack",
             "file_outline",
             "project_map",
             "related_files",
@@ -159,13 +164,15 @@ fn test_mcp_map_tools_on_a_workspace() {
     );
 
     let related = tool_text(&output, 3);
+    // The index resolves imports and stores the resolved path, so imports
+    // shows the actual file and importers shows files that import this one.
     assert!(
         related.contains("Imports (1):\n  packages/shared/src/index.ts"),
-        "{related}"
+        "related should show resolved import: {related}"
     );
     assert!(
         related.contains("Imported by (1):\n  apps/web/app/page.tsx"),
-        "{related}"
+        "related should show importer: {related}"
     );
 
     let search = tool_text(&output, 4);
@@ -179,6 +186,156 @@ fn test_mcp_map_tools_on_a_workspace() {
     assert!(
         outline.contains("3-5 export function requireSession(token: string): boolean"),
         "{outline}"
+    );
+}
+
+#[test]
+fn test_mcp_search_finds_new_uncommitted_file() {
+    // On a git repository that has been indexed, a new uncommitted file with a
+    // declaration is found via the index without an explicit refresh or scan.
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    // Initialize a git repo.
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(root)
+        .output()
+        .expect("git init failed");
+
+    let write = |rel: &str, text: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+
+    // Write an initial file and commit it so the repo is "indexed".
+    write("src/main.ts", "export const existing = 1;\n");
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(root)
+        .output()
+        .expect("git add failed");
+    // An explicit identity: a CI runner has none, and a commit that fails
+    // without one leaves no HEAD, which the test would only see much later.
+    let commit = std::process::Command::new("git")
+        .args(["commit", "-q", "-m", "initial"])
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .current_dir(root)
+        .output()
+        .expect("git commit failed");
+    assert!(
+        commit.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+
+    // Now write a new uncommitted file with a unique declaration.
+    write(
+        "src/newfeature.ts",
+        "export function brandNewUtility(input: string): boolean {\n  return input.length > 0;\n}\n",
+    );
+
+    let path = root.display().to_string();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let search = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"search_code","arguments":{{"path":"{}","query":"brandNewUtility"}}}}}}"#,
+        path
+    );
+
+    let output = send_jsonrpc(vec![init, ready, &search]);
+    let text = tool_text(&output, 2);
+    assert!(
+        text.contains("brandNewUtility"),
+        "search_code should find brandNewUtility in the new uncommitted file: {text}"
+    );
+    assert!(
+        text.contains("src/newfeature.ts"),
+        "search_code should report the new file path: {text}"
+    );
+}
+
+#[test]
+fn test_mcp_file_outline_matches_declarations() {
+    // The index-sourced outline contains declarations with expected kinds and line ranges.
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    // Initialize a git repo.
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(root)
+        .output()
+        .expect("git init failed");
+
+    let write = |rel: &str, text: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+
+    write("package.json", r#"{"name":"test"}"#);
+    write(
+        "src/lib.ts",
+        "// This is a utility function\nexport function greet(name: string): string {\n  return `Hello, ${name}`;\n}\n\nexport const MAX_RETRIES = 3;\n\nclass InternalCache {\n  private data: Map<string, string>;\n  constructor() { this.data = new Map(); }\n}\n\nexport { InternalCache };\n",
+    );
+
+    // Commit so the index has something to work with.
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(root)
+        .output()
+        .expect("git add failed");
+    // An explicit identity: a CI runner has none, and a commit that fails
+    // without one leaves no HEAD, which the test would only see much later.
+    let commit = std::process::Command::new("git")
+        .args(["commit", "-q", "-m", "initial"])
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .current_dir(root)
+        .output()
+        .expect("git commit failed");
+    assert!(
+        commit.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+
+    let path = root.display().to_string();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let outline = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"file_outline","arguments":{{"path":"{}","file":"src/lib.ts"}}}}}}"#,
+        path
+    );
+
+    let output = send_jsonrpc(vec![init, ready, &outline]);
+    let text = tool_text(&output, 2);
+
+    // Verify the outline contains the expected declarations.
+    assert!(
+        text.contains("function greet") || text.contains("fn greet"),
+        "outline should contain function greet: {text}"
+    );
+    assert!(
+        text.contains("MAX_RETRIES") || text.contains("const MAX_RETRIES"),
+        "outline should contain const MAX_RETRIES: {text}"
+    );
+    assert!(
+        text.contains("class InternalCache") || text.contains("InternalCache"),
+        "outline should contain class InternalCache: {text}"
+    );
+
+    // Verify line ranges are present (e.g., "3-5" or similar).
+    assert!(
+        text.contains('-') && text.matches(char::is_numeric).count() >= 4,
+        "outline should contain line ranges: {text}"
     );
 }
 
@@ -201,6 +358,152 @@ fn test_mcp_stdout_is_only_json_rpc() {
         assert!(
             parsed.is_ok_and(|v| v.get("jsonrpc").is_some()),
             "every stdout line must be a JSON-RPC message, got: {line}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// context_pack
+// ---------------------------------------------------------------------------
+
+/// The `used` figure the pack header reports.
+fn pack_used_tokens(text: &str) -> usize {
+    let after = text
+        .split("used ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no used figure in: {text}"));
+    after
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("the used figure is not a number in: {text}"))
+}
+
+fn context_pack_workspace() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let write = |rel: &str, text: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(
+        "Cargo.toml",
+        "[package]\nname = \"packws\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        "src/session_store.rs",
+        "pub fn session_store() -> u32 {\n    load()\n}\n\nfn load() -> u32 {\n    1\n}\n",
+    );
+    write(
+        "src/unrelated.rs",
+        "pub fn unrelated() -> u32 {\n    2\n}\n",
+    );
+    dir
+}
+
+#[test]
+fn test_mcp_context_pack_returns_budgeted_fragments() {
+    let dir = context_pack_workspace();
+    let path = dir.path().display().to_string();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"context_pack","arguments":{{"path":"{}","task":"how does the session store load","budget":800}}}}}}"#,
+        path
+    );
+
+    let text = tool_text(&send_jsonrpc(vec![init, ready, &call]), 2);
+
+    assert!(
+        text.contains("src/session_store.rs"),
+        "the pack must reach the file the task is about:\n{text}"
+    );
+    let used = pack_used_tokens(&text);
+    assert!(used > 0, "a pack with fragments must cost tokens:\n{text}");
+    assert!(
+        used <= 800,
+        "the pack must respect the budget, used {used} of 800:\n{text}"
+    );
+}
+
+#[test]
+fn test_mcp_context_pack_says_when_nothing_matches() {
+    let dir = context_pack_workspace();
+    let path = dir.path().display().to_string();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"context_pack","arguments":{{"path":"{}","task":"kubernetes ingress annotations","budget":800}}}}}}"#,
+        path
+    );
+
+    let text = tool_text(&send_jsonrpc(vec![init, ready, &call]), 2);
+
+    assert!(
+        text.contains("No matches for this task"),
+        "an unmatched task must say so:\n{text}"
+    );
+    assert!(
+        !text.contains("src/session_store.rs") && !text.contains("src/unrelated.rs"),
+        "nothing generic may be returned instead:\n{text}"
+    );
+}
+
+/// A workspace whose symbols all mention `readme` while only `README.md` is
+/// named by the query. Their paths deliberately do not contain the word, so the
+/// file phase has a single candidate and the symbol flood has to be what
+/// crowds it out.
+fn named_file_workspace() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"named\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("README.md"), "# Named\n\nA project.\n").unwrap();
+    std::fs::create_dir(root.join("src")).unwrap();
+    for n in 0..20 {
+        std::fs::write(
+            root.join(format!("src/helper_{n}.rs")),
+            format!("pub fn readme_helper_{n}() -> usize {{\n    {n}\n}}\n"),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+/// The end-to-end version of the index rule: `search_code README` must answer
+/// with `README.md` in a Files section, and that section comes before the
+/// symbols.
+#[test]
+fn test_mcp_search_code_puts_a_named_file_first() {
+    let dir = named_file_workspace();
+    let path = dir.path().display().to_string();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"search_code","arguments":{{"path":"{}","query":"README"}}}}}}"#,
+        path
+    );
+
+    let text = tool_text(&send_jsonrpc(vec![init, ready, &call]), 2);
+
+    let files = text
+        .find("Files:")
+        .unwrap_or_else(|| panic!("search_code must answer with a Files section:\n{text}"));
+    let named = text
+        .find("README.md")
+        .unwrap_or_else(|| panic!("README.md must be in the answer:\n{text}"));
+    assert!(
+        files < named,
+        "README.md must be inside the Files section:\n{text}"
+    );
+    if let Some(symbols) = text.find("Symbols:") {
+        assert!(
+            files < symbols,
+            "a named file puts Files before Symbols:\n{text}"
         );
     }
 }

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
     branches: [main]
 
@@ -11,6 +11,19 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  node:
+    name: Node.js Plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check cogito.js
+        run: node --check crates/cogito-harness/assets/opencode/cogito.js
+      - name: Run cogito.test.mjs
+        run: node crates/cogito-harness/assets/opencode/cogito.test.mjs
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

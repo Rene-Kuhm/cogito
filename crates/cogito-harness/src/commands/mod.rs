@@ -3,13 +3,12 @@
 //! Connects to the cogito-harness-core engine and provides user-facing operations.
 
 use anyhow::{Context, Result};
-use cogito_harness_core::{Cogito, CompressionOptions, Project};
+use cogito_harness_core::{Cogito, Project};
 use std::path::{Path, PathBuf};
-use uuid::Uuid;
 
-use crate::DecisionCommands;
 use crate::ProjectCommands;
-use crate::TagCommands;
+
+pub mod bench;
 
 // ============================================================
 // Project Commands
@@ -55,12 +54,36 @@ pub async fn init() -> Result<()> {
 }
 
 /// Scan project and generate fingerprint
-pub async fn scan(_watch: bool) -> Result<()> {
+pub async fn scan() -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
 
     println!("Scanning: {} ({})", project.name, project.language);
+
+    // Sync the index and report what changed
+    if let Some(conn) = cogito.sqlite() {
+        let conn_guard = conn.lock();
+        let report =
+            cogito_harness_core::index::sync(&conn_guard, project.id, &project.path, false)?;
+        println!();
+        println!("📁 Index: {} files scanned", report.scanned);
+        if report.added > 0 {
+            println!("   + {} added", report.added);
+        }
+        if report.modified > 0 {
+            println!("   ~ {} modified", report.modified);
+        }
+        if report.removed > 0 {
+            println!("   - {} removed", report.removed);
+        }
+        if report.reparsed > 0 {
+            println!("   🔄 {} reparsed", report.reparsed);
+        }
+        if report.unchanged > 0 {
+            println!("   ✓ {} unchanged", report.unchanged);
+        }
+    }
     println!();
 
     let fingerprint = cogito
@@ -138,332 +161,11 @@ pub async fn scan(_watch: bool) -> Result<()> {
 /// Show current fingerprint (stub - reuses scan for now)
 pub async fn fingerprint(verbose: bool) -> Result<()> {
     if verbose {
-        scan(false).await
+        scan().await
     } else {
         println!("Use 'cogito scan' to regenerate the fingerprint.");
         Ok(())
     }
-}
-
-// ============================================================
-// Context Commands
-// ============================================================
-
-/// Compress context
-pub async fn compress(
-    file: &str,
-    max_tokens: usize,
-    preserve_imports: bool,
-    preserve_types: bool,
-    json: bool,
-) -> Result<()> {
-    let content = if file == "-" {
-        let mut buffer = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
-            .context("Failed to read from stdin")?;
-        buffer
-    } else {
-        std::fs::read_to_string(file).with_context(|| format!("Failed to read file: {file}"))?
-    };
-
-    let options = CompressionOptions {
-        max_tokens,
-        preserve_imports,
-        preserve_types,
-        hot_zones_priority: true,
-    };
-
-    let cogito = Cogito::new();
-    let result = cogito
-        .compress_context(&content, options)
-        .await
-        .context("Failed to compress context")?;
-
-    if json {
-        let json_output = serde_json::json!({
-            "original_tokens": result.original_tokens,
-            "compressed_tokens": result.compressed_tokens,
-            "savings_percent": result.savings_percent,
-            "content": result.content,
-            "sources": result.sources,
-        });
-        println!("{}", serde_json::to_string_pretty(&json_output)?);
-    } else {
-        println!("Original tokens:  {}", result.original_tokens);
-        println!("Compressed tokens: {}", result.compressed_tokens);
-        println!("Savings:           {:.1}%", result.savings_percent);
-        println!();
-        println!("--- Compressed Content ---");
-        println!("{}", result.content);
-    }
-
-    Ok(())
-}
-
-/// Query knowledge base
-pub async fn query(query_str: &str, json: bool) -> Result<()> {
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    let tags = cogito
-        .search_tags(project.id, query_str)
-        .context("Failed to search tags")?;
-    let decisions = cogito
-        .search_decisions(project.id, query_str)
-        .context("Failed to search decisions")?;
-
-    if json {
-        let output = serde_json::json!({
-            "query": query_str,
-            "tags": tags,
-            "decisions": decisions,
-        });
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        println!("Search: {}", query_str);
-        println!();
-        println!("📌 Tags ({}):", tags.len());
-        for tag in &tags {
-            println!("   • {} ({})", tag.tag, tag.domain);
-        }
-        println!();
-        println!("📋 Decisions ({}):", decisions.len());
-        for decision in &decisions {
-            println!("   • {} - {}", decision.title, decision.why);
-        }
-    }
-
-    Ok(())
-}
-
-// ============================================================
-// Decision Commands
-// ============================================================
-
-pub async fn decision(subcommand: Option<DecisionCommands>) -> Result<()> {
-    match subcommand {
-        Some(DecisionCommands::Add {
-            title,
-            why,
-            alternative,
-            paths,
-            tags,
-        }) => add_decision(title, why, alternative, paths, tags).await,
-        Some(DecisionCommands::List) => list_decisions().await,
-        Some(DecisionCommands::Search { query }) => search_decisions(&query).await,
-        Some(DecisionCommands::Show { id }) => show_decision(&id).await,
-        None => {
-            println!("Usage: cogito decision <add|list|search|show>");
-            Ok(())
-        }
-    }
-}
-
-async fn add_decision(
-    title: Option<String>,
-    why: Option<String>,
-    alternatives: Vec<String>,
-    paths: Vec<String>,
-    tags: Vec<String>,
-) -> Result<()> {
-    let (title_str, why_str) = match (title, why) {
-        (Some(t), Some(w)) => (t, w),
-        _ => {
-            println!("Error: --title and --why are required");
-            println!("Usage: cogito decision add --title '...' --why '...'");
-            return Ok(());
-        }
-    };
-
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    // Build the decision with all options
-    let mut builder = cogito_harness_core::decision::builder(project.id)
-        .title(&title_str)
-        .why(&why_str)
-        .author(&whoami::username());
-    for alt in &alternatives {
-        builder = builder.alternative(alt);
-    }
-    for tag in &tags {
-        builder = builder.tag(tag);
-    }
-    for path_str in &paths {
-        builder = builder.path(PathBuf::from(path_str));
-    }
-    let decision = builder.build();
-
-    let added = cogito
-        .add_decision(decision)
-        .context("Failed to add decision")?;
-
-    println!("✓ Decision added");
-    println!("  ID:    {}", added.id);
-    println!("  Title: {}", added.title);
-    println!("  Why:   {}", added.why);
-    if !added.alternatives.is_empty() {
-        println!("  Alternatives:");
-        for alt in &added.alternatives {
-            println!("    - {}", alt);
-        }
-    }
-    if !added.tags.is_empty() {
-        println!("  Tags:  {}", added.tags.join(", "));
-    }
-
-    Ok(())
-}
-
-async fn list_decisions() -> Result<()> {
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    // For now, return all by searching empty
-    let decisions = cogito
-        .search_decisions(project.id, "")
-        .context("Failed to list decisions")?;
-
-    if decisions.is_empty() {
-        println!("No decisions found.");
-        println!("Add one with: cogito decision add --title '...' --why '...'");
-        return Ok(());
-    }
-
-    println!("Decisions ({}):", decisions.len());
-    for d in &decisions {
-        println!("  • {} - {}", d.title, d.why);
-    }
-    Ok(())
-}
-
-async fn search_decisions(query_str: &str) -> Result<()> {
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    let decisions = cogito
-        .search_decisions(project.id, query_str)
-        .context("Failed to search decisions")?;
-
-    if decisions.is_empty() {
-        println!("No decisions found matching: {}", query_str);
-        return Ok(());
-    }
-
-    println!("Decisions matching '{}' ({}):", query_str, decisions.len());
-    for d in &decisions {
-        println!("  • {} - {}", d.title, d.why);
-    }
-    Ok(())
-}
-
-async fn show_decision(id: &str) -> Result<()> {
-    println!("Showing decision: {}", id);
-    println!("(not yet implemented - coming soon)");
-    Ok(())
-}
-
-// ============================================================
-// Tag Commands
-// ============================================================
-
-pub async fn tag(subcommand: Option<TagCommands>) -> Result<()> {
-    match subcommand {
-        Some(TagCommands::Add { tag, paths }) => add_tag(&tag, paths).await,
-        Some(TagCommands::List) => list_tags().await,
-        Some(TagCommands::Search { query }) => search_tags(&query).await,
-        None => {
-            println!("Usage: cogito tag <add|list|search>");
-            Ok(())
-        }
-    }
-}
-
-async fn add_tag(tag: &str, paths: Vec<String>) -> Result<()> {
-    if paths.is_empty() {
-        println!("Error: at least one path is required");
-        println!("Usage: cogito tag add <tag> <paths...>");
-        return Ok(());
-    }
-
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    let semantic_tag = cogito_harness_core::types::SemanticTag {
-        id: Uuid::new_v4(),
-        project_id: project.id,
-        tag: tag.to_string(),
-        domain: "manual".to_string(),
-        paths: paths.iter().map(PathBuf::from).collect(),
-        confidence: 1.0,
-        created_at: chrono::Utc::now(),
-    };
-
-    let added = cogito.add_tag(semantic_tag).context("Failed to add tag")?;
-
-    println!("✓ Tag added");
-    println!("  Tag:  {}", added.tag);
-    println!("  Paths: {}", added.paths.len());
-
-    Ok(())
-}
-
-async fn list_tags() -> Result<()> {
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    let tags = cogito
-        .search_tags(project.id, "")
-        .context("Failed to list tags")?;
-
-    if tags.is_empty() {
-        println!("No tags found.");
-        println!("Add one with: cogito tag add <tag> <paths...>");
-        return Ok(());
-    }
-
-    println!("Tags ({}):", tags.len());
-    for tag in &tags {
-        println!(
-            "  • {} ({}) - {} paths",
-            tag.tag,
-            tag.domain,
-            tag.paths.len()
-        );
-    }
-    Ok(())
-}
-
-async fn search_tags(query_str: &str) -> Result<()> {
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    let tags = cogito
-        .search_tags(project.id, query_str)
-        .context("Failed to search tags")?;
-
-    if tags.is_empty() {
-        println!("No tags found matching: {}", query_str);
-        return Ok(());
-    }
-
-    println!("Tags matching '{}' ({}):", query_str, tags.len());
-    for tag in &tags {
-        println!(
-            "  • {} ({}) - {} paths",
-            tag.tag,
-            tag.domain,
-            tag.paths.len()
-        );
-    }
-    Ok(())
 }
 
 // ============================================================
@@ -493,33 +195,9 @@ async fn delete_project(_id: &str) -> Result<()> {
 }
 
 // ============================================================
-// Server Commands
+// Stats / Doctor
 // ============================================================
 
-/// Start server mode
-pub async fn serve(port: u16, mcp: bool) -> Result<()> {
-    if mcp {
-        println!("Starting MCP server on port {}...", port);
-        // TODO: Start MCP server
-    } else {
-        println!("Starting REST API server on port {}...", port);
-        println!("Run 'cogito-api' to start the API server");
-    }
-    println!();
-    println!("Server started. Press Ctrl+C to stop.");
-
-    // Keep running
-    tokio::signal::ctrl_c()
-        .await
-        .context("Failed to wait for Ctrl+C")?;
-    Ok(())
-}
-
-// ============================================================
-// Stats / Doctor / Export
-// ============================================================
-
-/// Show statistics
 /// Print the project map, scanning only if the stored one is stale.
 pub async fn map(refresh: bool, card: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
@@ -540,31 +218,83 @@ pub async fn outline(file: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
-    let (fingerprint, _) = cogito.fingerprint(&project, false).await?;
+    let _ = cogito.sync_index(&project).await?;
+
+    // Need a fingerprint for find_file. Try stored first, then fall back to scan.
+    let stored = cogito.stored_fingerprint(project.id)?;
+    let fingerprint = match stored.as_ref() {
+        Some(fp) => fp.clone(),
+        None => {
+            let (fp, _) = cogito.fingerprint(&project, false).await?;
+            fp
+        }
+    };
     let file = cogito_harness_core::map::find_file(&project.path, &fingerprint, file)
         .map_err(|e| anyhow::anyhow!(e))?;
-    let text = cogito_harness_core::map::render_outline(&project.path, &fingerprint, &file)
-        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Try index first.
+    #[allow(clippy::collapsible_if)]
+    if let Some(conn) = cogito.connection() {
+        if let Ok(decls) = cogito_harness_core::index::outline(&conn, project.id, &file) {
+            if !decls.is_empty() {
+                let importer_count =
+                    cogito_harness_core::index::importers(&conn, project.id, &file)
+                        .map(|i| i.len())
+                        .unwrap_or(0);
+                let text = cogito_harness_core::map::render_outline(
+                    &project.path,
+                    stored.as_ref(),
+                    &file,
+                    &decls.into_iter().map(Into::into).collect::<Vec<_>>(),
+                    importer_count,
+                );
+                print!("{text}");
+                return Ok(());
+            }
+        }
+    }
+
+    // Index had no declarations: read from disk.
+    let content = std::fs::read_to_string(project.path.join(&file))
+        .map_err(|e| anyhow::anyhow!("Cannot read {}: {e}", file.display()))?;
+    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let decls = cogito_harness_core::map::outline::declarations(&content, ext);
+    let text =
+        cogito_harness_core::map::render_outline(&project.path, stored.as_ref(), &file, &decls, 0);
     print!("{text}");
     Ok(())
 }
 
-/// Print symbols, doc sections, files, modules and tags matching `query`.
+/// Print symbols, doc sections, files and modules matching `query`.
 pub async fn search(query: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
-    let (fingerprint, _) = cogito.fingerprint(&project, false).await?;
-    let found = cogito_harness_core::map::search_paths(&project.path, &fingerprint, query);
-    let tags: Vec<(String, Vec<std::path::PathBuf>)> = cogito
-        .search_tags(project.id, query)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| (t.tag, t.paths))
-        .collect();
+    let _ = cogito.sync_index(&project).await?;
+
+    let stored = cogito.stored_fingerprint(project.id)?;
+
+    let hits = if let Some(conn) = cogito.connection() {
+        cogito_harness_core::index::search(&conn, project.id, query, 12)?
+    } else {
+        vec![]
+    };
+
+    // A file named exactly like the query puts the Files section first. The rule
+    // lives in the index, so this and the other two callers cannot drift apart.
+    let files_first = hits.iter().any(|h| {
+        !h.is_symbol
+            && cogito_harness_core::index::is_named_file_match(&h.path.to_string_lossy(), query)
+    });
+
+    let modules: Vec<_> = stored
+        .as_ref()
+        .map(|fp| fp.modules.clone())
+        .unwrap_or_default();
+
     print!(
         "{}",
-        cogito_harness_core::map::render_search(&found, &tags, query)
+        cogito_harness_core::map::render_search(&hits, &modules, query, files_first)
     );
     Ok(())
 }
@@ -574,12 +304,54 @@ pub async fn related(file: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
-    let (fingerprint, _) = cogito.fingerprint(&project, false).await?;
+    let _ = cogito.sync_index(&project).await?;
+
+    // Need a fingerprint for find_file. Try stored first, then fall back to scan.
+    let stored = cogito.stored_fingerprint(project.id)?;
+    let fingerprint = match stored.as_ref() {
+        Some(fp) => fp.clone(),
+        None => {
+            let (fp, _) = cogito.fingerprint(&project, false).await?;
+            fp
+        }
+    };
     let file = cogito_harness_core::map::find_file(&project.path, &fingerprint, file)
         .map_err(|e| anyhow::anyhow!(e))?;
+
+    let (imports, importers, external) = if let Some(conn) = cogito.connection() {
+        let imports: Vec<String> =
+            cogito_harness_core::index::imports(&conn, project.id, &file).unwrap_or_default();
+        let importers: Vec<String> =
+            cogito_harness_core::index::importers(&conn, project.id, &file)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.display().to_string())
+                .collect();
+        let external: Vec<String> = stored
+            .as_ref()
+            .map(|fp| {
+                fp.data_flows
+                    .iter()
+                    .filter(|flow| flow.from == file && flow.resolved.is_none())
+                    .map(|flow| flow.to.display().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        (imports, importers, external)
+    } else {
+        (vec![], vec![], vec![])
+    };
+
     print!(
         "{}",
-        cogito_harness_core::map::render_related(&project.path, &fingerprint, &file)
+        cogito_harness_core::map::render_related(
+            &project.path,
+            stored.as_ref(),
+            &file,
+            &imports,
+            &importers,
+            &external,
+        )
     );
     Ok(())
 }
@@ -588,30 +360,20 @@ pub async fn stats(json: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("Cannot read current directory")?;
     let cogito = open_cogito(&cwd)?;
     let project = load_or_create_project(&cogito, &cwd)?;
-
-    let tags = cogito.search_tags(project.id, "").unwrap_or_default();
-    let decisions = cogito.search_decisions(project.id, "").unwrap_or_default();
     let stored = cogito.stats(project.id)?;
 
     if json {
         let stats = serde_json::json!({
             "project": project.name,
-            "tags": tags.len(),
-            "decisions": decisions.len(),
-            "hot_zones": stored.hot_zones_count,
+            "has_fingerprint": stored.has_fingerprint,
             "fingerprint_generated_at": stored.fingerprint_generated_at,
         });
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {
         println!("=== Cogito Statistics ===");
-        println!("Project:     {}", project.name);
-        println!("Tags:        {}", tags.len());
-        println!("Decisions:   {}", decisions.len());
+        println!("Project: {}", project.name);
         match &stored.fingerprint_generated_at {
-            Some(at) => println!(
-                "Fingerprint: {} hot zones, scanned {at}",
-                stored.hot_zones_count
-            ),
+            Some(at) => println!("Fingerprint: present, generated {at}"),
             None => println!("Fingerprint: not scanned yet (run `cogito scan`)"),
         }
     }
@@ -907,18 +669,43 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool, with_pi_package: boo
             );
         }
 
+        // AGENTS.md goes to the project root only; see agents_md_root.
+        let agents_root = crate::agents::agents_md_root(&std::env::current_dir()?, &home);
+
         if dry_run {
             let status = crate::agents::status(agent, &home, &binary)?;
-            println!(
-                "  {} [{}] -> would {}",
-                agent.display(),
-                status.label(),
-                match status {
-                    crate::agents::Status::Configured => "stay as is",
-                    crate::agents::Status::Outdated => "update the entry",
-                    _ => "write",
+            let agents_action = match status {
+                crate::agents::Status::Configured => "stay as is",
+                crate::agents::Status::Outdated => "update the entry",
+                _ => "write",
+            };
+
+            if crate::agents::reads_agents_md(agent) {
+                match &agents_root {
+                    Some(root) => {
+                        let _ = crate::agents::install_agents_md_block(root, true);
+                        println!(
+                            "  {} [{}] -> {}, AGENTS.md block would be written",
+                            agent.display(),
+                            status.label(),
+                            agents_action
+                        );
+                    }
+                    None => println!(
+                        "  {} [{}] -> {}, AGENTS.md skipped (not a git repository root)",
+                        agent.display(),
+                        status.label(),
+                        agents_action
+                    ),
                 }
-            );
+            } else {
+                println!(
+                    "  {} [{}] -> would {}",
+                    agent.display(),
+                    status.label(),
+                    agents_action
+                );
+            }
             continue;
         }
 
@@ -943,6 +730,32 @@ pub fn setup(agents: Vec<String>, all: bool, dry_run: bool, with_pi_package: boo
                 // say which file or which step went wrong.
                 for (i, cause) in e.chain().enumerate() {
                     println!("    {}{cause}", if i == 0 { "error: " } else { "cause: " });
+                }
+            }
+        }
+
+        // Install the AGENTS.md block for agents that read it, at the project root.
+        if crate::agents::reads_agents_md(agent) {
+            let Some(root) = &agents_root else {
+                println!(
+                    "    AGENTS.md: skipped, {} is not a git repository root (run setup from your project's root)",
+                    std::env::current_dir()?.display()
+                );
+                continue;
+            };
+            if dry_run {
+                let _ = crate::agents::install_agents_md_block(root, true);
+            } else {
+                match crate::agents::install_agents_md_block(root, false) {
+                    Ok(crate::agents::Change::Written { .. }) => {
+                        println!("    AGENTS.md: block installed");
+                    }
+                    Ok(crate::agents::Change::AlreadyCorrect) => {
+                        println!("    AGENTS.md: block already present");
+                    }
+                    Err(e) => {
+                        println!("    AGENTS.md: failed: {e}");
+                    }
                 }
             }
         }
@@ -1020,6 +833,9 @@ pub fn uninstall(agents: Vec<String>, yes: bool) -> Result<()> {
     }
 
     println!();
+    // AGENTS.md is removed only from the root it would have been written to.
+    let agents_root = crate::agents::agents_md_root(&std::env::current_dir()?, &home);
+
     for agent in selected {
         match crate::agents::uninstall(agent, &home) {
             Ok(crate::agents::Change::AlreadyCorrect) => {
@@ -1032,6 +848,21 @@ pub fn uninstall(agents: Vec<String>, yes: bool) -> Result<()> {
                 }
             }
             Err(e) => println!("  {} — failed: {e}", agent.display()),
+        }
+
+        // Remove the AGENTS.md block for agents that read it.
+        if let (true, Some(root)) = (crate::agents::reads_agents_md(agent), &agents_root) {
+            match crate::agents::remove_agents_md_block(root) {
+                Ok(crate::agents::Change::Written { .. }) => {
+                    println!("    AGENTS.md: block removed");
+                }
+                Ok(crate::agents::Change::AlreadyCorrect) => {
+                    // No block to remove; nothing to report.
+                }
+                Err(e) => {
+                    println!("    AGENTS.md: failed to remove block: {e}");
+                }
+            }
         }
     }
     Ok(())
@@ -1091,64 +922,11 @@ fn pick_interactively(home: &Path, binary: &Path) -> Result<Vec<crate::agents::A
     Ok(chosen)
 }
 
-/// Export project data
-pub async fn export(output: Option<&str>, format: &str) -> Result<()> {
-    let cwd = std::env::current_dir().context("Cannot read current directory")?;
-    let cogito = open_cogito(&cwd)?;
-    let project = load_or_create_project(&cogito, &cwd)?;
-
-    let fingerprint = cogito.generate_fingerprint(&project).await?;
-    let tags = cogito.search_tags(project.id, "")?;
-    let decisions = cogito.search_decisions(project.id, "")?;
-
-    let export_data = serde_json::json!({
-        "version": "0.1.0",
-        "exported_at": chrono::Utc::now().to_rfc3339(),
-        "project": {
-            "id": project.id,
-            "name": project.name,
-            "path": project.path,
-            "language": project.language,
-        },
-        "fingerprint": {
-            "entry_points": fingerprint.entry_points.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-            "data_flows_count": fingerprint.data_flows.len(),
-            "hot_zones_count": fingerprint.hot_zones.len(),
-            "cold_zones_count": fingerprint.cold_zones.len(),
-            "frozen_zones_count": fingerprint.frozen_zones.len(),
-        },
-        "tags": tags,
-        "decisions": decisions,
-    });
-
-    let json_output = if format == "yaml" {
-        // Simple JSON-to-YAML-ish output (not real YAML, but readable)
-        format!(
-            "# Cogito Export\n# Format: {}\n{}",
-            format,
-            serde_json::to_string_pretty(&export_data)?
-        )
-    } else {
-        serde_json::to_string_pretty(&export_data)?
-    };
-
-    match output {
-        Some(path) => {
-            std::fs::write(path, &json_output)
-                .with_context(|| format!("Failed to write to {path}"))?;
-            println!("✓ Exported to {}", path);
-        }
-        None => println!("{}", json_output),
-    }
-    Ok(())
-}
-
 // ============================================================
 // Helpers
 // ============================================================
 
 /// Open a Cogito instance backed by SQLite at `<cwd>/.cogito/state.db`.
-/// Auto-migrates legacy JSON files on first run.
 fn open_cogito(cwd: &Path) -> Result<Cogito> {
     let cogito_dir = cwd.join(".cogito");
     std::fs::create_dir_all(&cogito_dir)
@@ -1181,5 +959,19 @@ fn load_or_create_project(cogito: &Cogito, cwd: &Path) -> Result<Project> {
     Ok(project)
 }
 
-// ProjectId is just a type alias for Uuid
-type _ProjectId = Uuid;
+// ─────────────────────────────────────────────────────────────────────────────
+// Benchmark
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run the token-savings benchmark.
+pub async fn bench(
+    repo: Option<PathBuf>,
+    terms: Vec<String>,
+    json: bool,
+    limit: usize,
+) -> Result<()> {
+    let opts = bench::BenchOptions { repo, terms, limit };
+    let result = bench::run_benchmark_async(opts).await?;
+    bench::print_results(&result, json)?;
+    Ok(())
+}

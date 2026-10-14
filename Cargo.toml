@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/cogito-harness-core",
     "crates/cogito-harness",
-    "crates/cogito-harness-api",
 
     "examples",
     "skills/cogito",
@@ -12,6 +11,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# Minimum Rust version required by edition 2024.
+rust-version = "1.85"
 # `cogito.ai` is not ours -- it is a parked domain for sale, and a security
 # address there would deliver reports to whoever buys it. Everything published
 # to crates.io is permanent, so the metadata points at the repository instead.
@@ -45,9 +46,6 @@ rusqlite = { version = "0.32", features = ["bundled", "modern_sqlite", "blob"] }
 rmcp = { version = "1.8", features = ["server", "transport-io", "macros", "schemars"] }
 schemars = "1"
 toml_edit = "0.22"
-syn = { version = "2", features = ["full", "extra-traits", "parsing"] }
-quote = "1"
-proc-macro2 = "1"
 tree-sitter = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.23"
@@ -58,19 +56,15 @@ tree-sitter-ruby = "0.23"
 tree-sitter-php = "0.25"
 tree-sitter-kotlin-ng = "1"
 tree-sitter-swift = "0.7"
+tree-sitter-rust = "0.24"
 whoami = "1"
 clap = { version = "4", features = ["derive", "env"] }
 colored = "2"
 indicatif = "0.17"
-axum = "0.7"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
-hyper = "1"
 
 # Internal crates
 cogito-harness-core = { version = "0.1.0", path = "crates/cogito-harness-core" }
 cogito-harness = { version = "0.1.0", path = "crates/cogito-harness" }
-cogito-harness-api = { version = "0.1.0", path = "crates/cogito-harness-api" }
 
 [profile.release]
 opt-level = 3

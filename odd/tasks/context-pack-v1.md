@@ -1,0 +1,139 @@
+# context_pack v1 — one call that returns the fragments a task needs
+
+Branch: `feat/context-pack`, from `fix/bench-baseline-gitignore` at `76e651a`.
+Baseline: 211 tests pass, 0 fail, 3 ignored.
+
+## Goal
+
+An MCP tool `context_pack(path, task, budget)` that, in a single call, returns the
+code and documentation fragments a task needs, ranked and inside a token budget.
+Today the same result costs four or five round trips (`search_code`, then
+`file_outline`, then reads, then `related_files`).
+
+## Non-goals (v1)
+
+- No reference graph and no impact analysis.
+- No embeddings or semantic search: that is a later Nivel 2 step.
+- No change to the index format or `FINGERPRINT_FORMAT` unless forced.
+
+## Contract
+
+- Input: free-text task (English or Spanish), budget in tokens (default 2000,
+  maximum 8000), and `path` like every other tool.
+- Candidates: symbols (name, kind, file, line), Markdown sections, and files by
+  path.
+- Neighbours: one hop of resolved imports per candidate, at a lower weight.
+- Fragment range: the outline range, never the whole file.
+- Ranking: deterministic. Term match in the name beats the path beats being a
+  neighbour. Tie-break: sources before tests, then more changes, then path.
+- Budget: fragments are added in rank order until the limit, measured with the
+  same tokenizer as `cogito bench` (`cl100k_base`), not bytes/4.
+- Output: one header line per fragment (`path:start-end`, kind, name, short
+  reason) followed by the fragment's own text, plus tokens used and the budget.
+  No candidates means a clear "no matches" message, never generic filler.
+
+## Work units
+
+### WU1 — Evaluation set, committed alone before any implementation
+`benchmarks/context_pack_gold.json`: 10 tasks over the two pinned repositories
+(ripgrep `3fce3b5`, bat `d9559c6`), each with the task text and the files or
+symbols a person would consider necessary. Deliberately mixed: some tasks name
+the identifier, some only describe behaviour, because the second kind is what
+tests the ranking.
+- [x] Acceptance: every expected path and symbol verified to exist at the pinned commit (13 file paths, 11 declarations).
+- [x] Evidence: commit `58c2b2b`
+
+### WU2 — One token counter, shared
+`TokenCounter` lives in `commands/bench.rs` where `mcp.rs` cannot reach it.
+Extract it to a small crate-level module used by both, with no behaviour change.
+- [x] Acceptance: `cogito bench` output unchanged; tests untouched. Correcting the plan's stated reason: `mcp.rs` can reach `commands::bench`; the move is for layering.
+- [x] Evidence: commit `1dfa566`
+
+### WU3 — Selection and rendering, in core, with an injected counter
+New core module that turns `(task, budget)` into a ranked, budgeted pack. It takes
+the token counter as a parameter, so `tiktoken` stays in the CLI crate and the
+logic is unit-testable without it.
+- [x] Acceptance: determinism test; budget never exceeded at ten sizes including one and five tokens; every fragment has `start <= end` within the file's real line count; a no-match task returns the empty message; a project without git behaves the same.
+- [x] Evidence: commit `417b120`
+
+### WU4 — The MCP tool
+`context_pack` registered with its request struct; `INSTRUCTIONS` names it as the
+first option for a task; `test_mcp_lists_the_map_tools_only` updated.
+- [x] Acceptance: the tool appears in `tools/list`, returns fragments inside the budget for a real workspace, and the instructions mention it first.
+- [x] Evidence: commit `8782872`
+
+### WU5 — Recall, measured
+Harness over the pinned repositories producing recall@budget per task, with the
+table committed to `docs/benchmarks.md`. The average is reported only with that
+table behind it.
+- [x] Acceptance: the table is reproducible from the committed harness and the gold set. Measured 66.7% average; first measurement was 59.2% before the term weighting and 66.7% after.
+- [x] Evidence: commit `f1aec9a`
+
+### WU6 — Docs and report
+README, SPEC and the integration tool tables describe `context_pack`; the closing
+report states the numbers, the limits, and any departure from the brief.
+- [ ] Evidence: commit `____`
+
+## Measured
+
+Every figure below comes from one run of the recall harness; the three tables are
+in `docs/benchmarks.md`.
+
+- Overall **66.7%** recall@budget over ten tasks (59.2% before the term
+  weighting).
+- **English 83.3%** over six tasks; **Spanish 41.7%** over four. The split is the
+  finding: an English task about English code works, a Spanish description of it
+  does not.
+- Tier weights, same ten tasks: `10/3/1` → 66.7%, `5/2/1` → 61.7%, `20/5/1` →
+  66.7%. Spread 5.0 percentage points, under the 10 the harness declares as its
+  margin, so the default is **stable on this set and not shown to be optimal**:
+  with ten tasks a single task moves the overall average by up to ten points.
+- The three tasks that name the identifier all score 100%. The misses are
+  `rg-05` (needs the flags-to-HiArgs semantic step), `bat-02` and `bat-04`
+  (Spanish descriptions of English code) and `rg-03` (finds the gitignore matcher
+  but not the walker).
+
+## Corrections to earlier commit messages
+
+For the pull request description, since the messages are not rewritten:
+
+- `8782872` says "The five-tool surface becomes six". That is wrong at both ends.
+  The surface was **four** tools (`project_map`, `related_files`, `file_outline`,
+  `search_code`) and adding `context_pack` made it **five**.
+
+## Departures from the brief, with reasons
+
+1. **`search_paths` no longer exists.** The brief names it as available; it was
+   replaced by `index::search` in `1945db8`. Candidates come from the index
+   module.
+2. **The pack carries each fragment's text.** The brief says "one line per
+   fragment"; returning only pointers would not save the round trips the tool
+   exists to save, so each header line is followed by the fragment's own source.
+   Budget accounting covers the whole answer either way.
+3. **The tier multiplies the term rarity instead of gating it.** Measured: an
+   absolute gate took `rg-05` from 25% to 0% and left `rg-02` at 0%. The brief's
+   `name > path > neighbour` order holds for comparable evidence; a strong match
+   in a lower tier now survives a weak one in a higher tier. Multipliers are ten,
+   three and one.
+4. **A third ranking signal was added: how much a term narrows the project.** The
+   brief lists the precedence order but not relevance between terms, and without
+   it a task phrased with common words filled its budget with whatever sorted
+   first alphabetically.
+5. **A fragment that does not fit is skipped, not fatal,** so a small fragment
+   after a large one still uses the space; the brief says "until the limit".
+6. **Reason strings are English** (`name match`, `imported by X`) although the
+   brief's examples are Spanish, because every other tool output is English.
+7. **Two index additions:** `index::files` and `index::is_test_path` (made
+   public), plus `index::count_matches` for the exact term frequency.
+
+
+## Risks
+
+- A lexical ranker cannot find code from behaviour alone, and the measured set
+  shows both failure modes: no shared vocabulary at all, and a semantic step the
+  words do not contain. Closing either needs embeddings or the reference graph,
+  not more tuning of this ranking.
+- The term weighting is a proxy. A word can look rare while matching a thousand
+  rows, which is exactly what happened to `flags`, where one large definitions
+  file shares a directory name. Document frequencies are computed per index, so
+  the proxy is honest, but it is still a proxy for relevance.

@@ -35,9 +35,9 @@ fn clone_shallow(url: &str) -> Option<(TempDir, PathBuf)> {
     Some((dir, path))
 }
 
-#[test]
+#[tokio::test]
 #[ignore] // Run with --ignored
-fn real_world_ripgrep_small() {
+async fn real_world_ripgrep_small() {
     if !should_run() {
         eprintln!("Skipping: set COGITO_RUN_REAL_WORLD=1 to run");
         return;
@@ -52,14 +52,16 @@ fn real_world_ripgrep_small() {
     eprintln!("=== ripgrep real-world test ===");
     eprintln!("Path: {}", path.display());
 
-    let cogito = cogito_harness_core::Cogito::new();
-    let project = cogito.init_project(path).expect("init");
+    let cogito = cogito_harness_core::Cogito::for_project(&path).unwrap();
+    let project = cogito.load_project(path).unwrap();
 
     eprintln!("Project: {} ({})", project.name, project.language);
 
     let start = std::time::Instant::now();
-    let fingerprint =
-        futures::executor::block_on(cogito.generate_fingerprint(&project)).expect("fingerprint");
+    let fingerprint = cogito
+        .generate_fingerprint(&project)
+        .await
+        .expect("fingerprint");
     let elapsed = start.elapsed();
 
     eprintln!("Fingerprint time: {:?}", elapsed);
@@ -79,53 +81,9 @@ fn real_world_ripgrep_small() {
     );
 }
 
-#[test]
-#[ignore]
-fn real_world_compress_ripgrep() {
-    if !should_run() {
-        eprintln!("Skipping: set COGITO_RUN_REAL_WORLD=1 to run");
-        return;
-    }
-
-    let Some((_dir, path)) = clone_shallow("https://github.com/BurntSushi/ripgrep.git") else {
-        return;
-    };
-
-    // Compress a few real source files
-    let target = path.join("src/main.rs");
-    if !target.exists() {
-        eprintln!("ripgrep main.rs not found, skipping");
-        return;
-    }
-    let content = std::fs::read_to_string(&target).expect("read");
-
-    let cogito = cogito_harness_core::Cogito::new();
-    let options = cogito_harness_core::CompressionOptions {
-        max_tokens: 1_000_000,
-        preserve_imports: true,
-        preserve_types: true,
-        hot_zones_priority: false,
-    };
-
-    let start = std::time::Instant::now();
-    let result =
-        futures::executor::block_on(cogito.compress_context(&content, options)).expect("compress");
-    let elapsed = start.elapsed();
-
-    eprintln!("=== ripgrep compress test ===");
-    eprintln!("File: src/main.rs ({} bytes)", content.len());
-    eprintln!("Compress time: {:?}", elapsed);
-    eprintln!(
-        "Tokens: {} -> {} ({:.1}% savings)",
-        result.original_tokens, result.compressed_tokens, result.savings_percent
-    );
-
-    assert!(result.compressed_tokens <= result.original_tokens);
-}
-
-#[test]
-#[ignore]
-fn real_world_bat_medium() {
+#[tokio::test]
+#[ignore] // Run with --ignored
+async fn real_world_bat_medium() {
     if !should_run() {
         eprintln!("Skipping: set COGITO_RUN_REAL_WORLD=1 to run");
         return;
@@ -140,12 +98,14 @@ fn real_world_bat_medium() {
     eprintln!("=== bat real-world test ===");
     eprintln!("Path: {}", path.display());
 
-    let cogito = cogito_harness_core::Cogito::new();
-    let project = cogito.init_project(path).expect("init");
+    let cogito = cogito_harness_core::Cogito::for_project(&path).unwrap();
+    let project = cogito.load_project(path).unwrap();
 
     let start = std::time::Instant::now();
-    let fingerprint =
-        futures::executor::block_on(cogito.generate_fingerprint(&project)).expect("fingerprint");
+    let fingerprint = cogito
+        .generate_fingerprint(&project)
+        .await
+        .expect("fingerprint");
     let elapsed = start.elapsed();
 
     eprintln!("Project: {} ({})", project.name, project.language);

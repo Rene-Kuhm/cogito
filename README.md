@@ -2,23 +2,29 @@
 
 **Intelligent context harness for AI coding agents.**
 
-Cogito optimizes the context AI agents receive — without modifying models or agents. It acts as an intelligent middle layer that reduces token consumption, improves context relevance, and accelerates agent performance.
+Cogito gives AI coding agents the project context they need — structure, symbols, references — without sending the entire codebase. It indexes files and declarations with tree-sitter, keeps an incremental SQLite/FTS5 store in sync with the working tree, and exposes five MCP tools (`context_pack`, `project_map`, `search_code`, `file_outline`, `related_files`) that agents can call on demand. Token savings on benchmark: 89.8% on ripgrep and bat — from 743,440 tokens to 75,961 over eight search terms.
 
-**Storage**: SQLite (FTS5 + generated columns + WAL). Auto-migrates from legacy JSON files.
+**Storage**: SQLite with FTS5 full-text index over files and symbols. Incremental sync: a new uncommitted file is visible without a commit or a manual refresh.
 
 ```bash
 # Install
 curl -fsSL https://raw.githubusercontent.com/Rene-Kuhm/cogito-harness/main/install.sh | sh
 
-# Wire it into the agents you use (backs up every file it touches)
+# Wire it into the agents you use (backups every file it touches)
 cogito setup
 
 # Check what is configured
 cogito doctor
 
 # Use it
-cogito scan                    # code fingerprint
-cogito query "where is auth?"  # search knowledge
+cogito init                     # create .cogito/ in the current project
+cogito scan                     # build fingerprint and full index
+cogito search "useAuth"         # look up a symbol, file or doc section
+cogito outline src/main.rs      # see a file's declarations with line ranges
+cogito map                       # print the full project map
+cogito map --card               # print the short project card
+cogito related src/auth.rs      # show what a file imports and what imports it
+cogito bench                    # measure token savings vs baseline explorer
 ```
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org)
@@ -30,24 +36,24 @@ cogito query "where is auth?"  # search knowledge
 
 ## Works with everything
 
-Cogito ships one binary and configures your agents for you. `cogito setup`
-writes each agent's config, backing up every file first:
+`cogito setup` detects the agents installed on your machine and offers a menu.
+It writes each agent's config, backing up every file first:
 
 | Agent | Integration |
 |---|---|
-| **Gentle Shell (pi)** | `cogito-harness` npm package + direct MCP — status line, `/cogito`, session-start scan |
-| **Claude Code** | MCP + `SessionStart` hook |
-| **opencode** | MCP + session plugin |
-| **Codex** | MCP (`[mcp_servers.cogito]` in `~/.codex/config.toml`) |
+| **Gentle Shell (pi)** | `cogito-harness` npm package (session scan, status line, `/cogito` commands) + direct MCP exposure |
+| **Claude Code** | MCP + `SessionStart` hook (project card on session start) + `PreToolUse` guardrail |
+| **Codex** | MCP + `AGENTS.md` block (project card reminder + MCP tool names + read/grep guardrail) |
+| **opencode** | MCP + session plugin (card injection, guardrails) + `AGENTS.md` block |
 | **Gemini CLI** | MCP |
 | **Crush** | MCP |
 | **Cursor / Zed / any MCP client** | one config block |
-| **Any agent without MCP** | CLI or REST API on `localhost:8080` |
+| **Any agent without MCP** | CLI |
 
 ```bash
 cogito setup              # interactive menu of detected agents
 cogito setup --all        # configure everything detected
-cogito setup --dry-run    # show what would change
+cogito setup --dry-run    # show what would change, write nothing
 cogito uninstall          # remove, keeping backups
 ```
 
@@ -57,17 +63,16 @@ Full per-agent detail: [`docs/integrations.md`](docs/integrations.md).
 
 ## What is Cogito?
 
-AI coding agents suffer from **context inflation**. Large codebases exceed context windows, agents fetch irrelevant code, and every conversation starts from scratch.
-
-Cogito solves this with four core innovations:
+AI coding agents suffer from **context inflation**. Large codebases exceed context windows, agents fetch irrelevant code, and every conversation starts from scratch. Cogito solves this by giving the agent the right structural information at the right time.
 
 | Feature | What it does | Why it matters |
 |---------|-------------|----------------|
-| **Code Fingerprints** | Minimal structural snapshots of projects | Agents understand structure without reading everything |
-| **SQLite + FTS5** | Single-file local DB with porter stemming | "scalable" matches "scalability"; 309x faster writes than JSON |
-| **Semantic Memory Tags** | Indexed knowledge with zero reading | Query "where is auth?" returns instant answers |
-| **Decision Log** | Structured reasoning that survives sessions | "Why did we choose JWT?" is always answerable |
-| **Context Compressor** | Intelligent context reduction | 50%+ token savings, zero semantic loss |
+| **Project card** | ~320-token summary: modules, key docs, busiest files | Agent orients without a call |
+| **Code fingerprint** | Hot/cold/frozen zones from git history, modules from manifests, entry points and data flows | Agent knows where the action is |
+| **Symbol & file index** | Tree-sitter declarations for 10 languages, keyed by language | Agents find symbols, not just files |
+| **Outline & reference lookup** | Declarations with exact line ranges; imports resolved for TS/JS, Rust, Python, Go, Java | Only the needed lines are read |
+| **Incremental sync** | SQLite index synced from the working tree on every call | Uncommitted files are visible without a commit |
+| **Token benchmark** | Reproducible `cogito bench` over pinned open-source repos | Measure actual savings |
 
 ---
 
@@ -77,27 +82,26 @@ Cogito solves this with four core innovations:
 ┌─────────────────────────────────────────────────────────────┐
 │                         COGITO CORE                         │
 │  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐ │
-│  │   Code       │  │  Semantic    │  │    Decision Log    │ │
-│  │  Fingerprint │  │   Memory     │  │       Engine       │ │
+│  │   Code       │  │   Symbol    │  │  Incremental       │ │
+│  │  Fingerprint │  │   Index     │  │  SQLite / FTS5     │ │
 │  └──────────────┘  └──────────────┘  └────────────────────┘ │
 │  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐ │
-│  │   Hot/Cold   │  │  Context     │  │   MCP Protocol     │ │
-│  │    Zones     │  │  Compressor  │  │      Adapter      │ │
+│  │   Import     │  │   Tree-      │  │   MCP Protocol    │ │
+│  │  Resolution │  │   sitter     │  │   Adapter         │ │
 │  └──────────────┘  └──────────────┘  └────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
-          │                 │                    │
-    ┌─────┴─────┐     ┌─────┴─────┐       ┌─────┴─────┐
-    │    CLI    │     │  REST API │       │  MCP      │
-    └───────────┘     └───────────┘       │  Server   │
-                                          └───────────┘
-                           │              │
-              ┌────────────┴──────────────┘
-              │         ANY AI AGENT
-              │
-    ┌─────────┼─────────┬─────────┬─────────┬─────────┐
-    │ Claude  │ GPT-4o  │ Gemini  │DeepSeek │  Qwen   │
-    │  Code   │  Codex  │         │         │         │
-    └─────────┴─────────┴─────────┴─────────┴─────────┘
+          │                     │
+    ┌─────┴─────┐         ┌─────┴─────┐
+    │    CLI    │         │  MCP      │
+    └───────────┘         │  Server   │
+                          └───────────┘
+                           │
+              ┌────────────┴──────────────┐
+              │         ANY AI AGENT       │
+              │  Claude Code · opencode    │
+              │  Codex · Gemini · Crush   │
+              │  pi · any MCP client       │
+              └────────────────────────────┘
 ```
 
 ---
@@ -120,30 +124,33 @@ cargo install cogito-harness
 
 ### Pre-built binaries
 
-Download from [GitHub Releases](https://github.com/Rene-Kuhm/cogito-harness/releases)
+Download from [GitHub Releases](https://github.com/Rene-Kuhm/cogito-harness/releases).
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Initialize Cogito in your project
+# 1. Initialise Cogito in your project
 cogito init
 
-# 2. Scan and generate fingerprint
+# 2. Build fingerprint and full index
 cogito scan
 
-# 3. Compress context
-cat large_context.txt | cogito compress --max-tokens 8000
+# 3. Print the project card (what an agent gets on session start)
+cogito map --card
 
-# 4. Query knowledge
-cogito query "how does authentication work?"
+# 4. Search for a symbol, file or doc section
+cogito search "useAuth"
 
-# 5. Register a decision
-cogito decision add \
-  --title "JWT with refresh tokens" \
-  --why "stateless, scales better than sessions" \
-  --paths src/auth/
+# 5. See a file's declarations with exact line ranges
+cogito outline src/main.rs
+
+# 6. See what a file imports and what imports it
+cogito related src/auth.rs
+
+# 7. Measure token savings
+cogito bench
 ```
 
 ---
@@ -153,58 +160,73 @@ cogito decision add \
 ### Code Fingerprint Generator
 
 ```bash
-cogito scan --watch    # Watch mode for live updates
-cogito fingerprint show # Display current fingerprint
+cogito scan
+cogito fingerprint show
 ```
 
-Generates minimal structural snapshots identifying:
+Generates a minimal structural snapshot identifying:
 - Entry points (main, routes, handlers)
 - Data flows between modules
-- Hot/cold code zones
-- Dependency graph
+- Hot/cold/frozen zones from git history analysis
+- Module structure from manifests (`Cargo.toml`, `package.json`, `go.mod`, …)
 
-### Semantic Memory Tags
-
-```bash
-cogito tag add billing src/billing/ src/invoices/
-cogito tag search "payment"
-```
-
-Indexes knowledge without reading code:
-- Auto-tag by file naming patterns
-- Directory structure → domain mapping
-- Confidence scores for relevance
-
-### Decision Log
+### Symbol & File Index
 
 ```bash
-cogito decision list
-cogito decision search "auth"
+cogito search "useAuth"       # symbols, files, doc sections
+cogito outline src/main.rs    # declarations with line ranges
 ```
 
-Structured reasoning that survives sessions:
-- Manual registration via CLI
-- Auto-extraction from git history
-- Search by tags, paths, or text
+Tree-sitter declaration extraction for Rust, TypeScript, JavaScript, Python,
+Go, Java, C#, Ruby, PHP, Kotlin and Swift. Markdown sections are indexed
+separately. FTS5 with bm25 ranking over symbol names and doc section titles.
+The index syncs incrementally from the working tree on every call.
 
-### Context Compressor
+### Import Resolution
 
 ```bash
-cogito compress context.txt --max-tokens 8000
+cogito related src/auth.rs
 ```
 
-Intelligent compression strategies:
-- **Structural**: Remove whitespace, comments
-- **Semantic**: Summarize functions, keep signatures
-- **Relevance**: Remove unused code paths
+Resolves imports for TypeScript/JavaScript, Rust, Python, Go and Java.
+`related_files` shows: what the file imports, what imports it, and external
+packages.
+
+### Incremental Sync
+
+The SQLite index (`indexed_files`, `indexed_symbols` with FTS5, `indexed_imports`)
+is kept in sync with the working tree by content hash + size + mtime.
+An uncommitted file is visible in `search_code` without a commit or `--refresh`.
+
+### Token Benchmark
+
+```bash
+cogito bench
+```
+
+Reproducible benchmark against pinned open-source repositories (ripgrep, bat),
+counting tokens with `tiktoken-rs` / `cl100k_base`. Baseline vs Cogito:
+listing files, grepping, whole-file reads vs card + `search_code` + `file_outline`.
+On ripgrep and bat combined: 743,440 → 75,961 tokens (89.8% savings).
 
 ### MCP Server
 
 ```bash
-cogito serve --mcp
+cogito mcp
 ```
 
-Connect to any MCP-compatible client (Claude Code, Cursor, etc.)
+Five tools: `context_pack`, `project_map`, `search_code`, `file_outline`,
+`related_files`. Each tool takes an explicit `path` to the project root.
+
+`context_pack` is the one to start with when you know what you are about to do:
+give it the task in your own words and it returns the fragments that matter,
+ranked, with the reason each was chosen and inside a token budget (2000 by
+default, 8000 maximum). Measured recall over ten labelled tasks on ripgrep and
+bat: 66.7% overall, and the split matters more than the average — 83.3% on the
+six English tasks against 41.7% on the four Spanish ones. The tables and the
+limits are in [`docs/benchmarks.md`](docs/benchmarks.md), including what was
+tried and reverted. The main limit: a question in Spanish about code written in
+English gets much less out of it than the same question in English.
 
 ---
 
@@ -212,56 +234,49 @@ Connect to any MCP-compatible client (Claude Code, Cursor, etc.)
 
 | Feature | Cogito | LangChain | LlamaIndex |
 |---------|--------|-----------|------------|
-| Code fingerprints | ✅ | ❌ | ❌ |
-| Semantic memory tags | ✅ | ❌ | ❌ |
-| Decision log | ✅ | ❌ | ❌ |
-| Hot/cold zones | ✅ | ❌ | ❌ |
-| Context compression | ✅ Optimized | ⚠️ Basic | ⚠️ Basic |
+| Tree-sitter symbols | ✅ | ❌ | ❌ |
+| Hot/cold/frozen zones | ✅ | ❌ | ❌ |
+| Incremental index | ✅ | ❌ | ❌ |
+| Import resolution | ✅ (5 stacks) | ❌ | ❌ |
 | MCP native | ✅ | ⚠️ | ❌ |
-| Multi-model unified | ✅ | ⚠️ | ⚠️ |
-| Token savings | >50% | Unknown | Unknown |
+| Reproducible benchmark | ✅ | ❌ | ❌ |
+| Token savings | 89.8% (bench) | Unknown | Unknown |
 | Open source | ✅ | ✅ | ✅ |
 
 ---
 
-## Supported Models
+## Supported Models / Agents
 
-Cogito is model-agnostic. It works with any AI agent:
+Cogito is agent-agnostic. It works with any agent that speaks MCP:
+Gentle Shell (pi), Claude Code, opencode, Codex, Gemini CLI, Crush, Cursor, Zed.
 
-- **Claude** (Anthropic) — via MCP or REST
-- **GPT-4o / Codex** (OpenAI) — via REST API
-- **Gemini** (Google) — via REST API
-- **DeepSeek** (Moonshot) — via REST API
-- **Qwen** (Alibaba) — via REST API
-- **MiniMax** — via REST API
-- **Grok** (xAI) — via REST API
-- **Cursor** — via MCP
-- **Copilot** — via API
-- **Aider** — via CLI
+Agents without MCP use the CLI directly.
 
 ---
 
 ## Supported Languages
 
-| Language | Fingerprint | Semantic Tags | Hot/Cold |
-|----------|-------------|---------------|----------|
+| Language | Fingerprint | Symbol extraction | Import resolution |
+|----------|-------------|-------------------|-------------------|
 | Rust | ✅ | ✅ | ✅ |
-| TypeScript | ✅ | ✅ | ✅ |
-| JavaScript | ✅ | ✅ | ✅ |
+| TypeScript / JavaScript | ✅ | ✅ | ✅ |
 | Python | ✅ | ✅ | ✅ |
 | Go | ✅ | ✅ | ✅ |
 | Java | ✅ | ✅ | ✅ |
-| C# | ✅ | ✅ | ✅ |
-| Ruby | ✅ | ✅ | ✅ |
-| PHP | ✅ | ✅ | ✅ |
+| C# | ✅ | ✅ | — |
+| Ruby | ✅ | ✅ | — |
+| PHP | ✅ | ✅ | — |
+| Kotlin | ✅ | ✅ | — |
+| Swift | ✅ | ✅ | — |
 
 ---
 
 ## Documentation
 
-- [SPEC.md](SPEC.md) — Full technical specification
+- [SPEC.md](SPEC.md) — Technical specification
 - [CONTRIBUTING.md](CONTRIBUTING.md) — How to contribute
-- [docs/](docs/) — Detailed documentation (coming soon)
+- [docs/integrations.md](docs/integrations.md) — Per-agent setup and behaviour
+- [docs/benchmarks.md](docs/benchmarks.md) — Token savings benchmark details
 
 ---
 
@@ -273,25 +288,5 @@ Apache License 2.0 — see [LICENSE](LICENSE)
 
 ## Contributing
 
-Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for:
-- Development setup
-- Code style guidelines
-- Commit message conventions
-- Pull request process
-
----
-
-## Status
-
-**Project Status**: 🟡 Active Development
-
-Cogito is in active development. The MVP is being built.
-
-- [x] Project structure
-- [x] Specification
-- [ ] Core engine implementation
-- [ ] CLI tool
-- [ ] REST API
-- [ ] MCP server
-
-See [ROADMAP](SPEC.md#roadmap) for full timeline.
+Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for development
+setup, code style, commit conventions and the pull request process.

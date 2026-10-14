@@ -1,13 +1,12 @@
 //! # Cogito Core
 //!
-//! Intelligent context optimization engine for AI coding agents.
+//! Intelligent context harness for AI coding agents.
 //!
 //! ## Core Modules
 //!
-//! - [`fingerprint`] — Code Fingerprint generator
-//! - [`compressor`] — Context compression engine
-//! - [`semantic`] — Semantic Memory Tags
-//! - [`decision`] — Decision Log engine
+//! - [`fingerprint`] — Code fingerprint generator
+//! - [`map`] — Project map and search
+//! - [`storage`] — SQLite persistence
 //!
 //! ## Usage
 //!
@@ -23,12 +22,10 @@
 //! # }
 //! ```
 
-pub mod compressor;
-pub mod decision;
 pub mod fingerprint;
+pub mod index;
 pub mod map;
-pub mod persistence;
-pub mod semantic;
+pub mod pack;
 pub mod storage;
 pub mod types;
 
@@ -119,7 +116,7 @@ impl Cogito {
     /// Open an in-memory SQLite Cogito (for tests).
     pub fn in_memory() -> Result<Self> {
         let conn = rusqlite::Connection::open_in_memory()?;
-        crate::storage::sqlite::migrate_v1_pub(&conn)?;
+        crate::storage::sqlite::migrate_pub(&conn)?;
         Ok(Self {
             sqlite: Some(std::sync::Arc::new(parking_lot::Mutex::new(conn))),
             cogito_dir: PathBuf::from(".cogito"),
@@ -138,14 +135,11 @@ impl Cogito {
     }
 
     /// Borrow the connection, if any.
-    fn connection(&self) -> Option<parking_lot::MutexGuard<'_, rusqlite::Connection>> {
+    pub fn connection(&self) -> Option<parking_lot::MutexGuard<'_, rusqlite::Connection>> {
         self.sqlite.as_ref().map(|c| c.lock())
     }
 
     /// Initialize a project rooted at `path`.
-    ///
-    /// If SQLite is open and legacy `.cogito/*.json` files exist, they are
-    /// migrated into SQLite and re-assigned to this project's id.
     pub fn init_project(&self, path: PathBuf) -> Result<Project> {
         let language = if path.is_dir() {
             Language::detect_project(&path)?
@@ -156,19 +150,6 @@ impl Cogito {
         // Deterministic id: identical canonical paths map to the same project.
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
         let id = Uuid::new_v5(&Uuid::NAMESPACE_OID, canonical.to_string_lossy().as_bytes());
-
-        if let Some(conn) = self.connection()
-            && self.cogito_dir.exists()
-            && let Ok(report) =
-                crate::storage::sqlite::migrate_from_json(&conn, &self.cogito_dir, Some(id))
-            && (report.tags_imported > 0 || report.decisions_imported > 0)
-        {
-            tracing::info!(
-                "Migrated {} tags and {} decisions from legacy JSON",
-                report.tags_imported,
-                report.decisions_imported
-            );
-        }
 
         Ok(Project {
             id,
@@ -233,21 +214,82 @@ impl Cogito {
     /// was never scanned, the stored one predates the current format, or
     /// `HEAD` moved since it was taken. Returns whether a scan ran.
     ///
-    /// Uncommitted edits do not trigger a rescan; pass `refresh` after large
-    /// local changes.
+    /// Working-tree changes invalidate the stored fingerprint: the index is
+    /// synced first and any change (added, modified, removed file) forces a
+    /// regeneration so `fingerprint.files` and `fingerprint.symbols` always
+    /// reflect the current working tree.
+    ///
+    /// The fast skip path (`allow_skip_when_clean = true`) is used only when
+    /// a valid stored fingerprint exists and `HEAD` has not moved: the
+    /// `worktree_changed()` check then avoids re-walking the tree.
     pub async fn fingerprint(
         &self,
         project: &Project,
         refresh: bool,
     ) -> Result<(Fingerprint, bool)> {
+        // Load stored fingerprint before syncing so we know whether to allow
+        // the fast skip path.
+        let stored = if self.sqlite.is_some() {
+            self.stored_fingerprint(project.id)?
+        } else {
+            None
+        };
+
+        let can_skip = !refresh
+            && stored.is_some()
+            && stored
+                .as_ref()
+                .map(|s| s.format >= fingerprint::FINGERPRINT_FORMAT)
+                .unwrap_or(false)
+            && stored
+                .as_ref()
+                .map(|s| s.head == fingerprint::current_head(&project.path))
+                .unwrap_or(false);
+
+        let index_changed = if let Some(conn) = self.connection() {
+            let report = crate::index::sync(&conn, project.id, &project.path, can_skip)?;
+            report.changed()
+        } else {
+            false
+        };
+
         if !refresh
-            && let Some(stored) = self.stored_fingerprint(project.id)?
-            && stored.format >= fingerprint::FINGERPRINT_FORMAT
-            && stored.head == fingerprint::current_head(&project.path)
+            && !index_changed
+            && stored
+                .as_ref()
+                .map(|s| {
+                    s.format >= fingerprint::FINGERPRINT_FORMAT
+                        && s.head == fingerprint::current_head(&project.path)
+                })
+                .unwrap_or(false)
         {
-            return Ok((stored, false));
+            return Ok((stored.unwrap(), false));
         }
         Ok((self.generate_fingerprint(project).await?, true))
+    }
+
+    /// Sync the index for `project`, returning a report.
+    ///
+    /// This is the cheap freshness entry point: it checks whether the working
+    /// tree has changed and re-indexes only what is necessary, but it does NOT
+    /// regenerate the fingerprint. Use this before any query that needs the
+    /// index up to date. `Cogito::fingerprint` is for `project_map` and for
+    /// explicit scan/refresh paths.
+    pub async fn sync_index(&self, project: &Project) -> Result<crate::index::SyncReport> {
+        // Load stored fingerprint to determine the allow_skip_when_clean flag.
+        let stored = self.stored_fingerprint(project.id)?;
+        let can_skip = stored
+            .as_ref()
+            .map(|s| {
+                s.format >= fingerprint::FINGERPRINT_FORMAT
+                    && s.head == fingerprint::current_head(&project.path)
+            })
+            .unwrap_or(false);
+
+        let conn = self
+            .connection()
+            .ok_or_else(|| anyhow::anyhow!("No SQLite connection"))?;
+        crate::index::sync(&conn, project.id, &project.path, can_skip)
     }
 
     /// The fingerprint stored by the last scan, if any.
@@ -258,60 +300,13 @@ impl Cogito {
         }
     }
 
-    /// Compress context
-    pub async fn compress_context(
-        &self,
-        content: &str,
-        options: CompressionOptions,
-    ) -> Result<CompressedContext> {
-        compressor::compress(content, options)
-    }
-
-    /// Search semantic tags
-    pub fn search_tags(&self, project_id: Uuid, query: &str) -> Result<Vec<SemanticTag>> {
-        let guard = self.connection();
-        semantic::search(guard.as_deref(), project_id, query)
-    }
-
-    /// Add a semantic tag
-    pub fn add_tag(&self, tag: SemanticTag) -> Result<SemanticTag> {
-        let guard = self.connection();
-        semantic::add(guard.as_deref(), &self.cogito_dir, tag)
-    }
-
-    /// Delete a semantic tag
-    pub fn delete_tag(&self, project_id: Uuid, tag_id: Uuid) -> Result<bool> {
-        let guard = self.connection();
-        semantic::delete(guard.as_deref(), &self.cogito_dir, project_id, tag_id)
-    }
-
-    /// Create a decision
-    pub fn add_decision(&self, decision: Decision) -> Result<Decision> {
-        let guard = self.connection();
-        decision::add(guard.as_deref(), &self.cogito_dir, decision)
-    }
-
-    /// Search decisions
-    pub fn search_decisions(&self, project_id: Uuid, query: &str) -> Result<Vec<Decision>> {
-        let guard = self.connection();
-        decision::search(guard.as_deref(), project_id, query)
-    }
-
-    /// Delete a decision
-    pub fn delete_decision(&self, project_id: Uuid, decision_id: Uuid) -> Result<bool> {
-        let guard = self.connection();
-        decision::delete(guard.as_deref(), &self.cogito_dir, project_id, decision_id)
-    }
-
     /// Storage statistics for a project
     pub fn stats(&self, project_id: Uuid) -> Result<crate::storage::Stats> {
         match self.connection() {
             Some(conn) => crate::storage::sqlite::get_stats(&conn, project_id),
             None => Ok(crate::storage::Stats {
                 project_id,
-                tags_count: 0,
-                decisions_count: 0,
-                hot_zones_count: 0,
+                has_fingerprint: false,
                 fingerprint_generated_at: None,
             }),
         }
@@ -328,9 +323,6 @@ impl Default for Cogito {
         Self::new()
     }
 }
-
-// StorageBackend enum removed: SQLite is now the default,
-// legacy JSON is implicit. See `Cogito::with_sqlite` and `with_project_sqlite`.
 
 #[cfg(test)]
 mod tests {

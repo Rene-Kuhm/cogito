@@ -10,7 +10,7 @@
 //! Every failure path allows the call. A guardrail that errors must not cost
 //! the user a tool call.
 
-use cogito_harness_core::{Cogito, map};
+use cogito_harness_core::{Cogito, index, map};
 use serde_json::Value;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -101,9 +101,25 @@ async fn read_nudge(root: &Path, input: &Value) -> anyhow::Result<Option<(String
 
     let (cogito, project) = open(root)?;
     let (fingerprint, _) = cogito.fingerprint(&project, false).await?;
-    let Ok(outline) = map::render_outline(root, &fingerprint, &rel) else {
-        return Ok(None);
+
+    // Try the index first.
+    let decls = if let Some(conn) = cogito.connection() {
+        index::outline(&conn, project.id, &rel)
+            .map(|ds| ds.into_iter().map(Into::into).collect::<Vec<_>>())
+            .unwrap_or_default()
+    } else {
+        vec![]
     };
+
+    let decls = if decls.is_empty() {
+        let content = std::fs::read_to_string(root.join(&rel)).unwrap_or_default();
+        let ext = rel.extension().and_then(|e| e.to_str()).unwrap_or("");
+        map::outline::declarations(&content, ext)
+    } else {
+        decls
+    };
+
+    let outline = map::render_outline(root, Some(&fingerprint), &rel, &decls, 0);
     let message = format!(
         "{} has {lines} lines. Cogito's outline instead of the whole file:\n\n{}\n\
          Read the range you need with offset/limit. Reading the whole file again is allowed \
@@ -122,12 +138,34 @@ async fn grep_nudge(root: &Path, input: &Value) -> anyhow::Result<Option<(String
         return Ok(None);
     }
     let (cogito, project) = open(root)?;
-    let (fingerprint, _) = cogito.fingerprint(&project, false).await?;
-    let found = map::search_paths(root, &fingerprint, pattern);
-    if found.files.is_empty() && found.symbols.is_empty() && found.modules.is_empty() {
+
+    // Sync the index: on failure, let the call through.
+    let _ = cogito.sync_index(&project).await;
+
+    // Query the index: on failure, let the call through.
+    let hits = if let Some(conn) = cogito.connection() {
+        index::search(&conn, project.id, pattern, 12).unwrap_or_default()
+    } else {
+        return Ok(None);
+    };
+
+    if hits.is_empty() {
         return Ok(None);
     }
-    let text = map::render_search(&found, &[], pattern);
+
+    let stored = cogito.stored_fingerprint(project.id).unwrap_or(None);
+    let modules: Vec<_> = stored
+        .as_ref()
+        .map(|fp| fp.modules.clone())
+        .unwrap_or_default();
+
+    // A file named exactly like the query puts the Files section first. The rule
+    // lives in the index, so this and the other two callers cannot drift apart.
+    let files_first = hits
+        .iter()
+        .any(|h| !h.is_symbol && index::is_named_file_match(&h.path.to_string_lossy(), pattern));
+
+    let text = map::render_search(&hits, &modules, pattern, files_first);
     let key = format!(
         "grep:{pattern}:{}:{}",
         input["path"].as_str().unwrap_or_default(),

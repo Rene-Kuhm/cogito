@@ -10,7 +10,7 @@
  *    for a plain name, it gets Cogito's outline or search result instead.
  *    Repeating the same call goes through, so the agent is never stuck.
  * 3. It sets a status line showing what Cogito knows about the project.
- * 4. It registers `/cogito` with `status`, `map`, `scan`, `query`, `stats`
+ * 4. It registers `/cogito` with `status`, `map`, `scan`, `search`, `stats`
  *    and `doctor`, so the map is usable without leaving the session.
  *
  * Persistence is owned by the `cogito` binary. This extension does **not**
@@ -303,7 +303,7 @@ export default function registerCogito(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("cogito", {
-    description: "Cogito context harness: status, map, scan, query, stats, doctor",
+    description: "Cogito context harness: status, map, scan, search, stats, doctor",
     handler: async (args: string, raw: any) => {
       const ctx = raw as CogitoContext;
       const cwd = ctx.cwd;
@@ -348,13 +348,13 @@ export default function registerCogito(pi: ExtensionAPI) {
           report(result.ok ? result.stdout.trim() : `cogito stats failed: ${firstLine(result.stderr)}`);
           return;
         }
-        case "query": {
+        case "search": {
           if (rest.length === 0) {
-            report("usage: /cogito query <text>");
+            report("usage: /cogito search <text>");
             return;
           }
-          const result = await run(["query", rest.join(" ")], cwd, QUERY_TIMEOUT_MS);
-          report(result.ok ? result.stdout.trim() : `cogito query failed: ${firstLine(result.stderr)}`);
+          const result = await run(["search", rest.join(" ")], cwd, QUERY_TIMEOUT_MS);
+          report(result.ok ? result.stdout.trim() : `cogito search failed: ${firstLine(result.stderr)}`);
           return;
         }
         case "doctor": {
@@ -375,8 +375,8 @@ export default function registerCogito(pi: ExtensionAPI) {
               "  /cogito status          what Cogito sees in this project",
               "  /cogito map             the project map the agent reads",
               "  /cogito scan            regenerate the code fingerprint",
-              "  /cogito query <text>    search tags and architectural decisions",
-              "  /cogito stats           stored tag/decision counts",
+              "  /cogito search <text>  find symbols, files and modules by words",
+              "  /cogito stats           what the index holds",
               "  /cogito doctor          full diagnostics incl. agent integrations",
             ].join("\n"),
           );

@@ -20,12 +20,8 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// The three publishable crates.
-const PUBLISHABLE: &[&str] = &[
-    "cogito-harness-core",
-    "cogito-harness",
-    "cogito-harness-api",
-];
+/// The publishable crates.
+const PUBLISHABLE: &[&str] = &["cogito-harness-core", "cogito-harness"];
 
 #[test]
 fn no_metadata_references_a_domain_we_do_not_own() {
@@ -41,7 +37,6 @@ fn no_metadata_references_a_domain_we_do_not_own() {
         "SECURITY.md",
         "crates/cogito-harness/Cargo.toml",
         "crates/cogito-harness-core/Cargo.toml",
-        "crates/cogito-harness-api/Cargo.toml",
     ] {
         let path = root.join(relative);
         let text = read(&path);

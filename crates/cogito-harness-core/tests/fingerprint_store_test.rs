@@ -56,7 +56,7 @@ async fn scan_stores_the_fingerprint() {
     );
 
     let after = cogito.stats(project.id).unwrap();
-    assert_eq!(after.hot_zones_count, fingerprint.hot_zones.len() as i64);
+    assert!(after.has_fingerprint);
     assert!(after.fingerprint_generated_at.is_some());
 
     let stored = cogito.stored_fingerprint(project.id).unwrap().unwrap();

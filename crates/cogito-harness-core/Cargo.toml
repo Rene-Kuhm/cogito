@@ -2,6 +2,7 @@
 name = "cogito-harness-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -28,9 +29,6 @@ parking_lot.workspace = true
 whoami.workspace = true
 git2.workspace = true
 rusqlite.workspace = true
-syn.workspace = true
-quote.workspace = true
-proc-macro2.workspace = true
 tree-sitter.workspace = true
 tree-sitter-typescript.workspace = true
 tree-sitter-python.workspace = true
@@ -41,6 +39,7 @@ tree-sitter-ruby.workspace = true
 tree-sitter-php.workspace = true
 tree-sitter-kotlin-ng.workspace = true
 tree-sitter-swift.workspace = true
+tree-sitter-rust.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
@@ -56,33 +55,5 @@ name = "fingerprint"
 harness = false
 
 [[bench]]
-name = "compress"
-harness = false
-
-[[bench]]
-name = "search"
-harness = false
-
-[[bench]]
-name = "storage_compare"
-harness = false
-
-[[bench]]
-name = "ast_vs_structural"
-harness = false
-
-[[bench]]
-name = "ast_ts_vs_structural"
-harness = false
-
-[[bench]]
-name = "ast_all_langs"
-harness = false
-
-[[bench]]
-name = "ast_csharp_java"
-harness = false
-
-[[bench]]
-name = "ast_ruby_php_kotlin_swift"
+name = "index"
 harness = false

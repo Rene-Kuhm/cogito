@@ -6,9 +6,11 @@ mod agents;
 mod claude_hook;
 mod commands;
 mod mcp;
+mod tokenizer;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
+use std::path::PathBuf;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 /// Cogito - Intelligent context optimization for AI coding agents
@@ -43,54 +45,13 @@ enum Commands {
     Init,
 
     /// Scan project and generate fingerprint
-    Scan {
-        /// Watch mode for live updates
-        #[arg(long)]
-        watch: bool,
-    },
+    Scan,
 
     /// Show current fingerprint
     Fingerprint {
         /// Show detailed fingerprint
         #[arg(short, long)]
         verbose: bool,
-    },
-
-    /// Compress context
-    Compress {
-        /// Input file (reads from stdin if not provided)
-        #[arg(default_value = "-")]
-        file: String,
-
-        /// Maximum tokens in output
-        #[arg(long, default_value_t = 8000)]
-        max_tokens: usize,
-
-        /// Preserve imports
-        #[arg(long, default_value_t = true)]
-        preserve_imports: bool,
-
-        /// Preserve types
-        #[arg(long, default_value_t = true)]
-        preserve_types: bool,
-    },
-
-    /// Query knowledge base
-    Query {
-        /// Search query
-        query: String,
-    },
-
-    /// Manage decisions
-    Decision {
-        #[command(subcommand)]
-        subcommand: Option<DecisionCommands>,
-    },
-
-    /// Manage semantic tags
-    Tag {
-        #[command(subcommand)]
-        subcommand: Option<TagCommands>,
     },
 
     /// Manage projects
@@ -131,17 +92,6 @@ enum Commands {
         /// Skip the confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
-    },
-
-    /// Start server mode
-    Serve {
-        /// Port to listen on
-        #[arg(short, long, default_value_t = 8080)]
-        port: u16,
-
-        /// Start as MCP server
-        #[arg(long)]
-        mcp: bool,
     },
 
     /// Show statistics
@@ -185,77 +135,19 @@ enum Commands {
     /// Diagnose configuration
     Doctor,
 
-    /// Export project data
-    Export {
-        /// Output file (stdout if not provided)
-        #[arg(short, long)]
-        output: Option<String>,
-
-        /// Export format
-        #[arg(short, long, default_value = "json")]
-        format: String,
-    },
-}
-
-#[derive(Parser, Debug)]
-enum DecisionCommands {
-    /// Add a new decision
-    Add {
-        /// Decision title
-        #[arg(short, long)]
-        title: Option<String>,
-
-        /// Why this decision was made
-        #[arg(short, long)]
-        why: Option<String>,
-
-        /// Alternative options considered
-        #[arg(short, long)]
-        alternative: Vec<String>,
-
-        /// Affected paths
-        #[arg(short, long)]
-        paths: Vec<String>,
-
-        /// Tags
-        #[arg(short = 'T', long)]
-        tags: Vec<String>,
-    },
-
-    /// List all decisions
-    List,
-
-    /// Search decisions
-    Search {
-        /// Search query
-        query: String,
-    },
-
-    /// Show decision details
-    Show {
-        /// Decision ID
-        id: String,
-    },
-}
-
-#[derive(Parser, Debug)]
-enum TagCommands {
-    /// Add a semantic tag
-    Add {
-        /// Tag name
-        tag: String,
-
-        /// Paths to tag
-        paths: Vec<String>,
-    },
-
-    /// List all tags
-    List,
-
-    /// Search tags
-    Search {
-        /// Search query
-        query: String,
+    /// Measure token savings when using Cogito vs. a baseline explorer.
+    Bench {
+        /// Local repository to benchmark. When omitted, uses the pinned manifest
+        /// at benchmarks/repos.json and clones repositories into .cogito/bench-cache/.
+        #[arg(short = 'r', long)]
+        repo: Option<String>,
+        /// Comma-separated search terms (e.g. "search_code,project_map").
+        /// When omitted, uses the terms from the manifest for that repository.
+        #[arg(short = 't', long, value_delimiter = ',', num_args = 1..)]
+        terms: Vec<String>,
+        /// Maximum matched files to read per term (default 5).
+        #[arg(short, long, default_value = "5")]
+        limit: usize,
     },
 }
 
@@ -309,30 +201,8 @@ async fn main() -> Result<()> {
             // An unknown hook must never block the agent.
             _ => std::process::exit(0),
         },
-        Some(Commands::Scan { watch }) => commands::scan(watch).await?,
+        Some(Commands::Scan) => commands::scan().await?,
         Some(Commands::Fingerprint { verbose }) => commands::fingerprint(verbose).await?,
-        Some(Commands::Compress {
-            file,
-            max_tokens,
-            preserve_imports,
-            preserve_types,
-        }) => {
-            commands::compress(
-                &file,
-                max_tokens,
-                preserve_imports,
-                preserve_types,
-                args.json,
-            )
-            .await?;
-        }
-        Some(Commands::Query { query }) => commands::query(&query, args.json).await?,
-        Some(Commands::Decision { subcommand }) => {
-            commands::decision(subcommand).await?;
-        }
-        Some(Commands::Tag { subcommand }) => {
-            commands::tag(subcommand).await?;
-        }
         Some(Commands::Project { subcommand }) => {
             commands::project(subcommand).await?;
         }
@@ -345,15 +215,14 @@ async fn main() -> Result<()> {
             with_pi_package,
         }) => commands::setup(agents, all || yes, dry_run, with_pi_package)?,
         Some(Commands::Uninstall { agents, yes }) => commands::uninstall(agents, yes)?,
-        Some(Commands::Serve { port, mcp }) => commands::serve(port, mcp).await?,
         Some(Commands::Stats) => commands::stats(args.json).await?,
         Some(Commands::Map { refresh, card }) => commands::map(refresh, card).await?,
         Some(Commands::Related { file }) => commands::related(&file).await?,
         Some(Commands::Outline { file }) => commands::outline(&file).await?,
         Some(Commands::Search { query }) => commands::search(&query).await?,
         Some(Commands::Doctor) => commands::doctor().await?,
-        Some(Commands::Export { output, format }) => {
-            commands::export(output.as_deref(), &format).await?
+        Some(Commands::Bench { repo, terms, limit }) => {
+            commands::bench(repo.map(PathBuf::from), terms, args.json, limit).await?;
         }
         None => {
             // No subcommand, show help

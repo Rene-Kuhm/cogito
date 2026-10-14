@@ -4,16 +4,14 @@
 //! opencode, Gemini CLI, …) can use Cogito as a tool provider.
 //!
 //! The tools give an agent the project's layout so it does not have to read
-//! the code to find its way: `project_map`, `related_files`, `search_code`,
-//! and `add_tag` to label code locations. Memory (decisions, session notes)
-//! is deliberately out of scope; that belongs to the agent's memory tool.
+//! the code to find its way: `project_map`, `related_files`, and `search_code`.
 //!
 //! Each tool takes an explicit `path` argument. The server opens that
 //! project's `.cogito/state.db` per call, so one process can serve several
 //! projects without mixing their data.
 
 use anyhow::Result;
-use cogito_harness_core::{Cogito, Fingerprint, Project};
+use cogito_harness_core::{Fingerprint, Project};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -22,20 +20,21 @@ use rmcp::{
     transport::stdio,
 };
 use std::path::PathBuf;
-use uuid::Uuid;
 
 /// Server name advertised to MCP clients.
 pub const SERVER_NAME: &str = "cogito";
 
 /// What the client tells the model about this server.
 const INSTRUCTIONS: &str = "Cogito indexes the project's code so you can answer without reading \
-it. Cheapest path first: project_map to orient (once per session); search_code to find a \
-symbol, file or module by name (it gives file:line); file_outline to see a file's declarations \
-with line ranges; then read only the lines you need. related_files shows what a file imports \
-and what imports it. Avoid listing directories, grepping or reading whole files to find your \
-way. The index refreshes when HEAD changes; pass refresh=true to project_map after large \
-uncommitted changes. Cogito is not a memory: keep decisions and notes in your memory tool. \
-Every tool takes `path`, the absolute project root.";
+it. If you know what you are about to do, start with context_pack: give it the task in your own \
+words and it returns the fragments that matter, ranked and inside a token budget, with the \
+reason each was chosen. Otherwise work cheapest first: project_map to orient (once per \
+session); search_code to find a symbol, file or module by name (it gives file:line); \
+file_outline to see a file's declarations with line ranges; then read only the lines you need. \
+related_files shows what a file imports and what imports it. Avoid listing directories, \
+grepping or reading whole files to find your way. The index refreshes when HEAD changes; pass \
+refresh=true to project_map after large uncommitted changes. Every tool takes `path`, the \
+absolute project root.";
 
 // ============================================================
 // Requests
@@ -62,18 +61,38 @@ pub struct RelatedFilesRequest {
 pub struct SearchCodeRequest {
     /// Absolute path to the project root
     pub path: String,
-    /// Words to look for in file paths, module names and tags, e.g. `auth session`
+    /// Words to look for in file paths and module names, e.g. `auth session`
     pub query: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct AddTagRequest {
+pub struct ContextPackRequest {
     /// Absolute path to the project root
     pub path: String,
-    /// Tag name, e.g. "auth", "billing"
-    pub tag: String,
-    /// Project paths the tag points at
-    pub paths: Vec<String>,
+    /// What you are about to do, in your own words: `add MFA by SMS`, `how does
+    /// the session guard validate a token`, `change the retry policy`. English
+    /// and Spanish both work.
+    pub task: String,
+    /// Token budget for the whole answer. Defaults to 2000, capped at 8000.
+    #[serde(default = "default_pack_budget")]
+    pub budget: usize,
+}
+
+fn default_pack_budget() -> usize {
+    cogito_harness_core::pack::DEFAULT_BUDGET
+}
+
+/// Tier weights for this process.
+///
+/// `COGITO_PACK_TIERS=name/path/neighbour` overrides them. The hook exists so the
+/// recall harness can measure alternatives through the real tool rather than
+/// through a reimplementation of it; unset or malformed means the default, so
+/// shipped behaviour only changes when someone deliberately asks.
+fn tier_weights() -> cogito_harness_core::pack::TierWeights {
+    std::env::var("COGITO_PACK_TIERS")
+        .ok()
+        .and_then(|spec| cogito_harness_core::pack::TierWeights::parse(&spec))
+        .unwrap_or_default()
 }
 
 // ============================================================
@@ -96,9 +115,9 @@ impl Default for CogitoServer {
 ///
 /// This is the fix for the multi-project bug: the connection is derived from
 /// the caller-supplied path, never from the process working directory.
-fn open_project(path: &str) -> Result<(Cogito, Project), String> {
+fn open_project(path: &str) -> Result<(cogito_harness_core::Cogito, Project), String> {
     let root = PathBuf::from(path);
-    let cogito = Cogito::for_project(&root)
+    let cogito = cogito_harness_core::Cogito::for_project(&root)
         .map_err(|e| format!("Failed to open project at {}: {e:#}", root.display()))?;
     let project = cogito
         .load_project(root.clone())
@@ -110,13 +129,24 @@ fn open_project(path: &str) -> Result<(Cogito, Project), String> {
 async fn mapped_project(
     path: &str,
     refresh: bool,
-) -> Result<(Cogito, Project, Fingerprint), String> {
+) -> Result<(cogito_harness_core::Cogito, Project, Fingerprint), String> {
     let (cogito, project) = open_project(path)?;
     let (fingerprint, _) = cogito
         .fingerprint(&project, refresh)
         .await
         .map_err(|e| format!("Failed to scan {}: {e}", project.path.display()))?;
     Ok((cogito, project, fingerprint))
+}
+
+/// The project and its stored fingerprint (no scan), for index-only queries.
+fn indexed_project(
+    path: &str,
+) -> Result<(cogito_harness_core::Cogito, Project, Option<Fingerprint>), String> {
+    let (cogito, project) = open_project(path)?;
+    let stored = cogito
+        .stored_fingerprint(project.id)
+        .map_err(|e| format!("Failed to load stored fingerprint: {e}"))?;
+    Ok((cogito, project, stored))
 }
 
 #[tool_router]
@@ -146,12 +176,54 @@ impl CogitoServer {
         &self,
         Parameters(req): Parameters<RelatedFilesRequest>,
     ) -> Result<String, String> {
-        let (_, project, fingerprint) = mapped_project(&req.path, false).await?;
+        let (cogito, project, stored) = indexed_project(&req.path)?;
+        let _ = cogito
+            .sync_index(&project)
+            .await
+            .map_err(|e| format!("Index sync failed: {e}"))?;
+
+        // We need a fingerprint for find_file. Fall back to scanning if needed.
+        let fingerprint = match stored.as_ref() {
+            Some(fp) => fp.clone(),
+            None => {
+                let (_, _, fp) = mapped_project(&req.path, false).await?;
+                fp
+            }
+        };
         let file = cogito_harness_core::map::find_file(&project.path, &fingerprint, &req.file)?;
+
+        let conn = cogito
+            .connection()
+            .ok_or_else(|| "No SQLite connection".to_string())?;
+        let imports: Vec<String> = cogito_harness_core::index::imports(&conn, project.id, &file)
+            .map_err(|e| format!("Failed to query imports: {e}"))?;
+        let importers: Vec<String> =
+            cogito_harness_core::index::importers(&conn, project.id, &file)
+                .map_err(|e| format!("Failed to query importers: {e}"))?
+                .into_iter()
+                .map(|p| p.display().to_string())
+                .collect();
+
+        // External specs come from the stored fingerprint's data_flows where
+        // no resolution exists. If we don't have a stored fingerprint, show none.
+        let external: Vec<String> = stored
+            .as_ref()
+            .map(|fp| {
+                fp.data_flows
+                    .iter()
+                    .filter(|flow| flow.from == file && flow.resolved.is_none())
+                    .map(|flow| flow.to.display().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(cogito_harness_core::map::render_related(
             &project.path,
-            &fingerprint,
+            stored.as_ref(),
             &file,
+            &imports,
+            &importers,
+            &external,
         ))
     }
 
@@ -162,57 +234,137 @@ impl CogitoServer {
         &self,
         Parameters(req): Parameters<RelatedFilesRequest>,
     ) -> Result<String, String> {
-        let (_, project, fingerprint) = mapped_project(&req.path, false).await?;
+        let (cogito, project, stored) = indexed_project(&req.path)?;
+        let _ = cogito
+            .sync_index(&project)
+            .await
+            .map_err(|e| format!("Index sync failed: {e}"))?;
+
+        // We need a fingerprint for find_file. Fall back to scanning if needed.
+        let fingerprint = match stored.as_ref() {
+            Some(fp) => fp.clone(),
+            None => {
+                let (_, _, fp) = mapped_project(&req.path, false).await?;
+                fp
+            }
+        };
         let file = cogito_harness_core::map::find_file(&project.path, &fingerprint, &req.file)?;
-        cogito_harness_core::map::render_outline(&project.path, &fingerprint, &file)
+
+        // Try the index first.
+        #[allow(clippy::collapsible_if)]
+        if let Some(conn) = cogito.connection() {
+            if let Ok(decls) = cogito_harness_core::index::outline(&conn, project.id, &file) {
+                if !decls.is_empty() {
+                    let importer_count =
+                        cogito_harness_core::index::importers(&conn, project.id, &file)
+                            .map(|i| i.len())
+                            .unwrap_or(0);
+                    return Ok(cogito_harness_core::map::render_outline(
+                        &project.path,
+                        stored.as_ref(),
+                        &file,
+                        &decls.into_iter().map(Into::into).collect::<Vec<_>>(),
+                        importer_count,
+                    ));
+                }
+            }
+        };
+
+        // Index had no declarations or no index: read and parse from disk.
+        let content = std::fs::read_to_string(project.path.join(&file))
+            .map_err(|e| format!("Cannot read {}: {e}", file.display()))?;
+        let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let decls = cogito_harness_core::map::outline::declarations(&content, ext);
+        Ok(cogito_harness_core::map::render_outline(
+            &project.path,
+            stored.as_ref(),
+            &file,
+            &decls,
+            0,
+        ))
     }
 
     #[tool(
-        description = "Find code or docs by words: symbols (functions, types, classes) and doc sections with file:line, file paths (most changed first), modules and tags."
+        description = "Find code or docs by words: symbols (functions, types, classes) and doc sections with file:line, and file paths (most changed first)."
     )]
     async fn search_code(
         &self,
         Parameters(req): Parameters<SearchCodeRequest>,
     ) -> Result<String, String> {
-        let (cogito, project, fingerprint) = mapped_project(&req.path, false).await?;
-        let found = cogito_harness_core::map::search_paths(&project.path, &fingerprint, &req.query);
-        let tags: Vec<(String, Vec<PathBuf>)> = cogito
-            .search_tags(project.id, &req.query)
-            .map_err(|e| format!("Failed to search tags: {e}"))?
-            .into_iter()
-            .map(|t| (t.tag, t.paths))
-            .collect();
+        let (cogito, project, stored) = indexed_project(&req.path)?;
+        let _ = cogito
+            .sync_index(&project)
+            .await
+            .map_err(|e| format!("Index sync failed: {e}"))?;
+
+        let hits = if let Some(conn) = cogito.connection() {
+            cogito_harness_core::index::search(&conn, project.id, &req.query, 12)
+                .map_err(|e| format!("Search failed: {e}"))?
+        } else {
+            vec![]
+        };
+
+        // A file named exactly like the query puts the Files section first. The
+        // rule lives in the index, so this and the other two callers cannot
+        // drift apart again.
+        let files_first = hits.iter().any(|h| {
+            !h.is_symbol
+                && cogito_harness_core::index::is_named_file_match(
+                    &h.path.to_string_lossy(),
+                    &req.query,
+                )
+        });
+
+        // Module names from the stored fingerprint, not from a new scan.
+        let modules: Vec<_> = stored
+            .as_ref()
+            .map(|fp| fp.modules.clone())
+            .unwrap_or_default();
+
         Ok(cogito_harness_core::map::render_search(
-            &found, &tags, &req.query,
+            &hits,
+            &modules,
+            &req.query,
+            files_first,
         ))
     }
 
     #[tool(
-        description = "Label project paths with a tag (e.g. 'auth' → apps/web/lib/auth) so search_code finds them by that word later. For code locations only; not for notes or decisions."
+        description = "The context for a task in one call: the code and documentation fragments it needs, ranked, with the reason each was chosen and inside a token budget. Use this first when you know what you are about to do; it replaces search_code plus several file_outline calls and range reads."
     )]
-    async fn add_tag(&self, Parameters(req): Parameters<AddTagRequest>) -> Result<String, String> {
-        let (cogito, project) = open_project(&req.path)?;
+    async fn context_pack(
+        &self,
+        Parameters(req): Parameters<ContextPackRequest>,
+    ) -> Result<String, String> {
+        let (cogito, project, stored) = indexed_project(&req.path)?;
+        // Sync before taking the connection: the guard cannot be held across an
+        // await.
+        let _ = cogito
+            .sync_index(&project)
+            .await
+            .map_err(|e| format!("Index sync failed: {e}"))?;
 
-        let tag = cogito_harness_core::types::SemanticTag {
-            id: Uuid::new_v4(),
-            project_id: project.id,
-            tag: req.tag.clone(),
-            domain: "manual".to_string(),
-            paths: req.paths.iter().map(PathBuf::from).collect(),
-            confidence: 1.0,
-            created_at: chrono::Utc::now(),
-        };
+        let conn = cogito
+            .connection()
+            .ok_or_else(|| format!("No index for {}: run `cogito scan`", req.path))?;
 
-        let added = cogito
-            .add_tag(tag)
-            .map_err(|e| format!("Failed to add tag: {e}"))?;
+        let counter = crate::tokenizer::shared();
+        let count = |text: &str| counter.count(text).0;
+        let pack = cogito_harness_core::pack::build(
+            cogito_harness_core::pack::Request {
+                conn: &conn,
+                project_id: project.id,
+                root: &project.path,
+                task: &req.task,
+                budget: req.budget,
+                fingerprint: stored.as_ref(),
+                tier_weights: tier_weights(),
+            },
+            &count,
+        )
+        .map_err(|e| format!("Failed to build the context pack: {e}"))?;
 
-        Ok(format!(
-            "Tagged {} path(s) as '{}' in {}",
-            added.paths.len(),
-            added.tag,
-            project.name
-        ))
+        Ok(cogito_harness_core::pack::render(&pack))
     }
 }
 

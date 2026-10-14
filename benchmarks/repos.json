@@ -1,0 +1,17 @@
+{
+  "manifest_version": "1.0",
+  "repos": [
+    {
+      "name": "ripgrep",
+      "url": "https://github.com/BurntSushi/ripgrep",
+      "commit": "3fce3b5bb0236da2df6d99672afb8a719642eca7",
+      "terms": ["regex", "Matcher", "search", "flags"]
+    },
+    {
+      "name": "bat",
+      "url": "https://github.com/sharkdp/bat",
+      "commit": "d9559c69f541873f8c47ac8ad81d985f4441edf6",
+      "terms": ["syntax", "Theme", "highlighter", "assets"]
+    }
+  ]
+}
