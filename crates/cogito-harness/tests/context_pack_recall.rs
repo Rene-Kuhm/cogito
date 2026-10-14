@@ -54,7 +54,23 @@ fn cogito_bin() -> PathBuf {
 
 #[derive(Deserialize)]
 struct Gold {
+    #[serde(default)]
+    repos: Vec<Repo>,
     tasks: Vec<Task>,
+}
+
+/// A repository the tasks are measured against.
+///
+/// `root` is for a local checkout that is not one of the pinned public clones,
+/// which is how a private repository is measured without its path appearing in
+/// this repository.
+#[derive(Deserialize)]
+struct Repo {
+    name: String,
+    #[serde(default)]
+    root: Option<String>,
+    #[serde(default)]
+    commit: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -213,14 +229,41 @@ struct Measured {
     missing: Vec<String>,
 }
 
+/// Where a task's repository lives.
+///
+/// A `root` in the gold set wins; otherwise the name is looked up in the pinned
+/// bench cache the public set uses.
+fn repo_roots(workspace: &Path, gold: &Gold) -> BTreeMap<String, PathBuf> {
+    let mut roots = BTreeMap::new();
+    for repo in &gold.repos {
+        let path = match &repo.root {
+            Some(root) => PathBuf::from(root),
+            None => workspace.join(".cogito/bench-cache").join(&repo.name),
+        };
+        roots.insert(repo.name.clone(), path);
+    }
+    // A gold set without a `repos` block still measures the bench cache.
+    for task in &gold.tasks {
+        roots
+            .entry(task.repo.clone())
+            .or_insert_with(|| workspace.join(".cogito/bench-cache").join(&task.repo));
+    }
+    roots
+}
+
 /// Run every task once and collect what each scored.
-fn measure(gold: &Gold, root: &Path, tiers: Option<&str>) -> Vec<Measured> {
+fn measure(gold: &Gold, roots: &BTreeMap<String, PathBuf>, tiers: Option<&str>) -> Vec<Measured> {
     let mut results = Vec::new();
     for task in &gold.tasks {
-        let repo_root = root.join(".cogito/bench-cache").join(&task.repo);
+        let Some(repo_root) = roots.get(&task.repo) else {
+            panic!(
+                "gold set names a repository it does not define: {}",
+                task.repo
+            );
+        };
         if !repo_root.is_dir() {
             println!(
-                "{:<7} {:<8}   checkout missing at {}, skipped",
+                "{:<7} {:<14}   checkout missing at {}, skipped",
                 task.id,
                 task.repo,
                 repo_root.display()
@@ -228,8 +271,8 @@ fn measure(gold: &Gold, root: &Path, tiers: Option<&str>) -> Vec<Measured> {
             continue;
         }
 
-        let first = ask(&repo_root, &task.task, task.budget, tiers);
-        let second = ask(&repo_root, &task.task, task.budget, tiers);
+        let first = ask(repo_root, &task.task, task.budget, tiers);
+        let second = ask(repo_root, &task.task, task.budget, tiers);
         assert_eq!(
             first, second,
             "task {} answered differently twice: the tool must be deterministic",
@@ -315,13 +358,13 @@ fn by_language<'a>(results: &'a [Measured], language: &str) -> Vec<&'a Measured>
 
 fn print_task_table(results: &[Measured]) {
     println!(
-        "\n{:<7} {:<4} {:>7} {:>6} {:>9} {:>6} {:>8}",
+        "\n{:<9} {:<4} {:>7} {:>6} {:>9} {:>6} {:>8}",
         "task", "lang", "budget", "used", "expected", "hits", "recall"
     );
-    println!("{}", "-".repeat(64));
+    println!("{}", "-".repeat(66));
     for r in results {
         println!(
-            "{:<7} {:<4} {:>7} {:>6} {:>9} {:>6} {:>7.0}%",
+            "{:<9} {:<4} {:>7} {:>6} {:>9} {:>6} {:>7.0}%",
             r.id,
             r.language,
             r.budget,
@@ -388,16 +431,28 @@ fn test_context_pack_recall() {
     }
 
     let root = workspace_root();
-    let gold_path = root.join("benchmarks/context_pack_gold.json");
+    // `COGITO_RECALL_GOLD` measures a set kept outside this repository, such as
+    // the one for a private monorepo, without committing its contents here.
+    let gold_path = std::env::var("COGITO_RECALL_GOLD")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("benchmarks/context_pack_gold.json"));
     let gold: Gold = serde_json::from_str(
         &std::fs::read_to_string(&gold_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", gold_path.display())),
     )
     .expect("parse the gold set");
+    let roots = repo_roots(&root, &gold);
 
-    println!("\ncontext_pack recall@budget over the labelled set");
+    println!("\ncontext_pack recall@budget over {}", gold_path.display());
+    for repo in &gold.repos {
+        let root = roots.get(&repo.name).expect("resolved above");
+        match &repo.commit {
+            Some(commit) => println!("  {} at {} ({})", repo.name, commit, root.display()),
+            None => println!("  {} at {} (unpinned)", repo.name, root.display()),
+        }
+    }
 
-    let default_run = measure(&gold, &root, None);
+    let default_run = measure(&gold, &roots, None);
     assert!(
         !default_run.is_empty(),
         "no task was measured: are the checkouts present?"
@@ -413,7 +468,7 @@ fn test_context_pack_recall() {
         let results = if variant.is_none() {
             None
         } else {
-            Some(measure(&gold, &root, variant))
+            Some(measure(&gold, &roots, variant))
         };
         let results = results.as_ref().unwrap_or(&default_run);
         assert_eq!(
