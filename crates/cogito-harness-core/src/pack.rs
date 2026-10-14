@@ -412,21 +412,173 @@ fn settle(pack: &mut Pack, count: &dyn Fn(&str) -> usize) {
 /// search and adds nothing.
 const STOPWORDS: &[&str] = &[
     // English
-    "the", "and", "for", "with", "how", "does", "what", "where", "when", "which", "this", "that",
-    "from", "into", "over", "are", "was", "were", "been", "being", "its", "use", "used", "using",
-    "get", "gets", "set", "sets", "can", "should", "would", "will", "not", "but", "all", "any",
-    "has", "have", "had", "then", "than", "there", "their", "they", "you", "your", "our", "who",
-    "whom", "whose", "why", "did", "done", "or", "if", "else", "about", "after", "before",
-    "between", "during", "more", "most", "other", "some", "such", "only", "own", "same", "too",
-    "very", "just", "now", "also", "may", "might", "must", "need", "needs", "out", "one", "two",
+    "the",
+    "and",
+    "for",
+    "with",
+    "how",
+    "does",
+    "what",
+    "where",
+    "when",
+    "which",
+    "this",
+    "that",
+    "from",
+    "into",
+    "over",
+    "are",
+    "was",
+    "were",
+    "been",
+    "being",
+    "its",
+    "use",
+    "used",
+    "using",
+    "get",
+    "gets",
+    "set",
+    "sets",
+    "can",
+    "should",
+    "would",
+    "will",
+    "not",
+    "but",
+    "all",
+    "any",
+    "has",
+    "have",
+    "had",
+    "then",
+    "than",
+    "there",
+    "their",
+    "they",
+    "you",
+    "your",
+    "our",
+    "who",
+    "whom",
+    "whose",
+    "why",
+    "did",
+    "done",
+    "or",
+    "if",
+    "else",
+    "about",
+    "after",
+    "before",
+    "between",
+    "during",
+    "more",
+    "most",
+    "other",
+    "some",
+    "such",
+    "only",
+    "own",
+    "same",
+    "too",
+    "very",
+    "just",
+    "now",
+    "also",
+    "may",
+    "might",
+    "must",
+    "need",
+    "needs",
+    "out",
+    "one",
+    "two",
     // Spanish, accented and plain, since terms are not de-accented
-    "que", "qué", "los", "las", "del", "una", "uno", "unas", "unos", "con", "por", "para", "como",
-    "cómo", "cuando", "cuándo", "donde", "dónde", "desde", "hasta", "este", "esta", "estos",
-    "estas", "ese", "esa", "esos", "esas", "son", "ser", "está", "estan", "están", "hay", "muy",
-    "más", "pero", "sino", "sin", "sobre", "entre", "cada", "todo", "toda", "todos", "todas",
-    "otro", "otra", "otros", "otras", "mismo", "misma", "además", "cuál", "cuáles", "quién",
-    "quiénes", "cual", "cuales", "al", "el", "la", "lo", "un", "se", "su", "sus", "le", "les",
-    "mi", "mis", "ni", "ya", "si", "sí", "es", "no",
+    "que",
+    "qué",
+    "los",
+    "las",
+    "del",
+    "una",
+    "uno",
+    "unas",
+    "unos",
+    "con",
+    "por",
+    "para",
+    "como",
+    "cómo",
+    "cuando",
+    "cuándo",
+    "donde",
+    "dónde",
+    "desde",
+    "hasta",
+    "este",
+    "esta",
+    "estos",
+    "estas",
+    "ese",
+    "esa",
+    "esos",
+    "esas",
+    "son",
+    "ser",
+    "está",
+    "estan",
+    "están",
+    "hay",
+    "muy",
+    "más",
+    "pero",
+    "sino",
+    "sin",
+    "sobre",
+    "entre",
+    "cada",
+    "todo",
+    "toda",
+    "todos",
+    "todas",
+    "otro",
+    "otra",
+    "otros",
+    "otras",
+    "mismo",
+    "misma",
+    "además",
+    "cuál",
+    "cuáles",
+    "quién",
+    "quiénes",
+    "cual",
+    "cuales",
+    "al",
+    "el",
+    "la",
+    "lo",
+    "un",
+    "se",
+    "su",
+    "sus",
+    "le",
+    "les",
+    "mi",
+    "mis",
+    "ni",
+    "ya",
+    "si",
+    "sí",
+    "es",
+    "no",
+    // Verbs a task uses to ask about code, not names the code carries.
+    "defined",
+    "implemented",
+    "parsed",
+    "declared",
+    "handled",
+    "computed",
 ];
 
 /// Search terms from a free-text task, sorted and deduplicated so the result
@@ -443,15 +595,52 @@ pub fn task_terms(task: &str) -> Vec<String> {
     terms.into_iter().take(MAX_TERMS).collect()
 }
 
-/// Whether `term` appears in a declaration name.
+/// Whether `term` names a word in a declaration name.
 ///
-/// Separators are dropped on both sides, so `session` matches `requireSession`
-/// and `require_session`, which is how a person describes a name they half
-/// remember.
+/// A name is split into its words (`requireSession`, `require_session`,
+/// `HTTPServer`), and the term matches a word, or a run of consecutive words
+/// read together (`requiresession`). A term that is only a fragment of a word
+/// does not match: `defined` must not match `undefined`.
 fn name_matches(name: &str, term: &str) -> bool {
-    let haystack = squash(name);
     let needle = squash(term);
-    !needle.is_empty() && haystack.contains(&needle)
+    if needle.is_empty() {
+        return false;
+    }
+    let words = name_words(name);
+    (0..words.len()).any(|start| {
+        let mut joined = String::new();
+        words[start..].iter().any(|word| {
+            joined.push_str(word);
+            joined == needle
+        })
+    }) || words.iter().any(|word| word == &needle)
+}
+
+/// The words of an identifier, lowercased: split on separators and on
+/// camelCase and acronym boundaries.
+fn name_words(name: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = name.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if !c.is_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        let starts_word = c.is_uppercase()
+            && !current.is_empty()
+            && (chars[i - 1].is_lowercase() || chars.get(i + 1).is_some_and(|n| n.is_lowercase()));
+        if starts_word {
+            words.push(std::mem::take(&mut current));
+        }
+        current.extend(c.to_lowercase());
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
 }
 
 /// Whether `term` appears in a path.
@@ -720,4 +909,39 @@ fn read_lines(root: &Path, path: &Path) -> Vec<String> {
     };
     let text = String::from_utf8_lossy(&bytes);
     text.lines().map(str::to_string).collect()
+}
+
+#[cfg(test)]
+mod name_match_tests {
+    use super::*;
+
+    #[test]
+    fn test_a_term_matches_whole_words_not_inside_other_words() {
+        // "defined" is a word in a task, not a fragment of "undefined".
+        assert!(!name_matches("undefined", "defined"));
+        assert!(!name_matches("entriesWithUndefined", "defined"));
+        assert!(name_matches("defined", "defined"));
+    }
+
+    #[test]
+    fn test_compound_identifiers_match_their_words_and_joined_form() {
+        assert!(name_matches("requireSession", "session"));
+        assert!(name_matches("require_session", "session"));
+        assert!(name_matches("requireSession", "requiresession"));
+        assert!(name_matches("requireSession", "require"));
+        assert!(name_matches("HTTPServer", "server"));
+        assert!(
+            !name_matches("requireSession", "sess"),
+            "a fragment of a word is not a word"
+        );
+    }
+
+    #[test]
+    fn test_generic_task_verbs_are_not_terms() {
+        let terms = task_terms("where is the SNMP catalog defined and how is it parsed");
+        assert!(terms.contains(&"snmp".to_string()));
+        assert!(terms.contains(&"catalog".to_string()));
+        assert!(!terms.contains(&"defined".to_string()));
+        assert!(!terms.contains(&"parsed".to_string()));
+    }
 }
