@@ -674,31 +674,14 @@ pub const ES_EN_GLOSSARY: &[(&str, &str)] = &[
     ("validación", "validation"),
 ];
 
-/// The English rendering of a Spanish development term, when the glossary has
-/// one. Lookup is exact, against the forms the glossary lists.
-fn glossary_english(term: &str) -> Option<&'static str> {
-    ES_EN_GLOSSARY
-        .iter()
-        .find(|(spanish, _)| *spanish == term)
-        .map(|(_, english)| *english)
-}
-
 /// Search terms from a free-text task, sorted and deduplicated so the result
 /// does not depend on word order.
-///
-/// A Spanish term brings its English equivalent along (see `ES_EN_GLOSSARY`) and
-/// keeps the Spanish one: the translation is additive. The English term is what
-/// an identifier can actually match, so a question asked in Spanish stops
-/// spending its whole weight on words no identifier contains.
 pub fn task_terms(task: &str) -> Vec<String> {
     let mut terms: BTreeSet<String> = BTreeSet::new();
     for raw in task.split(|c: char| !c.is_alphanumeric()) {
         let term = raw.to_lowercase();
         if term.chars().count() < 3 || STOPWORDS.contains(&term.as_str()) {
             continue;
-        }
-        if let Some(english) = glossary_english(&term) {
-            terms.insert(english.to_string());
         }
         terms.insert(term);
     }
