@@ -216,11 +216,22 @@ fn test_mcp_search_finds_new_uncommitted_file() {
         .current_dir(root)
         .output()
         .expect("git add failed");
-    std::process::Command::new("git")
-        .args(["commit", "-m", "initial"])
+    // An explicit identity: a CI runner has none, and a commit that fails
+    // without one leaves no HEAD, which the test would only see much later.
+    let commit = std::process::Command::new("git")
+        .args(["commit", "-q", "-m", "initial"])
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
         .current_dir(root)
         .output()
         .expect("git commit failed");
+    assert!(
+        commit.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
 
     // Now write a new uncommitted file with a unique declaration.
     write(
@@ -279,11 +290,22 @@ fn test_mcp_file_outline_matches_declarations() {
         .current_dir(root)
         .output()
         .expect("git add failed");
-    std::process::Command::new("git")
-        .args(["commit", "-m", "initial"])
+    // An explicit identity: a CI runner has none, and a commit that fails
+    // without one leaves no HEAD, which the test would only see much later.
+    let commit = std::process::Command::new("git")
+        .args(["commit", "-q", "-m", "initial"])
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
         .current_dir(root)
         .output()
         .expect("git commit failed");
+    assert!(
+        commit.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
 
     let path = root.display().to_string();
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
