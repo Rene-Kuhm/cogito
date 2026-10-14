@@ -550,6 +550,34 @@ fn test_code_outranks_a_document_for_the_same_match() {
     );
 }
 
+/// A heading is a fragment of its own section, not of everything under it.
+#[test]
+fn test_a_heading_fragment_is_its_own_section() {
+    let (_tmp, root, cogito, id) = project(&[(
+        "docs/s.md",
+        "# Title\n\nIntro.\n\n## Section\n\nBody one.\n\n### Nested\n\nBody two.\n",
+    )]);
+
+    let built = pack_for(&cogito, &root, id, "section", 2000);
+    let fragment = built
+        .fragments
+        .iter()
+        .find(|f| f.path.to_string_lossy().ends_with("s.md"))
+        .expect("the heading must be a fragment");
+
+    assert_eq!(fragment.name, "Section");
+    assert_eq!(fragment.start, 5);
+    assert_eq!(
+        fragment.end, 8,
+        "a section ends at the line before the next heading of any level"
+    );
+    assert!(
+        !fragment.text.contains("Nested"),
+        "the nested heading belongs to its own section: {:?}",
+        fragment.text
+    );
+}
+
 #[test]
 fn test_a_task_that_asks_for_documentation_does_not_penalise_documents() {
     let (_tmp, root, cogito, id) = doc_and_code_project();

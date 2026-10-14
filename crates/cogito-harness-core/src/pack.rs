@@ -687,6 +687,26 @@ fn is_doc_path(path: &Path) -> bool {
         .is_some_and(crate::map::outline::is_doc)
 }
 
+/// Where a heading's own section ends.
+///
+/// The index stores a heading with its whole subtree, which is what a range
+/// read wants. As a pack fragment that is too coarse: an h1 above every
+/// subsection spends the entire budget on one fragment. A section runs to the
+/// line before the next heading of any level; the last heading keeps the end
+/// the index gave it.
+fn section_end(decls: &[IndexedDeclaration], index: usize) -> usize {
+    let start = decls[index].start;
+    match decls
+        .iter()
+        .skip(index + 1)
+        .map(|d| d.start)
+        .find(|next| *next > start)
+    {
+        Some(next) => next - 1,
+        None => decls[index].end,
+    }
+}
+
 /// Whether the task asks about documentation rather than about code.
 ///
 /// When it does, documents are not penalised, because the document is the
@@ -768,12 +788,18 @@ fn candidates(
     // Symbol hits: the fragment is the declaration that owns the line.
     for ((path, line), acc) in &symbol_hits {
         let decls = outline(&mut outlines, req, path)?;
-        let chosen = decls
-            .iter()
-            .find(|d| d.name == acc.name)
-            .or_else(|| decls.iter().find(|d| d.start <= *line && *line <= d.end));
+        let doc = is_doc_path(path);
+        let chosen = decls.iter().position(|d| d.name == acc.name).or_else(|| {
+            decls
+                .iter()
+                .position(|d| d.start <= *line && *line <= d.end)
+        });
         let (start, end, kind, name) = match chosen {
-            Some(d) => (d.start, d.end, d.kind.clone(), d.name.clone()),
+            Some(i) => {
+                let d = &decls[i];
+                let end = if doc { section_end(decls, i) } else { d.end };
+                (d.start, end, d.kind.clone(), d.name.clone())
+            }
             // Not outlineable: keep the line the index reported.
             None => (*line, *line, "line".to_string(), acc.name.clone()),
         };
@@ -787,7 +813,7 @@ fn candidates(
             detail: acc.detail(),
             terms: acc.terms.len(),
             weight: acc.weight,
-            is_doc: is_doc_path(path),
+            is_doc: doc,
             is_test: acc.is_test,
         });
     }
@@ -816,18 +842,23 @@ fn candidates(
             }
             continue;
         }
-        let mut ranked: Vec<&IndexedDeclaration> = decls.iter().collect();
-        ranked.sort_by(|a, b| {
-            let a_named = terms.iter().any(|t| name_matches(&a.name, t));
-            let b_named = terms.iter().any(|t| name_matches(&b.name, t));
-            b_named.cmp(&a_named).then(a.start.cmp(&b.start))
+        let doc = is_doc_path(path);
+        let mut ranked: Vec<usize> = (0..decls.len()).collect();
+        ranked.sort_by(|&a, &b| {
+            let a_named = terms.iter().any(|t| name_matches(&decls[a].name, t));
+            let b_named = terms.iter().any(|t| name_matches(&decls[b].name, t));
+            b_named
+                .cmp(&a_named)
+                .then(decls[a].start.cmp(&decls[b].start))
         });
-        for d in ranked.iter().take(MAX_DECLS_PER_FILE) {
+        for &i in ranked.iter().take(MAX_DECLS_PER_FILE) {
+            let d = &decls[i];
             let named = terms.iter().any(|t| name_matches(&d.name, t));
+            let end = if doc { section_end(decls, i) } else { d.end };
             found.push(Candidate {
                 path: path.clone(),
                 start: d.start,
-                end: d.end,
+                end,
                 kind: d.kind.clone(),
                 name: d.name.clone(),
                 reason: if named { Reason::Name } else { Reason::Path },
@@ -838,7 +869,7 @@ fn candidates(
                 },
                 terms: acc.terms.len(),
                 weight: acc.weight,
-                is_doc: is_doc_path(path),
+                is_doc: doc,
                 is_test: acc.is_test,
             });
         }
