@@ -25,8 +25,8 @@ Pi extension that wires [Cogito](https://github.com/Rene-Kuhm/cogito-harness) in
    /cogito status          what Cogito sees in this project
    /cogito map             the project map the agent reads
    /cogito scan            regenerate the code fingerprint
-   /cogito query <text>    search tags and architectural decisions
-   /cogito stats           stored tag/decision counts
+   /cogito search <text>   find symbols, files and modules by words
+   /cogito stats           what the index holds
    /cogito doctor          full diagnostics incl. agent integrations
    ```
 
