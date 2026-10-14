@@ -159,15 +159,11 @@ async fn grep_nudge(root: &Path, input: &Value) -> anyhow::Result<Option<(String
         .map(|fp| fp.modules.clone())
         .unwrap_or_default();
 
-    let query_lower = pattern.to_lowercase();
-    let files_first = hits.iter().any(|h| {
-        h.kind != "symbol"
-            && h.path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.to_lowercase() == query_lower)
-                .unwrap_or(false)
-    });
+    // A file named exactly like the query puts the Files section first. The rule
+    // lives in the index, so this and the other two callers cannot drift apart.
+    let files_first = hits
+        .iter()
+        .any(|h| !h.is_symbol && index::is_named_file_match(&h.path.to_string_lossy(), pattern));
 
     let text = map::render_search(&hits, &modules, pattern, files_first);
     let key = format!(

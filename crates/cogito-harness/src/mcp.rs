@@ -304,15 +304,15 @@ impl CogitoServer {
             vec![]
         };
 
-        // Determine files_first: true when a file is named exactly like the query.
-        let query_lower = req.query.to_lowercase();
+        // A file named exactly like the query puts the Files section first. The
+        // rule lives in the index, so this and the other two callers cannot
+        // drift apart again.
         let files_first = hits.iter().any(|h| {
-            h.kind != "symbol"
-                && h.path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.to_lowercase() == query_lower)
-                    .unwrap_or(false)
+            !h.is_symbol
+                && cogito_harness_core::index::is_named_file_match(
+                    &h.path.to_string_lossy(),
+                    &req.query,
+                )
         });
 
         // Module names from the stored fingerprint, not from a new scan.

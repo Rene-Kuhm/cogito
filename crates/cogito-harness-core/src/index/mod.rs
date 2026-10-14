@@ -828,6 +828,10 @@ fn like_scan(
 /// Results are sorted: symbols before files; within each class, non-test paths
 /// before test paths; then by match-tier (exact > prefix > contains > other);
 /// then by path; then by line number.
+///
+/// One exception outranks that order: a file whose own name is the query
+/// (`README` answers `README.md`) is what the caller is looking for, so it is
+/// promoted to the front and therefore survives the limit.
 pub fn search(
     conn: &Connection,
     project_id: Uuid,
@@ -874,8 +878,48 @@ pub fn search(
         a.line.cmp(&b.line)
     });
 
+    // A file whose own name is the query comes first, before the truncate: with
+    // symbols filling every slot, promoting it afterwards would be too late and
+    // the file would be gone. This is the rule `search_paths` applied before the
+    // index took over the query path, kept in one place so the three callers
+    // cannot drift apart again.
+    if let Some(position) = hits
+        .iter()
+        .position(|h| !h.is_symbol && is_named_file_match(&h.path.to_string_lossy(), query))
+    {
+        let named = hits.remove(position);
+        hits.insert(0, named);
+    }
+
     hits.truncate(limit);
     Ok(hits)
+}
+
+/// Whether a file's own name is the query.
+///
+/// `README` answers `README.md`, and `readme.md` answers it too; `read` answers
+/// neither. Whitespace is ignored and the comparison is case-insensitive.
+pub fn is_named_file_match(path: &str, query: &str) -> bool {
+    let wanted: String = query
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    if wanted.is_empty() {
+        return false;
+    }
+    let file = Path::new(path);
+    let stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_lowercase)
+        .unwrap_or_default();
+    let name = file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_lowercase)
+        .unwrap_or_default();
+    wanted == stem || wanted == name
 }
 
 // ---------------------------------------------------------------------------

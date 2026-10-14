@@ -427,3 +427,61 @@ fn test_mcp_context_pack_says_when_nothing_matches() {
         "nothing generic may be returned instead:\n{text}"
     );
 }
+
+/// A workspace whose symbols all mention `readme` while only `README.md` is
+/// named by the query. Their paths deliberately do not contain the word, so the
+/// file phase has a single candidate and the symbol flood has to be what
+/// crowds it out.
+fn named_file_workspace() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"named\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("README.md"), "# Named\n\nA project.\n").unwrap();
+    std::fs::create_dir(root.join("src")).unwrap();
+    for n in 0..20 {
+        std::fs::write(
+            root.join(format!("src/helper_{n}.rs")),
+            format!("pub fn readme_helper_{n}() -> usize {{\n    {n}\n}}\n"),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+/// The end-to-end version of the index rule: `search_code README` must answer
+/// with `README.md` in a Files section, and that section comes before the
+/// symbols.
+#[test]
+fn test_mcp_search_code_puts_a_named_file_first() {
+    let dir = named_file_workspace();
+    let path = dir.path().display().to_string();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"search_code","arguments":{{"path":"{}","query":"README"}}}}}}"#,
+        path
+    );
+
+    let text = tool_text(&send_jsonrpc(vec![init, ready, &call]), 2);
+
+    let files = text
+        .find("Files:")
+        .unwrap_or_else(|| panic!("search_code must answer with a Files section:\n{text}"));
+    let named = text
+        .find("README.md")
+        .unwrap_or_else(|| panic!("README.md must be in the answer:\n{text}"));
+    assert!(
+        files < named,
+        "README.md must be inside the Files section:\n{text}"
+    );
+    if let Some(symbols) = text.find("Symbols:") {
+        assert!(
+            files < symbols,
+            "a named file puts Files before Symbols:\n{text}"
+        );
+    }
+}

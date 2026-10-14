@@ -1013,3 +1013,83 @@ fn test_external_package_stays_unresolved() {
     drop(conn);
     drop(tmp);
 }
+
+/// Test: a file whose own name is the query must survive the symbol flood.
+///
+/// `search` ranks symbols before files and then truncates. When enough symbols
+/// merely mention the word, the file named exactly like the query is pushed out
+/// of the results entirely, which is why `cogito search README` stopped
+/// answering README.md and put doc headings from an archive first instead. A
+/// file whose name is the query is what the caller is looking for, so it has to
+/// be in the list.
+#[test]
+fn test_named_file_survives_the_symbol_flood() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"flood\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("README.md"), "# Flood\n\nA project.\n").unwrap();
+
+    // Enough symbols mentioning the word to fill every slot `search` returns.
+    // Their paths deliberately do not contain it, so only README.md competes in
+    // the file phase and the test isolates the cut.
+    let src = root.join("src");
+    fs::create_dir(&src).unwrap();
+    for n in 0..20 {
+        fs::write(
+            src.join(format!("helper_{n}.rs")),
+            format!("pub fn readme_helper_{n}() -> usize {{\n    {n}\n}}\n"),
+        )
+        .unwrap();
+    }
+
+    let (cogito, project_id) = init_cogito(&root);
+    let conn = cogito.sqlite().unwrap().lock();
+    index::sync(&conn, project_id, &root, false).unwrap();
+
+    let hits = index::search(&conn, project_id, "README", 12).unwrap();
+    let paths: Vec<String> = hits.iter().map(|h| h.path.display().to_string()).collect();
+
+    assert!(
+        paths.iter().any(|p| p == "README.md"),
+        "a file named exactly like the query must be in the results, got {paths:?}"
+    );
+
+    drop(conn);
+    drop(tmp);
+}
+
+/// Test: which file name answers which query.
+#[test]
+fn test_is_named_file_match() {
+    // README answers README.md through the stem, and the full name answers it
+    // too, at any case and with surrounding whitespace.
+    assert!(index::is_named_file_match("README.md", "README"));
+    assert!(index::is_named_file_match("README.md", "readme.md"));
+    assert!(index::is_named_file_match("README.md", "  README  "));
+
+    // A bare prefix of a longer word is not the name.
+    assert!(!index::is_named_file_match("README.md", "read"));
+
+    // A path answers by its last segment, not by its directories.
+    assert!(index::is_named_file_match("docs/guide.md", "guide"));
+    assert!(!index::is_named_file_match("docs/guide.md", "docs"));
+
+    // The stem is everything before the last dot, so a two-part name is one
+    // name and its first part alone does not answer it.
+    assert!(index::is_named_file_match(
+        "auth/session.test.ts",
+        "session.test"
+    ));
+    assert!(!index::is_named_file_match(
+        "auth/session.test.ts",
+        "session"
+    ));
+
+    // An empty query never matches.
+    assert!(!index::is_named_file_match("README.md", ""));
+    assert!(!index::is_named_file_match("README.md", "   "));
+}
