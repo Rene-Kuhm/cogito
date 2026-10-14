@@ -218,16 +218,13 @@ struct Candidate {
 }
 
 impl Candidate {
-    /// How rare the terms this candidate matched are, all factors included.
-    ///
-    /// The match tier is deliberately absent: it is compared on its own, before
-    /// coverage, so rarity only ever breaks a tie between candidates that match
-    /// the same kind of thing equally often.
-    fn rarity(&self, asks_for_docs: bool) -> u64 {
+    /// How strong this candidate's evidence is, every factor included.
+    fn evidence(&self, tiers: TierWeights, asks_for_docs: bool) -> u64 {
+        let base = tiers.of(self.reason).saturating_mul(self.weight);
         if asks_for_docs || !self.is_doc {
-            self.weight.saturating_mul(DOC_PENALTY)
+            base.saturating_mul(DOC_PENALTY)
         } else {
-            self.weight
+            base
         }
     }
 }
@@ -921,24 +918,16 @@ fn candidates(
     // Rank, then drop duplicates keeping the best-ranked occurrence. The last
     // comparisons make the order total, so the result never depends on hash
     // iteration order.
-    //
-    // Coverage comes before rarity on purpose. Ordering by summed rarity alone
-    // lets a single rare word outrank a candidate that answers two words of the
-    // question, which is how a Spanish question about English code loses: its
-    // rarest terms are exactly the ones that reach nothing.
     found.sort_by(|a, b| {
-        tiers
-            .of(b.reason)
-            .cmp(&tiers.of(a.reason))
+        b.evidence(tiers, asks_for_docs)
+            .cmp(&a.evidence(tiers, asks_for_docs))
             .then(b.terms.cmp(&a.terms))
-            .then(b.rarity(asks_for_docs).cmp(&a.rarity(asks_for_docs)))
             .then(a.is_test.cmp(&b.is_test))
             .then(changes_of(changes, b).cmp(&changes_of(changes, a)))
             .then(a.path.cmp(&b.path))
             .then(a.start.cmp(&b.start))
             .then(a.name.cmp(&b.name))
     });
-
     let mut seen: BTreeSet<(PathBuf, usize, usize)> = BTreeSet::new();
     found.retain(|c| seen.insert((c.path.clone(), c.start, c.end)));
     Ok(found)

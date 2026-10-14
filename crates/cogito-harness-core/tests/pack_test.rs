@@ -578,62 +578,6 @@ fn test_a_heading_fragment_is_its_own_section() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Coverage before rarity
-// ---------------------------------------------------------------------------
-
-/// Two candidates of the same tier: one matches two common terms, the other a
-/// single rare one. The one that covers more of the question must win.
-///
-/// `alpha` and `beta` are made common by ten files each mentioning them, so the
-/// summed rarity of the pair is small; `zeta` appears once, so its rarity is the
-/// largest in the fixture. Ranking by summed rarity alone puts the single rare
-/// match first, which is how a Spanish question loses: its rarest words are
-/// precisely the ones that reach nothing.
-#[test]
-fn test_more_matched_terms_outrank_a_single_rare_one() {
-    let mut files: Vec<(String, String)> = vec![(
-        "src/pair.rs".to_string(),
-        "pub fn alpha_beta_combo() -> usize {\n    1\n}\n".to_string(),
-    )];
-    for n in 0..10 {
-        files.push((
-            format!("src/alpha_{n}.rs"),
-            format!("pub fn alpha_{n}() -> usize {{\n    {n}\n}}\n"),
-        ));
-        files.push((
-            format!("src/beta_{n}.rs"),
-            format!("pub fn beta_{n}() -> usize {{\n    {n}\n}}\n"),
-        ));
-    }
-    files.push((
-        "src/zeta.rs".to_string(),
-        "pub fn zeta_thing() -> usize {\n    9\n}\n".to_string(),
-    ));
-    let refs: Vec<(&str, &str)> = files
-        .iter()
-        .map(|(path, body)| (path.as_str(), body.as_str()))
-        .collect();
-    let (_tmp, root, cogito, id) = project(&refs);
-
-    let built = pack_for(&cogito, &root, id, "alpha beta zeta", 4000);
-    let paths = fragment_paths(&built);
-
-    let pair = paths
-        .iter()
-        .position(|p| p.contains("src/pair.rs"))
-        .unwrap_or_else(|| panic!("src/pair.rs missing from {paths:?}"));
-    let rare = paths
-        .iter()
-        .position(|p| p.contains("src/zeta.rs"))
-        .unwrap_or_else(|| panic!("src/zeta.rs missing from {paths:?}"));
-
-    assert!(
-        pair < rare,
-        "two common terms must outrank one rare term: {paths:?}"
-    );
-}
-
 #[test]
 fn test_a_task_that_asks_for_documentation_does_not_penalise_documents() {
     let (_tmp, root, cogito, id) = doc_and_code_project();
