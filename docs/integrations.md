@@ -181,9 +181,11 @@ printf '<cogito_project>\n%s\n</cogito_project>\n' "$card"
   - Fires `cogito scan --quiet` on `session.created` and `session.start`.
   - Injects the project card via `experimental.chat.system.transform` (once per
     session).
-  - Intercepts the first whole-file `Read` and plain-name `Grep` calls via
-    `tool.execute.before` and returns Cogito's outline or search result instead.
-    The same call on retry passes through.
+  - Intercepts whole-file `Read` and plain-name `Grep` calls via
+    `tool.execute.before`: it hands the call to `cogito guard` and throws the
+    reason the guard returns, so opencode, Pi and Claude Code share one
+    decision rule. A failed, missing, or unparseable guardrail answer lets the
+    call through.
 
 `setup` also installs the Cogito block into `AGENTS.md` at the project root.
 opencode reads every `AGENTS.md` from the workspace root toward home.
