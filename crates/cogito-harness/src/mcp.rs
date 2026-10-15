@@ -34,7 +34,9 @@ session); search_code to find a symbol, file or module by name (it gives file:li
 file_outline to see a file's declarations with line ranges; then read only the lines you need. \
 related_files shows what a file imports and what imports it. Before committing a change, impact \
 reads the diff (uncommitted, or base..HEAD) and names the declarations the hunks touch, the files \
-that import the changed files and the files that declare those symbol names, with a risk level from \
+that import the changed files and the files that use the names those declarations introduce, \
+resolved through the index's import edges for TypeScript and Rust (any other language answers \
+not supported), with a risk level from \
 the importer count. Avoid listing directories, \
 grepping or reading whole files to find your way. The index refreshes when HEAD changes; pass \
 refresh=true to project_map after large uncommitted changes. Every tool takes `path`, the \
@@ -344,7 +346,7 @@ impl CogitoServer {
     }
 
     #[tool(
-        description = "What a diff reaches: the declarations its hunks touch, the files that import the changed files and the files that declare those symbol names, plus a risk level taken only from how many files import the change. Overapproximate by design (import graph and declaration names, no calls). Without `base` it reads the uncommitted changes; with `base`, `base..HEAD`."
+        description = "What a diff reaches: the declarations its hunks touch, the files that import the changed files, and the files that use the names those declarations introduce (resolved through the index's import edges for TypeScript and Rust; any other language answers not supported). Plus a risk level taken only from how many files import the change. Overapproximate by design (import graph and identifier names, no calls or type resolution). Without `base` it reads the uncommitted changes; with `base`, `base..HEAD`."
     )]
     async fn impact(&self, Parameters(req): Parameters<ImpactRequest>) -> Result<String, String> {
         let (cogito, project, _stored) = indexed_project(&req.path)?;
