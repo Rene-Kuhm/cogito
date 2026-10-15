@@ -4,14 +4,21 @@
 //! with the call as JSON on stdin. The first time Claude reads a large file
 //! whole, or greps for a plain name, the call is blocked (exit 2) and the
 //! message on stderr, which Claude Code hands to the model, carries Cogito's
-//! outline or search result instead. Repeating the exact same call goes
-//! through: the agent is shown the cheap answer first, never stuck.
+//! outline or search result instead. Repeating that call goes through: the
+//! agent is shown the cheap answer first, never stuck.
+//!
+//! A whole-file read that was already delivered in full is not delivered again
+//! while the file is unchanged. The model gets the outline and the reason
+//! instead, up to `MAX_UNCHANGED_BLOCKS` times, and then the read goes through.
+//! A file that changed since it was delivered is read in full again, because
+//! the text the model holds is no longer true.
 //!
 //! Every failure path allows the call. A guardrail that errors must not cost
 //! the user a tool call.
 
 use cogito_harness_core::{Cogito, index, map};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +26,9 @@ use std::path::{Path, PathBuf};
 const OUTLINE_MIN_LINES: usize = 250;
 /// A `Read` with a limit above this still counts as reading the whole file.
 const WHOLE_READ_LIMIT: u64 = 400;
+/// How many times an unchanged, already delivered file is turned away before a
+/// full read goes through. The model is never stuck.
+const MAX_UNCHANGED_BLOCKS: u32 = 2;
 
 /// Read the hook input from stdin, decide, and exit: 0 to allow, 2 to block.
 pub async fn run() -> ! {
@@ -48,11 +58,10 @@ pub async fn decide(event: &Value) -> anyhow::Result<Option<String>> {
     let input = &event["tool_input"];
     let session = event["session_id"].as_str().unwrap_or("default");
 
+    if tool == "Read" {
+        return read_guard(&root, session, input).await;
+    }
     let (key, message) = match tool {
-        "Read" => match read_nudge(&root, input).await? {
-            Some(found) => found,
-            None => return Ok(None),
-        },
         "Grep" => match grep_nudge(&root, input).await? {
             Some(found) => found,
             None => return Ok(None),
@@ -67,6 +76,61 @@ pub async fn decide(event: &Value) -> anyhow::Result<Option<String>> {
     Ok(Some(message))
 }
 
+/// The agent-neutral entry point behind `cogito guard`. Reads one call from
+/// stdin as `{"tool": "read" | "grep", "input": {...}, "cwd": "...", "session": "..."}`
+/// and prints `{"block": bool, "reason": "..."}`. It always exits 0: a guard
+/// that fails must never cost the agent a tool call.
+pub async fn run_guard() -> ! {
+    let mut input = String::new();
+    let reason = match std::io::stdin().read_to_string(&mut input) {
+        Ok(_) => match serde_json::from_str::<Value>(&input) {
+            Ok(call) => guard_decision(&call).await.ok().flatten(),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    let answer = match reason {
+        Some(reason) => serde_json::json!({ "block": true, "reason": reason }),
+        None => serde_json::json!({ "block": false }),
+    };
+    println!("{answer}");
+    std::process::exit(0)
+}
+
+/// Map an agent-neutral call onto the Claude Code event `decide` reads.
+async fn guard_decision(call: &Value) -> anyhow::Result<Option<String>> {
+    let cwd = call["cwd"].as_str().unwrap_or_default();
+    let session = call["session"].as_str().unwrap_or("default");
+    let input = &call["input"];
+    let event = match call["tool"].as_str().unwrap_or_default() {
+        "read" => {
+            let Some(path) = input["path"].as_str().or(input["file_path"].as_str()) else {
+                return Ok(None);
+            };
+            // Relative paths are relative to the project, as the agent meant them.
+            let file = Path::new(cwd).join(path);
+            serde_json::json!({
+                "tool_name": "Read",
+                "session_id": session,
+                "cwd": cwd,
+                "tool_input": {
+                    "file_path": file.display().to_string(),
+                    "offset": input["offset"],
+                    "limit": input["limit"],
+                },
+            })
+        }
+        "grep" => serde_json::json!({
+            "tool_name": "Grep",
+            "session_id": session,
+            "cwd": cwd,
+            "tool_input": input,
+        }),
+        _ => return Ok(None),
+    };
+    decide(&event).await
+}
+
 /// The project the session runs in, if it looks like one.
 fn project_root(event: &Value) -> Option<PathBuf> {
     let dir = std::env::var_os("CLAUDE_PROJECT_DIR")
@@ -75,7 +139,8 @@ fn project_root(event: &Value) -> Option<PathBuf> {
     (dir.join(".git").exists() || dir.join(".cogito").is_dir()).then_some(dir)
 }
 
-async fn read_nudge(root: &Path, input: &Value) -> anyhow::Result<Option<(String, String)>> {
+/// What a whole-file `Read` gets: the message to block with, or `None` to let it run.
+async fn read_guard(root: &Path, session: &str, input: &Value) -> anyhow::Result<Option<String>> {
     let whole = input["offset"].is_null()
         && input["limit"]
             .as_u64()
@@ -99,12 +164,46 @@ async fn read_nudge(root: &Path, input: &Value) -> anyhow::Result<Option<(String
         return Ok(None);
     }
 
+    let key = rel.display().to_string();
+    let hash = fnv1a(content.as_bytes());
+    let mut state = ReadState::load(root, session);
+    let verdict = decide_read(state.0.entry(key).or_default(), hash);
+    state.save(root, session)?;
+
+    match verdict {
+        ReadVerdict::Allow => Ok(None),
+        ReadVerdict::Outline => {
+            let outline = outline_for(root, &rel).await?;
+            Ok(Some(format!(
+                "{} has {lines} lines. Cogito's outline instead of the whole file:\n\n{}\n\
+                 Read the range you need with offset/limit. Reading the whole file again is allowed \
+                 if you really need it.",
+                rel.display(),
+                outline.trim_end()
+            )))
+        }
+        ReadVerdict::Unchanged => {
+            let outline = outline_for(root, &rel).await?;
+            Ok(Some(format!(
+                "{} has not changed since its full text was read in this session ({lines} lines). \
+                 Cogito's outline instead:\n\n{}\n\
+                 Read the range you need with offset/limit. A repeated full read is blocked \
+                 {MAX_UNCHANGED_BLOCKS} times, then allowed.",
+                rel.display(),
+                outline.trim_end()
+            )))
+        }
+    }
+}
+
+/// The declaration outline of one project file, from the index when it has one.
+async fn outline_for(root: &Path, rel: &Path) -> anyhow::Result<String> {
     let (cogito, project) = open(root)?;
     let (fingerprint, _) = cogito.fingerprint(&project, false).await?;
 
     // Try the index first.
     let decls = if let Some(conn) = cogito.connection() {
-        index::outline(&conn, project.id, &rel)
+        index::outline(&conn, project.id, rel)
             .map(|ds| ds.into_iter().map(Into::into).collect::<Vec<_>>())
             .unwrap_or_default()
     } else {
@@ -112,22 +211,127 @@ async fn read_nudge(root: &Path, input: &Value) -> anyhow::Result<Option<(String
     };
 
     let decls = if decls.is_empty() {
-        let content = std::fs::read_to_string(root.join(&rel)).unwrap_or_default();
+        let content = std::fs::read_to_string(root.join(rel)).unwrap_or_default();
         let ext = rel.extension().and_then(|e| e.to_str()).unwrap_or("");
         map::outline::declarations(&content, ext)
     } else {
         decls
     };
 
-    let outline = map::render_outline(root, Some(&fingerprint), &rel, &decls, 0);
-    let message = format!(
-        "{} has {lines} lines. Cogito's outline instead of the whole file:\n\n{}\n\
-         Read the range you need with offset/limit. Reading the whole file again is allowed \
-         if you really need it.",
-        rel.display(),
-        outline.trim_end()
-    );
-    Ok(Some((format!("read:{}", rel.display()), message)))
+    Ok(map::render_outline(
+        root,
+        Some(&fingerprint),
+        rel,
+        &decls,
+        0,
+    ))
+}
+
+/// What the guard answers for one whole-file read.
+#[derive(Debug, PartialEq)]
+enum ReadVerdict {
+    /// First sight of this content: show the outline, deliver nothing yet.
+    Outline,
+    /// Already delivered unchanged: show the outline and the reason.
+    Unchanged,
+    /// Let the full read through.
+    Allow,
+}
+
+/// Per-file state for one session. `outline` is the hash of the content whose
+/// outline was shown, `delivered` the hash of the content given in full, and
+/// `blocks` how often an unchanged, delivered file was turned away since.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct ReadEntry {
+    outline: Option<u64>,
+    delivered: Option<u64>,
+    blocks: u32,
+}
+
+/// Decide one whole-file read against the entry for that file.
+fn decide_read(entry: &mut ReadEntry, hash: u64) -> ReadVerdict {
+    if entry.delivered == Some(hash) {
+        if entry.blocks >= MAX_UNCHANGED_BLOCKS {
+            return ReadVerdict::Allow;
+        }
+        entry.blocks += 1;
+        return ReadVerdict::Unchanged;
+    }
+    // Changed since it was delivered: the old text is stale, so read it in full.
+    // The same holds when the outline was already shown for this content.
+    if entry.delivered.is_some() || entry.outline == Some(hash) {
+        entry.delivered = Some(hash);
+        entry.blocks = 0;
+        return ReadVerdict::Allow;
+    }
+    entry.outline = Some(hash);
+    ReadVerdict::Outline
+}
+
+/// The read state of one session, one line per file: `path`, outline hash,
+/// delivered hash, blocks. A missing hash is written as `-`.
+#[derive(Debug, Default)]
+struct ReadState(BTreeMap<String, ReadEntry>);
+
+impl ReadState {
+    fn load(root: &Path, session: &str) -> Self {
+        let text =
+            std::fs::read_to_string(session_file(root, session, "reads")).unwrap_or_default();
+        let entries = text
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split('\t');
+                let path = parts.next()?;
+                // A hash is hex, or `-` when there is none.
+                let hash = |s: Option<&str>| {
+                    s.filter(|hex| *hex != "-")
+                        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                };
+                let outline = hash(parts.next());
+                let delivered = hash(parts.next());
+                let blocks = parts.next()?.parse().ok()?;
+                Some((
+                    path.to_string(),
+                    ReadEntry {
+                        outline,
+                        delivered,
+                        blocks,
+                    },
+                ))
+            })
+            .collect();
+        Self(entries)
+    }
+
+    fn save(&self, root: &Path, session: &str) -> anyhow::Result<()> {
+        let fmt = |h: Option<u64>| h.map_or("-".to_string(), |h| format!("{h:016x}"));
+        let text: String = self
+            .0
+            .iter()
+            .map(|(path, e)| {
+                format!(
+                    "{path}\t{}\t{}\t{}\n",
+                    fmt(e.outline),
+                    fmt(e.delivered),
+                    e.blocks
+                )
+            })
+            .collect();
+        let file = session_file(root, session, "reads");
+        std::fs::create_dir_all(file.parent().unwrap_or(root))?;
+        std::fs::write(file, text)?;
+        Ok(())
+    }
+}
+
+/// 64-bit FNV-1a: stable across runs, so a stored hash still means the same bytes.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
 }
 
 async fn grep_nudge(root: &Path, input: &Value) -> anyhow::Result<Option<(String, String)>> {
@@ -196,16 +400,22 @@ fn open(root: &Path) -> anyhow::Result<(Cogito, cogito_harness_core::Project)> {
     Ok((cogito, project))
 }
 
-/// Record `key` for this session; `false` if it was already recorded.
-fn first_time(root: &Path, session: &str, key: &str) -> anyhow::Result<bool> {
+/// The state file for one session under `.cogito/nudges/`.
+fn session_file(root: &Path, session: &str, extension: &str) -> PathBuf {
     let safe: String = session
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
         .take(64)
         .collect();
-    let dir = root.join(".cogito/nudges");
-    std::fs::create_dir_all(&dir)?;
-    let file = dir.join(if safe.is_empty() { "default" } else { &safe });
+    let name = if safe.is_empty() { "default" } else { &safe };
+    root.join(".cogito/nudges")
+        .join(format!("{name}.{extension}"))
+}
+
+/// Record `key` for this session; `false` if it was already recorded.
+fn first_time(root: &Path, session: &str, key: &str) -> anyhow::Result<bool> {
+    let file = session_file(root, session, "seen");
+    std::fs::create_dir_all(file.parent().unwrap_or(root))?;
     let seen = std::fs::read_to_string(&file).unwrap_or_default();
     if seen.lines().any(|line| line == key) {
         return Ok(false);
@@ -240,5 +450,125 @@ mod tests {
         assert!(!first_time(dir.path(), "s1", "read:a.ts").unwrap());
         assert!(first_time(dir.path(), "s1", "read:b.ts").unwrap());
         assert!(first_time(dir.path(), "s2", "read:a.ts").unwrap());
+    }
+
+    #[test]
+    fn test_first_read_shows_outline_then_the_full_text_then_turns_repeats_away() {
+        let mut entry = ReadEntry::default();
+        let h = fnv1a(b"v1");
+        assert_eq!(decide_read(&mut entry, h), ReadVerdict::Outline);
+        assert_eq!(decide_read(&mut entry, h), ReadVerdict::Allow);
+        assert_eq!(decide_read(&mut entry, h), ReadVerdict::Unchanged);
+    }
+
+    #[test]
+    fn test_unchanged_delivered_file_is_turned_away_twice_then_allowed() {
+        let mut entry = ReadEntry::default();
+        let h = fnv1a(b"v1");
+        decide_read(&mut entry, h); // outline
+        assert_eq!(decide_read(&mut entry, h), ReadVerdict::Allow); // full text delivered
+        assert_eq!(decide_read(&mut entry, h), ReadVerdict::Unchanged);
+        assert_eq!(decide_read(&mut entry, h), ReadVerdict::Unchanged);
+        assert_eq!(decide_read(&mut entry, h), ReadVerdict::Allow);
+    }
+
+    #[test]
+    fn test_changed_file_is_read_in_full_again() {
+        let mut entry = ReadEntry::default();
+        let v1 = fnv1a(b"v1");
+        let v2 = fnv1a(b"v2");
+        decide_read(&mut entry, v1);
+        decide_read(&mut entry, v1); // delivered v1
+        assert_eq!(decide_read(&mut entry, v2), ReadVerdict::Allow);
+        assert_eq!(decide_read(&mut entry, v2), ReadVerdict::Unchanged);
+    }
+
+    #[test]
+    fn test_read_state_round_trips_through_the_session_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut state = ReadState::default();
+        state.0.insert(
+            "src/a.rs".into(),
+            ReadEntry {
+                outline: Some(fnv1a(b"x")),
+                delivered: None,
+                blocks: 0,
+            },
+        );
+        state.0.insert(
+            "src/b.rs".into(),
+            ReadEntry {
+                outline: Some(fnv1a(b"y")),
+                delivered: Some(fnv1a(b"y")),
+                blocks: 2,
+            },
+        );
+        state.save(dir.path(), "s1").unwrap();
+        let loaded = ReadState::load(dir.path(), "s1");
+        assert_eq!(loaded.0, state.0);
+        assert!(ReadState::load(dir.path(), "other").0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_guard_resolves_relative_paths_and_turns_repeats_away() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@t")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@t")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        let body: String = (0..300)
+            .map(|i| format!("export function fn{i}(x: number) {{ return x + {i}; }}\n"))
+            .collect();
+        std::fs::write(root.join("big.ts"), body).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let call = |tool: &str, input: Value| {
+            serde_json::json!({
+                "tool": tool,
+                "session": "guard-test",
+                "cwd": root.display().to_string(),
+                "input": input,
+            })
+        };
+        let read = call("read", serde_json::json!({ "path": "big.ts" }));
+        assert!(
+            guard_decision(&read).await.unwrap().is_some(),
+            "outline first"
+        );
+        assert!(
+            guard_decision(&read).await.unwrap().is_none(),
+            "full text delivered"
+        );
+        assert!(
+            guard_decision(&read).await.unwrap().is_some(),
+            "unchanged repeat"
+        );
+
+        let ranged = call(
+            "read",
+            serde_json::json!({ "path": "big.ts", "offset": 10, "limit": 20 }),
+        );
+        assert!(
+            guard_decision(&ranged).await.unwrap().is_none(),
+            "ranges pass"
+        );
+        let other = call("bash", serde_json::json!({ "command": "ls" }));
+        assert!(
+            guard_decision(&other).await.unwrap().is_none(),
+            "other tools pass"
+        );
     }
 }

@@ -345,7 +345,9 @@ const CLAUDE_GUARD_SCRIPT: &str = r#"#!/bin/sh
 #
 # The first time Claude reads a large file whole, or greps for a plain name,
 # it gets Cogito's outline or search result instead (exit 2, message on
-# stderr). Repeating the exact same call goes through. Any problem exits 0, so
+# stderr). Repeating the exact same Grep goes through. A whole read of a file that
+# has not changed since it was read in full gets the outline again, twice, then
+# goes through. Any problem exits 0, so
 # a tool call is never blocked by accident.
 
 command -v cogito >/dev/null 2>&1 || exit 0
@@ -2488,24 +2490,41 @@ mod tests {
             plugin.contains("tool.execute.before"),
             "plugin must have guardrail hook"
         );
-        assert!(plugin.contains("cogito outline") || plugin.contains("outline"));
+        assert!(
+            plugin.contains("cogito guard"),
+            "the read guardrail must be delegated to `cogito guard`: {plugin}"
+        );
+        assert!(
+            !plugin.contains("cogito outline"),
+            "the plugin must not keep its own outline path: {plugin}"
+        );
     }
 
     #[test]
     fn test_opencode_plugin_has_grep_guardrail() {
         let plugin = OPENCODE_PLUGIN;
-        assert!(plugin.contains("cogito search") || plugin.contains("search"));
-        // Should check for plain name patterns
-        assert!(plugin.contains("isPlainName") || plugin.contains("is_plain_name"));
+        assert!(
+            plugin.contains("cogito guard"),
+            "the grep guardrail must be delegated to `cogito guard`: {plugin}"
+        );
+        // The plain-name rule lives in the guard, not here.
+        assert!(
+            !plugin.contains("isPlainName") && !plugin.contains("is_plain_name"),
+            "the plugin must not keep its own plain-name rule: {plugin}"
+        );
     }
 
     #[test]
-    fn test_opencode_plugin_repeat_passes_through() {
+    fn test_opencode_plugin_delegates_repeat_rule_to_guard() {
         let plugin = OPENCODE_PLUGIN;
-        // Should have per-session bookkeeping for "already nudged"
+        // The "already nudged" bookkeeping lives in the guard now.
         assert!(
-            plugin.contains("firstTime") || plugin.contains("first_time"),
-            "plugin must track already-nudged state per session"
+            !plugin.contains("firstTime") && !plugin.contains("first_time"),
+            "plugin must not track already-nudged state itself: {plugin}"
+        );
+        assert!(
+            plugin.contains("cogito guard"),
+            "plugin must ask `cogito guard` whether the call repeats: {plugin}"
         );
     }
 

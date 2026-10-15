@@ -55,6 +55,9 @@ Two halves, both written by setup:
 1. **`npm:cogito-harness`** in `settings.json` — a Pi package. On
    `session_start` it scans the project in the background and sets a status
    line, and it adds `/cogito` with `status`, `map`, `scan`, `stats` and `doctor`.
+   It also guards whole-file reads and plain-name greps: it hands the call to
+   `cogito guard` and returns the block the guard answers with, so Pi and
+   Claude Code share one decision rule.
 
    ```
    /cogito status
@@ -97,7 +100,9 @@ Four files:
   `Grep`. The first time Claude reads a file of 250+ lines whole, the call is
   blocked and Claude gets the file's outline instead; the first time it greps
   for a plain name, it gets Cogito's search result. Repeating the exact same
-  call runs normally, ranged reads and regex greps are never touched, and any
+  Grep runs normally. A whole read of a file that has not changed since its
+  full text was delivered gets the outline again, twice, then runs; a changed
+  file is read in full. Ranged reads and regex greps are never touched, and any
   error lets the call through. The decision logic is in `cogito hook
   claude-pre-tool-use`; the script only hands it Claude Code's JSON.
 - `~/.claude/settings.json` gets a `SessionStart` entry for the card and a
@@ -179,9 +184,11 @@ printf '<cogito_project>\n%s\n</cogito_project>\n' "$card"
   - Fires `cogito scan --quiet` on `session.created` and `session.start`.
   - Injects the project card via `experimental.chat.system.transform` (once per
     session).
-  - Intercepts the first whole-file `Read` and plain-name `Grep` calls via
-    `tool.execute.before` and returns Cogito's outline or search result instead.
-    The same call on retry passes through.
+  - Intercepts whole-file `Read` and plain-name `Grep` calls via
+    `tool.execute.before`: it hands the call to `cogito guard` and throws the
+    reason the guard returns, so opencode, Pi and Claude Code share one
+    decision rule. A failed, missing, or unparseable guardrail answer lets the
+    call through.
 
 `setup` also installs the Cogito block into `AGENTS.md` at the project root.
 opencode reads every `AGENTS.md` from the workspace root toward home.
@@ -273,7 +280,7 @@ Telescope over `cogito map --json`, or an MCP client such as
 
 | Editor / Agent | MCP | Session-start card | Read/grep guardrail | `AGENTS.md` block |
 |---|---|---|---|---|
-| Gentle Shell (pi) | ✅ direct | ✅ | — | — |
+| Gentle Shell (pi) | ✅ direct | ✅ | ✅ | — |
 | Claude Code | ✅ | ✅ | ✅ | — |
 | opencode | ✅ | ✅ | ✅ | ✅ |
 | Codex | ✅ | — | — | ✅ |
