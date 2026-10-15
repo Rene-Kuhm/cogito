@@ -148,6 +148,23 @@ enum Commands {
         /// Maximum matched files to read per term (default 5).
         #[arg(short, long, default_value = "5")]
         limit: usize,
+        /// Print the three-section measurement report: quality (recall@budget),
+        /// latency and cost, each on its own and never combined into a score.
+        /// Off by default, so the output without it is unchanged.
+        #[arg(long)]
+        report: bool,
+        /// Root that holds one <timestamp>/ artifact per run. Defaults to
+        /// ~/.cache/cogito/bench-runs, outside any measured worktree.
+        #[arg(long)]
+        out_dir: Option<String>,
+        /// Repeat the measurement N times. Every repetition is kept in the
+        /// run artifact; quality and cost are deterministic, latency is not.
+        #[arg(long, default_value = "1")]
+        repeat: usize,
+        /// Labelled gold set used for recall@budget. Defaults to
+        /// benchmarks/context_pack_gold.json next to the manifest.
+        #[arg(long)]
+        gold: Option<String>,
     },
 }
 
@@ -221,8 +238,28 @@ async fn main() -> Result<()> {
         Some(Commands::Outline { file }) => commands::outline(&file).await?,
         Some(Commands::Search { query }) => commands::search(&query).await?,
         Some(Commands::Doctor) => commands::doctor().await?,
-        Some(Commands::Bench { repo, terms, limit }) => {
-            commands::bench(repo.map(PathBuf::from), terms, args.json, limit).await?;
+        Some(Commands::Bench {
+            repo,
+            terms,
+            limit,
+            report,
+            out_dir,
+            repeat,
+            gold,
+        }) => {
+            commands::bench(
+                commands::bench::BenchOptions {
+                    repo: repo.map(PathBuf::from),
+                    terms,
+                    limit,
+                    report,
+                    out_dir: out_dir.map(PathBuf::from),
+                    repeat,
+                    gold: gold.map(PathBuf::from),
+                },
+                args.json,
+            )
+            .await?;
         }
         None => {
             // No subcommand, show help

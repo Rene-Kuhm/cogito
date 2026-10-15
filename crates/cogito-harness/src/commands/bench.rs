@@ -15,13 +15,15 @@
 
 use crate::tokenizer::TokenCounter;
 use anyhow::{Context, Result};
-use cogito_harness_core::{Cogito, Fingerprint, Project, index::SearchHit, map};
+use chrono::Utc;
+use cogito_harness_core::{Cogito, Fingerprint, Project, index::SearchHit, map, pack};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 /// One search term's benchmark result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -75,6 +77,255 @@ pub struct BenchmarkResult {
     pub total_elapsed_seconds: f64,
     /// Tokeniser that was actually used.
     pub tokenizer: String,
+    /// Quality, latency and cost, kept apart. Always measured, printed only by
+    /// `--report`; `render_json` never serialises it, so the old JSON output is
+    /// byte-identical with the flag off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<Report>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Report: quality, latency and cost, reported separately
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Provenance of one measured worktree.
+///
+/// A measurement without the revision it ran on and whether that revision had
+/// uncommitted work cannot be reproduced, so both are recorded per repository.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MeasuredRepo {
+    pub name: String,
+    pub path: String,
+    /// Exact commit SHA that was measured, or `unknown` outside a repository.
+    pub commit: String,
+    /// False when the path is not a git working tree.
+    pub is_git: bool,
+    /// True only when `git status --porcelain --untracked-files=all` was empty.
+    /// A path where git could not be read is never claimed clean.
+    pub clean: bool,
+    /// Modified, staged and untracked paths that git reported.
+    pub dirty_paths: usize,
+    /// Time to bring the index up to date before querying, in milliseconds.
+    pub index_sync_ms: f64,
+}
+
+impl MeasuredRepo {
+    /// How the worktree state reads in the report.
+    fn state(&self) -> &'static str {
+        if !self.is_git {
+            "no-git"
+        } else if self.clean {
+            "clean"
+        } else {
+            "dirty"
+        }
+    }
+}
+
+/// One row of the report, for one task or one search term.
+///
+/// Quality, latency and cost live in separate fields. Nothing here multiplies
+/// or adds them into a single score, because a fast wrong answer and a slow
+/// right one are not the same thing and one number would hide that.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Measurement {
+    pub label: String,
+    /// `task` for a labelled gold-set task, `term` for a search term.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<usize>,
+    /// quality: expected entries the pack returned, over the expected total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_hits: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_expected: Option<usize>,
+    /// latency: the query this row measured, in milliseconds.
+    pub query_ms: f64,
+    /// cost: tokens the pack actually used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_tokens: Option<usize>,
+    /// cost: tool calls the Cogito strategy needs for this row.
+    pub tool_calls: usize,
+    /// cost: tool calls plain exploration needs for the same row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_tool_calls: Option<usize>,
+}
+
+/// The measurement report: three classes, three sections, never one score.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Report {
+    /// How many times the measurement was repeated.
+    pub repetitions: usize,
+    /// Every worktree that was measured, with its SHA and clean state.
+    pub repos: Vec<MeasuredRepo>,
+    /// Every task and term that was measured.
+    pub measurements: Vec<Measurement>,
+    /// The labelled gold set the quality column was read from, when there was
+    /// one. `None` means no recall could be measured, never that it was zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gold_path: Option<String>,
+    /// Why the quality column is empty, when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_note: Option<String>,
+}
+
+impl Report {
+    fn new(repetitions: usize) -> Self {
+        Self {
+            repetitions: repetitions.max(1),
+            repos: Vec::new(),
+            measurements: Vec::new(),
+            gold_path: None,
+            quality_note: None,
+        }
+    }
+
+    /// Render the three classes as three separate sections.
+    ///
+    /// `artifacts` is the run directory, printed so the numbers can be traced
+    /// back to the raw file that produced them.
+    pub fn render(&self, tokenizer: &str, artifacts: Option<&Path>) -> String {
+        let mut out = String::new();
+        out.push_str("cogito bench report\n");
+        out.push_str(&format!(
+            "repetitions: {}   tokenizer: {}\n",
+            self.repetitions, tokenizer
+        ));
+        if let Some(dir) = artifacts {
+            out.push_str(&format!("artifacts:   {}\n", dir.display()));
+        }
+
+        // Provenance
+        out.push_str("\nPROVENANCE — the measured worktree\n");
+        out.push_str(&format!(
+            "{:<20} {:<14} {:<8} {:>7}  {:>13}\n",
+            "repo", "commit", "worktree", "dirty", "index_sync_ms"
+        ));
+        for repo in &self.repos {
+            out.push_str(&format!(
+                "{:<20} {:<14} {:<8} {:>7}  {:>13.1}\n",
+                repo.name,
+                short_commit(&repo.commit),
+                repo.state(),
+                repo.dirty_paths,
+                repo.index_sync_ms
+            ));
+        }
+
+        // Quality
+        out.push_str("\nQUALITY — recall@budget (higher is better)\n");
+        let tasks: Vec<&Measurement> = self
+            .measurements
+            .iter()
+            .filter(|m| m.recall_pct.is_some())
+            .collect();
+        if tasks.is_empty() {
+            out.push_str(&format!(
+                "n/a — {}\n",
+                self.quality_note
+                    .as_deref()
+                    .unwrap_or("no labelled gold set")
+            ));
+        } else {
+            out.push_str(&format!(
+                "{:<10} {:<5} {:>7} {:>5} {:>9} {:>8}\n",
+                "task", "lang", "budget", "hits", "expected", "recall"
+            ));
+            for task in &tasks {
+                out.push_str(&format!(
+                    "{:<10} {:<5} {:>7} {:>5} {:>9} {:>7.1}%\n",
+                    task.label,
+                    task.language.as_deref().unwrap_or("-"),
+                    task.budget
+                        .map(|b| b.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    task.recall_hits.unwrap_or(0),
+                    task.recall_expected.unwrap_or(0),
+                    task.recall_pct.unwrap_or(0.0),
+                ));
+            }
+            out.push_str(&format!(
+                "{:<10} {:<5} {:>7} {:>5} {:>9} {:>7.1}%\n",
+                "mean",
+                "all",
+                "",
+                "",
+                "",
+                mean(&tasks).unwrap_or(0.0)
+            ));
+            for lang in ["en", "es"] {
+                let rows: Vec<&Measurement> = tasks
+                    .iter()
+                    .copied()
+                    .filter(|m| m.language.as_deref() == Some(lang))
+                    .collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                out.push_str(&format!(
+                    "{:<10} {:<5} {:>7} {:>5} {:>9} {:>7.1}%\n",
+                    "mean",
+                    lang,
+                    "",
+                    "",
+                    "",
+                    mean(&rows).unwrap_or(0.0)
+                ));
+            }
+        }
+
+        // Latency
+        out.push_str("\nLATENCY — milliseconds (lower is better)\n");
+        out.push_str("index sync\n");
+        out.push_str(&format!("{:<18} {:>13}\n", "repo", "index_sync_ms"));
+        for repo in &self.repos {
+            out.push_str(&format!("{:<18} {:>13.1}\n", repo.name, repo.index_sync_ms));
+        }
+        out.push_str("query\n");
+        out.push_str(&format!("{:<18} {:>13}\n", "label", "query_ms"));
+        for m in &self.measurements {
+            out.push_str(&format!("{:<18} {:>13.1}\n", m.label, m.query_ms));
+        }
+
+        // Cost
+        out.push_str("\nCOST — pack tokens and tool calls (lower is better)\n");
+        out.push_str(&format!(
+            "{:<18} {:>11} {:>10} {:>15}\n",
+            "label", "pack_tokens", "tool_calls", "baseline_calls"
+        ));
+        for m in &self.measurements {
+            out.push_str(&format!(
+                "{:<18} {:>11} {:>10} {:>15}\n",
+                m.label,
+                m.pack_tokens
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                m.tool_calls,
+                m.baseline_tool_calls
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "-".into()),
+            ));
+        }
+
+        out
+    }
+}
+
+/// First 12 characters of a SHA, or the whole string when it is not one.
+fn short_commit(commit: &str) -> String {
+    commit.chars().take(12).collect()
+}
+
+fn mean(rows: &[&Measurement]) -> Option<f64> {
+    let values: Vec<f64> = rows.iter().filter_map(|m| m.recall_pct).collect();
+    if values.is_empty() {
+        return None;
+    }
+    Some(values.iter().sum::<f64>() / values.len() as f64)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -460,16 +711,15 @@ fn parse_grep_lines(grep_output: &[String]) -> BTreeMap<PathBuf, BTreeSet<usize>
 
 /// Open a project and ensure it has a fingerprint.
 /// Returns (cogito, project, fingerprint).
+///
+/// The instance is bound to the repository, not to the process working
+/// directory. Besides being the supported constructor, that is what writes
+/// `.cogito/.gitignore`, so measuring a checkout does not leave it dirty and
+/// the next run still sees the tree it expected.
 async fn open_project(path: &Path) -> Result<(Cogito, Project, Fingerprint)> {
-    let cwd = std::env::current_dir().context("Cannot read cwd")?;
-    std::env::set_current_dir(path).context("Cannot chdir to repo")?;
-
-    let cogito = Cogito::new();
+    let cogito = Cogito::for_project(path)?;
     let project = cogito.init_project(path.to_path_buf())?;
     let (fingerprint, _) = cogito.fingerprint(&project, false).await?;
-
-    let _ = std::env::set_current_dir(&cwd); // Restore, best effort
-
     Ok((cogito, project, fingerprint))
 }
 
@@ -573,15 +823,68 @@ fn read_matched_ranges(root: &Path, file: &Path, matched_lines: &BTreeSet<usize>
 // One term, both paths
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Benchmark one search term against a repository. Both paths are evaluated
-/// over the same set of matched files, derived independently from Cogito (from grep).
-/// This is an async function so it can be called from an async context.
+/// Everything measured once per repository, before any term runs.
+///
+/// Opening the project and bringing its index up to date is the expensive part.
+/// Doing it inside the per-term function would count the same sync once per
+/// term and report it as query latency.
+struct RepoScan {
+    /// False when the project could not be opened or scanned.
+    ok: bool,
+    card_tokens: (usize, usize),
+    fingerprint: Option<Fingerprint>,
+    /// Index sync plus fingerprint generation, in milliseconds.
+    index_sync_ms: f64,
+}
+
+impl RepoScan {
+    fn failed(index_sync_ms: f64) -> Self {
+        Self {
+            ok: false,
+            card_tokens: (0, 0),
+            fingerprint: None,
+            index_sync_ms,
+        }
+    }
+}
+
+/// Open `repo_path` once, bring its index up to date, and time that sync.
+async fn scan_repo(repo_path: &Path, counter: &TokenCounter) -> RepoScan {
+    let started = Instant::now();
+    let result = open_project(repo_path).await;
+    let index_sync_ms = started.elapsed().as_secs_f64() * 1000.0;
+    match result {
+        Ok((_, project, fingerprint)) => {
+            let built = map::build(&project.path, &project.name, &fingerprint);
+            let card_text = project_card_text(&built);
+            let card_tokens = counter.count(&card_text);
+            RepoScan {
+                ok: true,
+                card_tokens,
+                fingerprint: Some(fingerprint),
+                index_sync_ms,
+            }
+        }
+        Err(_) => RepoScan::failed(index_sync_ms),
+    }
+}
+
+/// Benchmark one search term. Both paths are evaluated over the same set of
+/// matched files, so the comparison isolates the reading strategy.
+///
+/// Returns the legacy term result plus this term's report row: query latency
+/// and the tool calls each strategy needs.
 async fn benchmark_term_async(
     repo_path: &Path,
     term: &str,
     limit: usize,
     counter: &TokenCounter,
-) -> TermResult {
+    scan: &RepoScan,
+) -> (TermResult, Measurement) {
+    // Query latency covers the Cogito path only. The index sync already
+    // happened in `scan_repo`, so it is reported once per repository.
+    let mut query_ms = 0.0;
+
     // ── Baseline finding ─────────────────────────────────────────────────────
     let all_files_text = list_all_files(repo_path)
         .iter()
@@ -598,32 +901,21 @@ async fn benchmark_term_async(
     let baseline_finding_bytes = all_files_count.1 + grep_count.1;
 
     // ── Cogito finding ───────────────────────────────────────────────────────
-    // Scan once per repo, but measure only the card + search_code output.
-    let scan_result = open_project(repo_path).await;
-
-    let (_card_text, _search_text, cogito_finding_tokens, cogito_finding_bytes) = match &scan_result
-    {
-        Ok((_, project, fingerprint)) => {
-            let map = map::build(&project.path, &project.name, fingerprint);
-            let card_text = project_card_text(&map);
-            let card_count = counter.count(&card_text);
-
-            let (search_text, _hits) = search_code_text(&project.path, fingerprint, term);
+    // The card was measured once per repository; only search_code is per term.
+    let (cogito_finding_tokens, cogito_finding_bytes) = match scan.fingerprint.as_ref() {
+        Some(fingerprint) => {
+            let started = Instant::now();
+            let (search_text, _hits) = search_code_text(repo_path, fingerprint, term);
             let search_count = counter.count(&search_text);
-
+            query_ms += started.elapsed().as_secs_f64() * 1000.0;
             (
-                card_text,
-                search_text,
-                card_count.0 + search_count.0,
-                card_count.1 + search_count.1,
+                scan.card_tokens.0 + search_count.0,
+                scan.card_tokens.1 + search_count.1,
             )
         }
-        Err(_) => (
-            String::new(),
-            String::new(),
-            baseline_finding_tokens,
-            baseline_finding_bytes,
-        ),
+        // Without a usable index the Cogito path is not a measurement, so the
+        // old fallback (charge it the baseline) is kept for the token columns.
+        None => (baseline_finding_tokens, baseline_finding_bytes),
     };
 
     // ── Determine the matched file set ───────────────────────────────────────
@@ -633,7 +925,7 @@ async fn benchmark_term_async(
     let matched_files: Vec<_> = matched_by_file.into_iter().take(limit).collect();
 
     if matched_files.is_empty() {
-        return TermResult {
+        let result = TermResult {
             term: term.to_string(),
             no_matches: true,
             baseline_finding_tokens,
@@ -657,12 +949,21 @@ async fn benchmark_term_async(
             },
             matched_files_count: 0,
         };
+        // A term with no matches is still one tool call per strategy: the
+        // search happened, and that it found nothing is the answer.
+        let measurement = term_measurement(
+            term,
+            query_ms,
+            if scan.ok { 2 } else { 0 },
+            baseline_tool_calls(0),
+        );
+        return (result, measurement);
     }
 
     let matched_files_count = matched_files.len();
 
     // Get fingerprint for outline rendering
-    let fingerprint = scan_result.ok().map(|(_, _, fp)| fp);
+    let fingerprint = scan.fingerprint.as_ref();
     let root_for_reading = repo_path.to_path_buf();
 
     // ── Baseline reading ─────────────────────────────────────────────────────
@@ -678,8 +979,9 @@ async fn benchmark_term_async(
     // ── Cogito reading ──────────────────────────────────────────────────────
     let mut cogito_reading_tokens = 0usize;
     let mut cogito_reading_bytes = 0usize;
+    let started = Instant::now();
     for (file, matched_lines) in &matched_files {
-        let outline_text = file_outline_text(&root_for_reading, fingerprint.as_ref(), file);
+        let outline_text = file_outline_text(&root_for_reading, fingerprint, file);
         let (t, b) = counter.count(&outline_text);
         cogito_reading_tokens += t;
         cogito_reading_bytes += b;
@@ -689,6 +991,7 @@ async fn benchmark_term_async(
         cogito_reading_tokens += t;
         cogito_reading_bytes += b;
     }
+    query_ms += started.elapsed().as_secs_f64() * 1000.0;
 
     let baseline_total_tokens = baseline_finding_tokens + baseline_reading_tokens;
     let baseline_total_bytes = baseline_finding_bytes + baseline_reading_bytes;
@@ -702,7 +1005,7 @@ async fn benchmark_term_async(
         0.0
     };
 
-    TermResult {
+    let result = TermResult {
         term: term.to_string(),
         no_matches: false,
         baseline_finding_tokens,
@@ -720,7 +1023,455 @@ async fn benchmark_term_async(
         savings_tokens,
         savings_pct,
         matched_files_count,
+    };
+    let measurement = term_measurement(
+        term,
+        query_ms,
+        // card + search_code, then an outline and a range read per file.
+        if scan.ok {
+            2 + 2 * matched_files_count
+        } else {
+            0
+        },
+        baseline_tool_calls(matched_files_count),
+    );
+    (result, measurement)
+}
+
+/// Tool calls plain exploration needs for a term: list the files, grep, then
+/// read each matched file in full.
+fn baseline_tool_calls(matched_files: usize) -> usize {
+    2 + matched_files
+}
+
+/// The cost and latency row of one search term. Quality is left empty: a search
+/// term has no ground truth, so there is no recall to report for it.
+fn term_measurement(
+    term: &str,
+    query_ms: f64,
+    tool_calls: usize,
+    baseline_tool_calls: usize,
+) -> Measurement {
+    Measurement {
+        label: term.to_string(),
+        kind: "term".to_string(),
+        language: None,
+        budget: None,
+        recall_pct: None,
+        recall_hits: None,
+        recall_expected: None,
+        query_ms,
+        pack_tokens: None,
+        tool_calls,
+        baseline_tool_calls: Some(baseline_tool_calls),
     }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Provenance and raw artifacts
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run one git command in `path` and return its trimmed stdout.
+fn git_capture(path: &Path, args: &[&str]) -> Option<String> {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+}
+
+/// Read the revision and the clean state of the worktree that was measured.
+///
+/// A path where `git status` cannot be read is reported as `no-git`, never as
+/// clean: claiming a clean tree that was never checked is worse than saying
+/// nothing.
+fn worktree_state(path: &Path) -> (String, bool, bool, usize) {
+    let commit = git_capture(path, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    if !is_git_top(path) {
+        return (commit, false, false, 0);
+    }
+    match git_capture(path, &["status", "--porcelain=v1", "--untracked-files=all"]) {
+        Some(status) => {
+            let dirty = status.lines().filter(|l| !l.trim().is_empty()).count();
+            (commit, true, dirty == 0, dirty)
+        }
+        None => (commit, true, false, 0),
+    }
+}
+
+/// The root that holds one `<timestamp>/` directory per run.
+///
+/// `COGITO_BENCH_OUT_DIR` wins, then `XDG_CACHE_HOME`, then the documented
+/// default of `~/.cache/cogito/bench-runs`. The artifacts live outside every
+/// measured worktree on purpose: writing them into the tree being measured
+/// would dirty it between runs and change what the next run sees.
+pub fn default_out_dir() -> PathBuf {
+    for key in ["COGITO_BENCH_OUT_DIR", "XDG_CACHE_HOME"] {
+        if let Ok(dir) = std::env::var(key)
+            && !dir.trim().is_empty()
+        {
+            return if key == "XDG_CACHE_HOME" {
+                PathBuf::from(dir).join("cogito/bench-runs")
+            } else {
+                PathBuf::from(dir)
+            };
+        }
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        return PathBuf::from(home).join(".cache/cogito/bench-runs");
+    }
+    PathBuf::from(".cogito/bench-runs")
+}
+
+/// One run's raw artifact. Every run gets one, including a run that failed and
+/// terms that matched nothing: discarding those is how a benchmark starts
+/// reporting only its good days.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunArtifact {
+    pub schema: String,
+    pub started_at: String,
+    pub repetitions: usize,
+    pub runs: Vec<BenchmarkResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Create this run's `<timestamp>/` directory below `root`.
+pub fn create_run_dir(root: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(root)
+        .with_context(|| format!("Failed to create the artifact root {}", root.display()))?;
+    let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
+    let mut dir = root.join(&stamp);
+    let mut suffix = 1;
+    while dir.exists() {
+        suffix += 1;
+        dir = root.join(format!("{stamp}-{suffix}"));
+    }
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create the run directory {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Write the raw JSON and the rendered text of one run into `dir`.
+pub fn write_artifact(dir: &Path, artifact: &RunArtifact, rendered: &str) -> Result<()> {
+    let json = serde_json::to_string_pretty(artifact).context("artifact serialisation failed")?;
+    fs::write(dir.join("run.json"), json)
+        .with_context(|| format!("Failed to write {}/run.json", dir.display()))?;
+    fs::write(dir.join("report.txt"), rendered)
+        .with_context(|| format!("Failed to write {}/report.txt", dir.display()))?;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Quality: recall@budget over the labelled gold set
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A repository the gold tasks are measured against.
+#[derive(Debug, Clone, Deserialize)]
+struct GoldRepo {
+    name: String,
+    /// A local checkout, used for a repository that is not one of the pinned
+    /// public clones.
+    #[serde(default)]
+    root: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    commit: Option<String>,
+}
+
+/// What a person would consider necessary to answer a task.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GoldExpect {
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    symbols: Vec<String>,
+}
+
+/// One labelled task.
+#[derive(Debug, Clone, Deserialize)]
+struct GoldTask {
+    id: String,
+    repo: String,
+    #[serde(default)]
+    language: String,
+    budget: usize,
+    task: String,
+    #[serde(default)]
+    expect: GoldExpect,
+}
+
+/// The labelled gold set.
+#[derive(Debug, Clone, Deserialize)]
+struct GoldSet {
+    #[serde(default)]
+    repos: Vec<GoldRepo>,
+    tasks: Vec<GoldTask>,
+}
+
+/// The fragments a rendered pack contains, as (path, symbol name).
+///
+/// The header is `path:start-end · kind · name · reason`. This mirrors the
+/// parser in `tests/context_pack_recall.rs`; both grade the same rendered
+/// format, and the format is `pack::render`'s contract.
+fn pack_fragments(rendered: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in rendered.lines() {
+        if line.starts_with("context_pack ") {
+            continue;
+        }
+        let Some((location, rest)) = line.split_once(" · ") else {
+            continue;
+        };
+        let Some((path, span)) = location.rsplit_once(':') else {
+            continue;
+        };
+        let Some((start, end)) = span.split_once('-') else {
+            continue;
+        };
+        if start.parse::<usize>().is_err() || end.parse::<usize>().is_err() {
+            continue;
+        }
+        let name = rest.split(" · ").nth(1).unwrap_or_default().to_string();
+        out.push((path.to_string(), name));
+    }
+    out
+}
+
+/// Score one pack against what a person would need: (hits, expected, missing).
+fn score_pack(rendered: &str, expect: &GoldExpect) -> (usize, usize, Vec<String>) {
+    let fragments = pack_fragments(rendered);
+    let mut hits = 0usize;
+    let mut missing = Vec::new();
+    for want in &expect.files {
+        if fragments.iter().any(|(path, _)| path == want) {
+            hits += 1;
+        } else {
+            missing.push(format!("file {want}"));
+        }
+    }
+    for want in &expect.symbols {
+        let want_lower = want.to_lowercase();
+        if fragments
+            .iter()
+            .any(|(_, name)| name.to_lowercase() == want_lower)
+        {
+            hits += 1;
+        } else {
+            missing.push(format!("symbol {want}"));
+        }
+    }
+    (hits, expect.files.len() + expect.symbols.len(), missing)
+}
+
+/// Where a task's repository lives: an explicit `root`, else the bench cache
+/// the pinned manifest clones into.
+fn gold_repo_root(workspace: &Path, gold: &GoldSet, name: &str) -> PathBuf {
+    if let Some(root) = gold
+        .repos
+        .iter()
+        .find(|r| r.name == name)
+        .and_then(|r| r.root.as_ref())
+    {
+        return PathBuf::from(root);
+    }
+    workspace.join(".cogito/bench-cache").join(name)
+}
+
+/// A repository opened and made fresh, ready to answer its tasks.
+struct GoldRepoState {
+    cogito: Cogito,
+    project: Project,
+}
+
+/// Measure recall@budget and the pack cost of every labelled task.
+///
+/// The pack is built with the same `pack::build`, the same stored fingerprint
+/// and the same shared `cl100k_base` counter the MCP `context_pack` tool uses,
+/// so the number describes the tool an agent gets rather than a reimplementation
+/// of it. A missing checkout is reported and skipped; it is never a miss and
+/// never a zero.
+///
+/// Returns `(measurements, repos, gold_path_used, note)`. `gold_path_used` is
+/// `None` only when no gold set was read at all, so an empty quality column is
+/// never confused with a measured zero.
+async fn measure_gold(
+    workspace: &Path,
+    gold_path: Option<&Path>,
+    counter: &TokenCounter,
+) -> (
+    Vec<Measurement>,
+    Vec<MeasuredRepo>,
+    Option<String>,
+    Option<String>,
+) {
+    let path = gold_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace.join("benchmarks/context_pack_gold.json"));
+    let Ok(content) = fs::read_to_string(&path) else {
+        return (
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(format!("no labelled gold set at {}", path.display())),
+        );
+    };
+    let gold: GoldSet = match serde_json::from_str(&content) {
+        Ok(gold) => gold,
+        Err(e) => {
+            return (
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some(format!(
+                    "gold set at {} is not valid JSON: {e}",
+                    path.display()
+                )),
+            );
+        }
+    };
+    let gold_path_used = Some(path.display().to_string());
+
+    // Phase 1: open and sync each repository once, not once per task.
+    let mut states: BTreeMap<String, GoldRepoState> = BTreeMap::new();
+    let mut repos: Vec<MeasuredRepo> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+
+    for task in &gold.tasks {
+        if !seen.insert(task.repo.clone()) {
+            continue;
+        }
+        let root = gold_repo_root(workspace, &gold, &task.repo);
+        if !root.is_dir() {
+            notes.push(format!(
+                "{}: checkout missing at {}",
+                task.repo,
+                root.display()
+            ));
+            continue;
+        }
+        let (commit, is_git, clean, dirty_paths) = worktree_state(&root);
+        let started = Instant::now();
+        let opened = match Cogito::for_project(&root) {
+            Ok(cogito) => match cogito.load_project(root.clone()) {
+                Ok(project) => match cogito.sync_index(&project).await {
+                    Ok(_) => Ok((cogito, project)),
+                    Err(e) => Err(format!("index sync failed: {e:#}")),
+                },
+                Err(e) => Err(format!("project could not be registered: {e:#}")),
+            },
+            Err(e) => Err(format!("project could not be opened: {e:#}")),
+        };
+        let index_sync_ms = started.elapsed().as_secs_f64() * 1000.0;
+        match opened {
+            Ok((cogito, project)) => {
+                states.insert(task.repo.clone(), GoldRepoState { cogito, project });
+                repos.push(MeasuredRepo {
+                    name: task.repo.clone(),
+                    path: root.display().to_string(),
+                    commit,
+                    is_git,
+                    clean,
+                    dirty_paths,
+                    index_sync_ms,
+                });
+            }
+            Err(e) => notes.push(format!("{}: {e}", task.repo)),
+        }
+    }
+
+    // Phase 2: build one pack per task on the already-fresh repositories.
+    let mut measurements = Vec::new();
+    for task in &gold.tasks {
+        let Some(state) = states.get(&task.repo) else {
+            continue;
+        };
+        let stored = state
+            .cogito
+            .stored_fingerprint(state.project.id)
+            .ok()
+            .flatten();
+        let count = |text: &str| counter.count(text).0;
+        let started = Instant::now();
+        let built = match state.cogito.connection() {
+            Some(conn) => pack::build(
+                pack::Request {
+                    conn: &conn,
+                    project_id: state.project.id,
+                    root: &state.project.path,
+                    task: &task.task,
+                    budget: task.budget,
+                    fingerprint: stored.as_ref(),
+                    tier_weights: crate::mcp::tier_weights(),
+                },
+                &count,
+            )
+            .map(|pack| {
+                let rendered = pack::render(&pack);
+                let used = pack::used_tokens(&pack, &count);
+                (rendered, used)
+            })
+            .map_err(|e| format!("{e:#}")),
+            None => Err("no index connection".to_string()),
+        };
+        let query_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        // A build that failed is recorded with its reason, never dropped. It is
+        // also not counted as a miss: an answer that was never produced is not
+        // recall, and folding it in as zero would make the metric move with the
+        // harness instead of with the product.
+        let (rendered, pack_tokens, error) = match built {
+            Ok((rendered, used)) => (rendered, Some(used), None),
+            Err(e) => (String::new(), None, Some(e)),
+        };
+        let (hits, expected, missing) = score_pack(&rendered, &task.expect);
+        let measured = error.is_none() && expected > 0;
+        let recall_pct = if measured {
+            Some(hits as f64 / expected as f64 * 100.0)
+        } else {
+            None
+        };
+        let mut note = error;
+        if note.is_none() && !missing.is_empty() {
+            note = Some(format!("missed: {}", missing.join(", ")));
+        }
+        measurements.push(Measurement {
+            label: task.id.clone(),
+            kind: "task".to_string(),
+            language: Some(task.language.clone()),
+            budget: Some(task.budget),
+            recall_pct,
+            recall_hits: measured.then_some(hits),
+            recall_expected: measured.then_some(expected),
+            query_ms,
+            pack_tokens,
+            // One context_pack call is the whole Cogito path for a task.
+            tool_calls: 1,
+            baseline_tool_calls: None,
+        });
+        if let Some(note) = note {
+            notes.push(format!("{}: {note}", task.id));
+        }
+    }
+
+    let note = if measurements.is_empty() {
+        Some(if notes.is_empty() {
+            format!("no task was measurable from {}", path.display())
+        } else {
+            format!("no task was measurable: {}", notes.join("; "))
+        })
+    } else if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join("; "))
+    };
+
+    (measurements, repos, gold_path_used, note)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -733,6 +1484,17 @@ pub struct BenchOptions {
     pub repo: Option<PathBuf>,
     pub terms: Vec<String>,
     pub limit: usize,
+    /// Print the three-section report. Off by default so the old output is
+    /// byte-identical with the same flags as before.
+    pub report: bool,
+    /// Root that holds one `<timestamp>/` artifact per run. `None` means the
+    /// documented default, `~/.cache/cogito/bench-runs`.
+    pub out_dir: Option<PathBuf>,
+    /// How many times to repeat the measurement. Every repetition is kept.
+    pub repeat: usize,
+    /// Labelled gold set for recall@budget. `None` means the one beside the
+    /// manifest, `benchmarks/context_pack_gold.json`.
+    pub gold: Option<PathBuf>,
 }
 
 impl Default for BenchOptions {
@@ -741,17 +1503,35 @@ impl Default for BenchOptions {
             repo: None,
             terms: Vec::new(),
             limit: 5,
+            report: false,
+            out_dir: None,
+            repeat: 1,
+            gold: None,
         }
     }
 }
 
+/// The workspace root, two levels above this crate's manifest.
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+}
+
 /// Run the benchmark with the given options (async to support tokio runtime).
+///
+/// One call is one repetition. Quality and cost are deterministic, so every
+/// repetition reports the same numbers; latency is not, which is why the
+/// artifact keeps them all instead of only an average.
 pub async fn run_benchmark_async(opts: BenchOptions) -> Result<BenchmarkResult> {
     let counter = TokenCounter::new();
     let tokenizer = counter.name().to_string();
+    let workspace = workspace_root();
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let mut repos = Vec::new();
+    let mut report = Report::new(opts.repeat);
 
     if let Some(repo_path) = &opts.repo {
         // Single local repository
@@ -767,6 +1547,7 @@ pub async fn run_benchmark_async(opts: BenchOptions) -> Result<BenchmarkResult> 
             &terms,
             opts.limit,
             &counter,
+            &mut report,
         )
         .await?;
         repos.push(result);
@@ -793,6 +1574,7 @@ pub async fn run_benchmark_async(opts: BenchOptions) -> Result<BenchmarkResult> 
                         &entry.terms,
                         opts.limit,
                         &counter,
+                        &mut report,
                     )
                     .await?;
                     repos.push(result);
@@ -805,6 +1587,21 @@ pub async fn run_benchmark_async(opts: BenchOptions) -> Result<BenchmarkResult> 
         }
     }
 
+    // Quality: recall@budget over the labelled gold set, built through the same
+    // pack the MCP tool builds. Measured on every run so the artifact always
+    // carries all three classes, and never invented when a checkout is missing.
+    let (quality, gold_repos, gold_path, note) =
+        measure_gold(&workspace, opts.gold.as_deref(), &counter).await;
+    report.measurements.extend(quality);
+    for repo in gold_repos {
+        // A repository already reported by the token path keeps its first row.
+        if !report.repos.iter().any(|r| r.path == repo.path) {
+            report.repos.push(repo);
+        }
+    }
+    report.gold_path = gold_path;
+    report.quality_note = note;
+
     let total_elapsed = start.elapsed().as_secs_f64();
 
     Ok(BenchmarkResult {
@@ -812,37 +1609,51 @@ pub async fn run_benchmark_async(opts: BenchOptions) -> Result<BenchmarkResult> 
         repos,
         total_elapsed_seconds: total_elapsed,
         tokenizer,
+        report: Some(report),
     })
 }
 
 /// Benchmark one repository (async to support tokio runtime).
+///
+/// The append-only `Report` receives this repository's provenance, its index
+/// sync latency and one row per term.
 async fn benchmark_repo_async(
     repo_path: &Path,
     repo_name: &str,
     terms: &[String],
     limit: usize,
     counter: &TokenCounter,
+    report: &mut Report,
 ) -> Result<RepoResult> {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
-    let commit = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo_path)
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_owned())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "unknown".to_string());
+    let (commit, is_git, clean, dirty_paths) = worktree_state(repo_path);
+
+    // Index once per repository, not once per term: a sync counted per term
+    // would multiply the same cost and report it as query latency.
+    let scan = scan_repo(repo_path, counter).await;
+    report.repos.push(MeasuredRepo {
+        // The short name keeps the provenance table readable; the full path is
+        // kept beside it, because a name alone does not identify a checkout.
+        name: repo_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(repo_name)
+            .to_string(),
+        path: repo_path.display().to_string(),
+        commit: commit.clone(),
+        is_git,
+        clean,
+        dirty_paths,
+        index_sync_ms: scan.index_sync_ms,
+    });
 
     let mut term_results = Vec::with_capacity(terms.len());
     for term in terms {
-        let result = benchmark_term_async(repo_path, term, limit, counter).await;
+        let (result, measurement) =
+            benchmark_term_async(repo_path, term, limit, counter, &scan).await;
         term_results.push(result);
+        report.measurements.push(measurement);
     }
 
     let elapsed = start.elapsed().as_secs_f64();
@@ -853,16 +1664,6 @@ async fn benchmark_repo_async(
         terms: term_results,
         elapsed_seconds: elapsed,
     })
-}
-
-/// Print the benchmark results to stdout.
-pub fn print_results(result: &BenchmarkResult, json: bool) -> Result<()> {
-    if json {
-        println!("{}", result.render_json()?);
-    } else {
-        println!("{}", result.render_human());
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -927,6 +1728,40 @@ mod baseline_tests {
         let dir = repo();
         assert!(grep_sync(dir.path(), "dep_only_here").is_empty());
         assert!(grep_sync(dir.path(), "ignored").is_empty());
+    }
+
+    /// The recall rule: a file counts when a fragment's path equals it, a symbol
+    /// when the name equals it, and a rendered pack line that is not a fragment
+    /// header is not a hit.
+    #[test]
+    fn test_score_pack_counts_files_and_symbols_by_equality() {
+        let rendered = "context_pack \"x\" used 10/2000 tokens\n\
+             src/a.rs:1-4 · fn · alpha · name match\n\
+             src/b.rs:9-12 · fn · Beta · path match\n";
+        let expect = GoldExpect {
+            files: vec!["src/a.rs".to_string(), "src/missing.rs".to_string()],
+            symbols: vec!["beta".to_string(), "gamma".to_string()],
+        };
+        let (hits, expected, missing) = score_pack(rendered, &expect);
+        assert_eq!((hits, expected), (2, 4));
+        assert_eq!(missing, vec!["file src/missing.rs", "symbol gamma"]);
+    }
+
+    /// A dirty worktree is never reported as clean, and a path git cannot read
+    /// is `no-git` rather than dirty.
+    #[test]
+    fn test_worktree_state_marks_dirty_and_non_git() {
+        let dir = TempDir::new().unwrap();
+        let (_, is_git, clean, dirty) = worktree_state(dir.path());
+        assert!(!is_git && !clean && dirty == 0);
+
+        git(dir.path(), &["init", "-q"]);
+        let (_, is_git, clean, dirty) = worktree_state(dir.path());
+        assert!(is_git && clean && dirty == 0);
+
+        fs::write(dir.path().join("new.rs"), "fn a() {}\n").unwrap();
+        let (_, is_git, clean, dirty) = worktree_state(dir.path());
+        assert!(is_git && !clean && dirty == 1, "dirty={dirty}");
     }
 
     #[test]
