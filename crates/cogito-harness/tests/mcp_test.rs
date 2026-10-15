@@ -97,6 +97,7 @@ fn test_mcp_lists_the_map_tools_only() {
         [
             "context_pack",
             "file_outline",
+            "impact",
             "project_map",
             "related_files",
             "search_code"
@@ -506,4 +507,295 @@ fn test_mcp_search_code_puts_a_named_file_first() {
             "a named file puts Files before Symbols:\n{text}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// impact
+// ---------------------------------------------------------------------------
+
+/// Run `git` in `dir`, with an explicit identity, and fail the test when it
+/// fails. An identity is explicit because a CI runner has none and a commit
+/// that fails without one leaves no HEAD, which the test would only see much
+/// later.
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("git failed to start");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A project whose `src/core.ts` is imported by two files while a third one
+/// declares the same symbol name without importing anything.
+///
+/// `src/unrelated.ts` is the negative control: nothing links it to a change in
+/// `src/core.ts`, so it must never appear in the affected set. So is
+/// `src/duplicate.ts`: declaring the same name is not a reference, and the
+/// reference edges only link a use reached through an import edge.
+fn impact_workspace() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let write = |rel: &str, text: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write("package.json", r#"{"name":"impactws","private":true}"#);
+    write(
+        "src/core.ts",
+        "export function computeValue(input: number): number {\n  return input + 1;\n}\n\nexport const UNRELATED = 0;\n",
+    );
+    write(
+        "src/consumer.ts",
+        "import { computeValue } from './core';\n\nexport function useValue(): number {\n  return computeValue(1);\n}\n",
+    );
+    write(
+        "src/other.ts",
+        "import { computeValue } from './core';\n\nexport function otherValue(): number {\n  return computeValue(2);\n}\n",
+    );
+    // Declares the same name, imports nothing: a name match, never a reference.
+    write(
+        "src/duplicate.ts",
+        "export function computeValue(): number {\n  return 0;\n}\n",
+    );
+    write(
+        "src/unrelated.ts",
+        "export function untouched(): number {\n  return 1;\n}\n",
+    );
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "initial"]);
+    dir
+}
+
+/// The paths under the "Affected files" heading, in the order they are listed.
+fn affected_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if line.starts_with("Affected files") {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if line.trim().is_empty() {
+            break;
+        }
+        let item = line.trim_start().split(" — ").next().unwrap();
+        paths.push(item.to_string());
+    }
+    paths
+}
+
+#[test]
+fn test_mcp_impact_reports_the_exact_affected_set() {
+    let dir = impact_workspace();
+    let root = dir.path();
+    let path = root.display().to_string();
+
+    // A committed change inside `computeValue`. `base..HEAD` is the diff whose
+    // new side is the committed content.
+    std::fs::write(
+        root.join("src/core.ts"),
+        "export function computeValue(input: number): number {\n  return input + 2;\n}\n\nexport const UNRELATED = 0;\n",
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "change"]);
+
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let call = |id: u64, args: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"impact","arguments":{{"path":"{path}"{args}}}}}}}"#
+        )
+    };
+    let base = call(2, r#","base":"HEAD~1""#);
+    let uncommitted = call(3, "");
+    let output = send_jsonrpc(vec![init, ready, &base, &uncommitted]);
+
+    let text = tool_text(&output, 2);
+    assert!(
+        text.starts_with("Impact of changes in HEAD~1..HEAD"),
+        "the base mode names its range:\n{text}"
+    );
+    assert!(
+        text.contains("computeValue") && !text.contains("UNRELATED"),
+        "only the declaration the hunk falls inside is touched:\n{text}"
+    );
+    assert_eq!(
+        affected_paths(&text),
+        ["src/consumer.ts", "src/other.ts"],
+        "the affected set is exactly the two importing users: the homonym \
+         declaration and the negative control are absent:\n{text}"
+    );
+    assert!(
+        text.contains("Reference edges (2):"),
+        "the reference edges are listed:\n{text}"
+    );
+    assert!(
+        text.contains("src/consumer.ts → src/core.ts: uses computeValue")
+            && text.contains("src/other.ts → src/core.ts: uses computeValue"),
+        "each edge names the user, the declaring file and the name:\n{text}"
+    );
+    assert!(
+        !text.contains("src/duplicate.ts"),
+        "declaring the same name is not a reference:\n{text}"
+    );
+    assert!(
+        !text.contains("not supported"),
+        "TypeScript is resolved, never excused:\n{text}"
+    );
+    assert!(
+        text.contains("Risk: medium · 2 files import a changed file"),
+        "the risk is the importer count, spelled out:\n{text}"
+    );
+    assert!(
+        text.contains("overapproximation"),
+        "the answer must say it is an overapproximation:\n{text}"
+    );
+
+    // The same change, this time uncommitted: `git diff` against HEAD is the
+    // source, and the answer is the same exact set.
+    std::fs::write(
+        root.join("src/core.ts"),
+        "export function computeValue(input: number): number {\n  return input + 3;\n}\n\nexport const UNRELATED = 0;\n",
+    )
+    .unwrap();
+    let text = tool_text(&send_jsonrpc(vec![init, ready, &uncommitted]), 3);
+    assert!(
+        text.starts_with("Impact of uncommitted changes"),
+        "without a base the mode is the uncommitted work:\n{text}"
+    );
+    assert_eq!(
+        affected_paths(&text),
+        ["src/consumer.ts", "src/other.ts"],
+        "the uncommitted diff reaches the same files:\n{text}"
+    );
+    assert!(
+        text.contains("Reference edges (2):"),
+        "and the same reference edges:\n{text}"
+    );
+    assert!(
+        !text.contains("no declarations touched"),
+        "the uncommitted change does touch a declaration:\n{text}"
+    );
+}
+
+#[test]
+fn test_mcp_impact_says_when_only_a_comment_changed() {
+    let dir = impact_workspace();
+    let root = dir.path();
+    let path = root.display().to_string();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let call = |id: u64| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"impact","arguments":{{"path":"{path}"}}}}}}"#
+        )
+    };
+
+    // A clean worktree first: nothing changed, and the tool says so instead of
+    // answering with an empty list.
+    let clean = call(2);
+    let clean_text = tool_text(&send_jsonrpc(vec![init, ready, &clean]), 2);
+    assert!(
+        clean_text.contains("Nothing changed"),
+        "a clean worktree has no impact to report:\n{clean_text}"
+    );
+
+    // A comment added above the first declaration shifts it down but falls
+    // outside its line range, so no declaration is touched.
+    std::fs::write(
+        root.join("src/core.ts"),
+        "// Note: the value core.\nexport function computeValue(input: number): number {\n  return input + 1;\n}\n\nexport const UNRELATED = 0;\n",
+    )
+    .unwrap();
+    let comment = call(2);
+    let text = tool_text(&send_jsonrpc(vec![init, ready, &comment]), 2);
+
+    assert!(
+        text.contains("no declarations touched"),
+        "a comment-only change must say exactly that, never an empty list:\n{text}"
+    );
+    assert!(
+        !text.contains("computeValue"),
+        "no symbol may be reported as touched:\n{text}"
+    );
+    assert!(
+        text.contains("src/core.ts — modified"),
+        "the changed file is still reported:\n{text}"
+    );
+    assert_eq!(
+        affected_paths(&text),
+        ["src/consumer.ts", "src/other.ts"],
+        "the importers of the changed file are still listed:\n{text}"
+    );
+    assert!(
+        text.contains("Reference edges: none."),
+        "no declaration is touched, so there is no reference to resolve:\n{text}"
+    );
+    assert!(
+        text.contains("Risk: medium · 2 files import a changed file"),
+        "the risk stays the importer count even with no declaration touched:\n{text}"
+    );
+}
+
+/// A project whose only changed file is Python, a language v1 does not resolve
+/// reference edges for.
+#[test]
+fn test_mcp_impact_says_not_supported_for_a_language_v1_does_not_resolve() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/helper.py"), "def thing():\n    return 1\n").unwrap();
+    std::fs::write(
+        root.join("src/app.py"),
+        "from helper import thing\n\ndef run():\n    return thing()\n",
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "initial"]);
+
+    std::fs::write(
+        root.join("src/app.py"),
+        "from helper import thing\n\ndef run():\n    return thing() + thing()\n",
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "change"]);
+
+    let path = root.display().to_string();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"impact","arguments":{{"path":"{path}","base":"HEAD~1"}}}}}}"#
+    );
+
+    let text = tool_text(&send_jsonrpc(vec![init, ready, &call]), 2);
+    assert!(
+        text.contains("Reference edges not supported for 1 changed file"),
+        "the tool answers not supported instead of guessing:\n{text}"
+    );
+    assert!(
+        text.contains("v1 resolves TypeScript and Rust only") && text.contains("src/app.py"),
+        "and names the file and the supported languages:\n{text}"
+    );
+    assert!(
+        !text.contains("uses thing"),
+        "no name-based edge is invented for Python:\n{text}"
+    );
 }

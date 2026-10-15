@@ -55,6 +55,9 @@ Two halves, both written by setup:
 1. **`npm:cogito-harness`** in `settings.json` — a Pi package. On
    `session_start` it scans the project in the background and sets a status
    line, and it adds `/cogito` with `status`, `map`, `scan`, `stats` and `doctor`.
+   It also guards whole-file reads and plain-name greps: it hands the call to
+   `cogito guard` and returns the block the guard answers with, so Pi and
+   Claude Code share one decision rule.
 
    ```
    /cogito status
@@ -97,11 +100,19 @@ Four files:
   `Grep`. The first time Claude reads a file of 250+ lines whole, the call is
   blocked and Claude gets the file's outline instead; the first time it greps
   for a plain name, it gets Cogito's search result. Repeating the exact same
-  call runs normally, ranged reads and regex greps are never touched, and any
+  Grep runs normally. A whole read of a file that has not changed since its
+  full text was delivered gets the outline again, twice, then runs; a changed
+  file is read in full. Ranged reads and regex greps are never touched, and any
   error lets the call through. The decision logic is in `cogito hook
   claude-pre-tool-use`; the script only hands it Claude Code's JSON.
+- Whole-file reads done through `Bash` (`cat FILE`, `nl FILE`,
+  `sed -n '1,$p' FILE`, `head -n N FILE` with `N` larger than the read limit)
+  go through the same guardrail as `Read` and share its per-session state: a
+  `cat` after a `Read` of the same file is not delivered again, and an explicit
+  range (`head -n 20`, `sed -n '10,30p'`) is never touched. Pipes, redirects,
+  multiple commands and other shells built-ins (`ls`, `git`, `grep`) pass.
 - `~/.claude/settings.json` gets a `SessionStart` entry for the card and a
-  `PreToolUse` entry (matcher `^(Read|Grep)$`) for the guardrail, both
+  `PreToolUse` entry (matcher `^(Read|Grep|Bash)$`) for the guardrail, both
   synchronous (an `async` hook's output never reaches the session; `cogito
   setup` repairs entries written that way by older versions).
 
@@ -179,9 +190,11 @@ printf '<cogito_project>\n%s\n</cogito_project>\n' "$card"
   - Fires `cogito scan --quiet` on `session.created` and `session.start`.
   - Injects the project card via `experimental.chat.system.transform` (once per
     session).
-  - Intercepts the first whole-file `Read` and plain-name `Grep` calls via
-    `tool.execute.before` and returns Cogito's outline or search result instead.
-    The same call on retry passes through.
+  - Intercepts whole-file `Read` and plain-name `Grep` calls via
+    `tool.execute.before`: it hands the call to `cogito guard` and throws the
+    reason the guard returns, so opencode, Pi and Claude Code share one
+    decision rule. A failed, missing, or unparseable guardrail answer lets the
+    call through.
 
 `setup` also installs the Cogito block into `AGENTS.md` at the project root.
 opencode reads every `AGENTS.md` from the workspace root toward home.
@@ -207,7 +220,7 @@ Any MCP-capable client works if you add the server yourself:
 }
 ```
 
-Cogito exposes five tools, each taking an explicit `path` to the project root:
+Cogito exposes six tools, each taking an explicit `path` to the project root:
 
 | Tool | Purpose |
 |---|---|
@@ -216,6 +229,7 @@ Cogito exposes five tools, each taking an explicit `path` to the project root:
 | `related_files` | What one file imports, what imports it, and its external packages |
 | `search_code` | Find code by words: symbols (functions, types, classes) with `file:line`, file paths, module names and doc sections |
 | `file_outline` | A file's declarations (code) or sections (Markdown) with line ranges, so only the needed range is read |
+| `impact` | What a diff reaches: the declarations its hunks touch, the files that import the changed files and the files that use those names (TypeScript and Rust; other languages answer "not supported"), with a risk level from the importer count. An overapproximation by design |
 
 The map is stored after each scan and reused until `HEAD` moves, so these calls
 read no source files. Documentation is indexed too: `search_code` finds
@@ -272,7 +286,7 @@ Telescope over `cogito map --json`, or an MCP client such as
 
 | Editor / Agent | MCP | Session-start card | Read/grep guardrail | `AGENTS.md` block |
 |---|---|---|---|---|
-| Gentle Shell (pi) | ✅ direct | ✅ | — | — |
+| Gentle Shell (pi) | ✅ direct | ✅ | ✅ | — |
 | Claude Code | ✅ | ✅ | ✅ | — |
 | opencode | ✅ | ✅ | ✅ | ✅ |
 | Codex | ✅ | — | — | ✅ |

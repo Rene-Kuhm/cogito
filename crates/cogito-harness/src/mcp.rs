@@ -4,7 +4,8 @@
 //! opencode, Gemini CLI, …) can use Cogito as a tool provider.
 //!
 //! The tools give an agent the project's layout so it does not have to read
-//! the code to find its way: `project_map`, `related_files`, and `search_code`.
+//! the code to find its way: `project_map`, `related_files`, `search_code` and
+//! `impact`.
 //!
 //! Each tool takes an explicit `path` argument. The server opens that
 //! project's `.cogito/state.db` per call, so one process can serve several
@@ -31,7 +32,12 @@ words and it returns the fragments that matter, ranked and inside a token budget
 reason each was chosen. Otherwise work cheapest first: project_map to orient (once per \
 session); search_code to find a symbol, file or module by name (it gives file:line); \
 file_outline to see a file's declarations with line ranges; then read only the lines you need. \
-related_files shows what a file imports and what imports it. Avoid listing directories, \
+related_files shows what a file imports and what imports it. Before committing a change, impact \
+reads the diff (uncommitted, or base..HEAD) and names the declarations the hunks touch, the files \
+that import the changed files and the files that use the names those declarations introduce, \
+resolved through the index's import edges for TypeScript and Rust (any other language answers \
+not supported), with a risk level from \
+the importer count. Avoid listing directories, \
 grepping or reading whole files to find your way. The index refreshes when HEAD changes; pass \
 refresh=true to project_map after large uncommitted changes. Every tool takes `path`, the \
 absolute project root.";
@@ -66,6 +72,16 @@ pub struct SearchCodeRequest {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ImpactRequest {
+    /// Absolute path to the project root
+    pub path: String,
+    /// Optional revision to compare against: `base..HEAD` instead of the
+    /// uncommitted changes
+    #[serde(default)]
+    pub base: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ContextPackRequest {
     /// Absolute path to the project root
     pub path: String,
@@ -88,7 +104,7 @@ fn default_pack_budget() -> usize {
 /// recall harness can measure alternatives through the real tool rather than
 /// through a reimplementation of it; unset or malformed means the default, so
 /// shipped behaviour only changes when someone deliberately asks.
-fn tier_weights() -> cogito_harness_core::pack::TierWeights {
+pub(crate) fn tier_weights() -> cogito_harness_core::pack::TierWeights {
     std::env::var("COGITO_PACK_TIERS")
         .ok()
         .and_then(|spec| cogito_harness_core::pack::TierWeights::parse(&spec))
@@ -327,6 +343,33 @@ impl CogitoServer {
             &req.query,
             files_first,
         ))
+    }
+
+    #[tool(
+        description = "What a diff reaches: the declarations its hunks touch, the files that import the changed files, and the files that use the names those declarations introduce (resolved through the index's import edges for TypeScript and Rust; any other language answers not supported). Plus a risk level taken only from how many files import the change. Overapproximate by design (import graph and identifier names, no calls or type resolution). Without `base` it reads the uncommitted changes; with `base`, `base..HEAD`."
+    )]
+    async fn impact(&self, Parameters(req): Parameters<ImpactRequest>) -> Result<String, String> {
+        let (cogito, project, _stored) = indexed_project(&req.path)?;
+        // Sync before taking the connection: the guard cannot be held across an
+        // await.
+        let _ = cogito
+            .sync_index(&project)
+            .await
+            .map_err(|e| format!("Index sync failed: {e}"))?;
+
+        let conn = cogito
+            .connection()
+            .ok_or_else(|| format!("No index for {}: run `cogito scan`", req.path))?;
+
+        let impact = cogito_harness_core::impact::build(
+            &conn,
+            project.id,
+            &project.path,
+            req.base.as_deref(),
+        )
+        .map_err(|e| format!("Failed to read the diff of {}: {e:#}", req.path))?;
+
+        Ok(cogito_harness_core::impact::render(&impact))
     }
 
     #[tool(

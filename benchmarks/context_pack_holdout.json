@@ -1,0 +1,183 @@
+{
+  "schema": "cogito.context_pack_holdout/v1",
+  "description": "Held-out tasks used to check that context_pack recall generalises beyond the tuning set. Every task is written over the same two pinned repositories as benchmarks/context_pack_gold.json (ripgrep 3fce3b5, bat d9559c6) but names different symbols and different files, so a ranker tuned on the gold set cannot have seen these pairs. Each task states what a person would need to answer it, plus the files and symbols a person would consider necessary. Every expected path and symbol is verified against the pinned commit; the commands are in benchmarks/context_pack_holdout.verify.md.",
+  "metric": {
+    "name": "recall@budget",
+    "definition": "expected entries that appear in the pack, over the total expected entries, per task, with the pack built at that task's budget. The reported average is the mean over all tasks.",
+    "by_language": "Averages are reported separately for `en` and `es` tasks. A Spanish description of English code shares no token with it, so mixing the two hides the difference that matters.",
+    "file_hit": "any emitted fragment whose path equals the expected path",
+    "symbol_hit": "any emitted fragment whose name equals the expected symbol, case-insensitive",
+    "why_mixed": "Six tasks name the identifier and six only describe behaviour, so the set can tell recall on a lexical match from recall on a paraphrase. A holdout that only named identifiers would measure nothing the gold set has not already measured.",
+    "overlap_with_gold": "None. No task reuses an expected file from the gold set: ripgrep tasks live in crates/printer, crates/globset, crates/ignore/src/types.rs, crates/ignore/src/overrides.rs and crates/cli/src/decompress.rs; bat tasks live in src/style.rs, src/output.rs, src/nonprintable_notation.rs, src/pager.rs, src/decorations.rs and src/diff.rs."
+  },
+  "repos": [
+    {
+      "name": "ripgrep",
+      "url": "https://github.com/BurntSushi/ripgrep",
+      "commit": "3fce3b5bb0236da2df6d99672afb8a719642eca7"
+    },
+    {
+      "name": "bat",
+      "url": "https://github.com/sharkdp/bat",
+      "commit": "d9559c69f541873f8c47ac8ad81d985f4441edf6"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "rg-h01",
+      "repo": "ripgrep",
+      "language": "en",
+      "budget": 2000,
+      "task": "Where is StandardBuilder defined and what does it let you configure about how matches are printed?",
+      "names_the_identifier": true,
+      "notes": "Names the type. The line-oriented printer's builder configures context, headings, colors and hyperlinks before the immutable printer is built.",
+      "expect": {
+        "symbols": ["StandardBuilder"],
+        "files": ["crates/printer/src/standard.rs"]
+      }
+    },
+    {
+      "id": "rg-h02",
+      "repo": "ripgrep",
+      "language": "es",
+      "budget": 2000,
+      "task": "¿Dónde está definido JSONBuilder y cómo arma el flujo de eventos que produce --json?",
+      "names_the_identifier": true,
+      "notes": "Spanish, names the type. The JSON printer wraps its writer and emits begin, match and end events; the builder fixes its configuration.",
+      "expect": {
+        "symbols": ["JSONBuilder"],
+        "files": ["crates/printer/src/json.rs"]
+      }
+    },
+    {
+      "id": "rg-h03",
+      "repo": "ripgrep",
+      "language": "en",
+      "budget": 2000,
+      "task": "Where are Override and OverrideBuilder defined and how do the -g globs layer on top of the ignore files?",
+      "names_the_identifier": true,
+      "notes": "Names both types. An override is a gitignore matcher built from the globs the user passed explicitly, so it is consulted before the ignore files.",
+      "expect": {
+        "symbols": ["Override", "OverrideBuilder"],
+        "files": ["crates/ignore/src/overrides.rs"]
+      }
+    },
+    {
+      "id": "rg-h04",
+      "repo": "ripgrep",
+      "language": "en",
+      "budget": 2000,
+      "task": "How are many glob patterns compiled into a single matcher that can test a path quickly?",
+      "names_the_identifier": false,
+      "notes": "Descriptive. The globset crate builds one matcher over all the patterns, so a path is tested once instead of once per pattern.",
+      "expect": {
+        "symbols": ["GlobSetBuilder", "GlobSet"],
+        "files": ["crates/globset/src/lib.rs"]
+      }
+    },
+    {
+      "id": "rg-h05",
+      "repo": "ripgrep",
+      "language": "es",
+      "budget": 2000,
+      "task": "¿Cómo se decide qué archivos entran cuando se pasa un filtro de tipo como -tpy o -tjs?",
+      "names_the_identifier": false,
+      "notes": "Spanish, descriptive. The types module maps a type name to a set of globs and keeps the built-in default definitions.",
+      "expect": {
+        "symbols": ["Types", "TypesBuilder"],
+        "files": ["crates/ignore/src/types.rs"]
+      }
+    },
+    {
+      "id": "rg-h06",
+      "repo": "ripgrep",
+      "language": "en",
+      "budget": 2000,
+      "task": "How does ripgrep decompress a file before searching it when --search-zip is enabled?",
+      "names_the_identifier": false,
+      "notes": "Descriptive. The cli crate matches a file path to an external decompression command and builds one matcher for all the associations.",
+      "expect": {
+        "symbols": ["DecompressionMatcherBuilder", "DecompressionMatcher"],
+        "files": ["crates/cli/src/decompress.rs"]
+      }
+    },
+    {
+      "id": "bat-h01",
+      "repo": "bat",
+      "language": "en",
+      "budget": 2000,
+      "task": "Where is StyleComponent defined and which parts of the output can it turn on or off?",
+      "names_the_identifier": true,
+      "notes": "Names the type. It is one member of the style set: numbers, grid, rule, header, changes and the plain and full presets.",
+      "expect": {
+        "symbols": ["StyleComponent"],
+        "files": ["src/style.rs"]
+      }
+    },
+    {
+      "id": "bat-h02",
+      "repo": "bat",
+      "language": "es",
+      "budget": 2000,
+      "task": "¿Dónde está definido OutputType y cómo elige entre paginar y escribir directo a la terminal?",
+      "names_the_identifier": true,
+      "notes": "Spanish, names the type. The variants cover stdout, an external pager and the built-in pager, and the constructor maps the paging mode onto them.",
+      "expect": {
+        "symbols": ["OutputType"],
+        "files": ["src/output.rs"]
+      }
+    },
+    {
+      "id": "bat-h03",
+      "repo": "bat",
+      "language": "en",
+      "budget": 1500,
+      "task": "Where is NonprintableNotation defined and which notations does it offer for control characters?",
+      "names_the_identifier": true,
+      "notes": "Names the type. It selects between caret notation and the Unicode control pictures.",
+      "expect": {
+        "symbols": ["NonprintableNotation"],
+        "files": ["src/nonprintable_notation.rs"]
+      }
+    },
+    {
+      "id": "bat-h04",
+      "repo": "bat",
+      "language": "en",
+      "budget": 2000,
+      "task": "How does bat find the pager binary and decide which arguments to run it with?",
+      "names_the_identifier": false,
+      "notes": "Descriptive. The pager module resolves the binary and its arguments from the flag, the config file and BAT_PAGER/PAGER, and records where the choice came from.",
+      "expect": {
+        "symbols": ["Pager"],
+        "files": ["src/pager.rs"]
+      }
+    },
+    {
+      "id": "bat-h05",
+      "repo": "bat",
+      "language": "es",
+      "budget": 2000,
+      "task": "¿Cómo se construyen los números de línea y las marcas de cambios de git que acompañan al texto?",
+      "names_the_identifier": false,
+      "notes": "Spanish, descriptive. One decoration per margin implements the shared trait that renders its text and reports its width.",
+      "expect": {
+        "symbols": ["LineNumberDecoration", "LineChangesDecoration"],
+        "files": ["src/decorations.rs"]
+      }
+    },
+    {
+      "id": "bat-h06",
+      "repo": "bat",
+      "language": "en",
+      "budget": 2000,
+      "task": "How does bat ask git which lines changed so it can mark them next to the text?",
+      "names_the_identifier": false,
+      "notes": "Descriptive. The diff module reads the index entry and turns the hunks into a per-line change map.",
+      "expect": {
+        "symbols": ["get_git_diff", "LineChange"],
+        "files": ["src/diff.rs"]
+      }
+    }
+  ]
+}

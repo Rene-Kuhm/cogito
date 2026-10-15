@@ -65,7 +65,10 @@ The standard path is `scan → pack → read`. All of it is read-only.
 4. **Narrow when the pack is not enough.** `search_code` finds symbols, files
    and doc sections by words with `file:line`; `file_outline` gives a file's
    declarations with line ranges, so you read one range instead of the file;
-   `related_files` shows what a file imports and what imports it.
+   `related_files` shows what a file imports and what imports it. Before a
+   commit, `impact` reads the diff and names the declarations it touches and
+   the files that import or use them (TypeScript and Rust; other languages
+   answer "not supported").
 
    ```bash
    cogito search "requireSession"
@@ -93,6 +96,7 @@ the `cogito mcp` server is configured, prefer the MCP tools over the CLI:
 | `search_code` | Find code by words: symbols (functions, types, classes) with `file:line`, file paths, module names and doc sections |
 | `file_outline` | A file's declarations with line ranges, so only the needed range is read |
 | `context_pack` | The context for a task in one call: ranked fragments with the reason each was chosen, inside a token budget |
+| `impact` | What a diff reaches: the declarations its hunks touch and the files that import or use them (TypeScript and Rust; other languages answer "not supported"), with a risk level from the importer count (an overapproximation) |
 
 The MCP server is `cogito mcp` (same binary, `mcp` subcommand). It uses the
 same `.cogito/state.db` as the CLI, so both stay in sync. `cogito setup` writes

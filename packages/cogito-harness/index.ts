@@ -6,9 +6,11 @@
  * 1. On `session_start` it loads the project card (rescanning only if `HEAD`
  *    moved) and puts it in the system prompt of every turn, so the model
  *    starts each answer already knowing the layout and how to look code up.
- * 2. Guardrails: the first time the agent reads a large file whole, or greps
- *    for a plain name, it gets Cogito's outline or search result instead.
- *    Repeating the same call goes through, so the agent is never stuck.
+ * 2. Guardrails: whole-file reads and plain-name greps are handed to
+ *    `cogito guard`, the same entry point Claude Code and opencode call, and
+ *    its decision (show Cogito's answer instead, or let the call run) is
+ *    returned. The rule lives in one place; this extension keeps no copy of
+ *    it and no state of its own.
  * 3. It sets a status line showing what Cogito knows about the project.
  * 4. It registers `/cogito` with `status`, `map`, `scan`, `search`, `stats`
  *    and `doctor`, so the map is usable without leaving the session.
@@ -19,8 +21,8 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { extname, isAbsolute, join, relative } from "node:path";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
@@ -37,6 +39,8 @@ interface CogitoContext {
     notify?: (message: string, severity?: string) => void;
     setStatus?: (key: string, text: string | undefined) => void;
   };
+  /** Pi's session manager; `getSessionId()` keys the guardrail state. */
+  sessionManager?: { getSessionId?: () => string };
 }
 
 /** Overridable for development builds. */
@@ -55,10 +59,17 @@ interface RunResult {
 /**
  * Run `cogito …` in `cwd`, capturing output.
  *
- * Rejects are converted to a failed `RunResult` so callers never need to
- * handle a spawn error: a missing binary is reported, not thrown.
+ * When `stdin` is given it is written to the child and the stream closed;
+ * otherwise the child gets no stdin at all. Rejects are converted to a failed
+ * `RunResult` so callers never need to handle a spawn error: a missing binary
+ * is reported, not thrown.
  */
-function run(args: string[], cwd: string, timeoutMs: number): Promise<RunResult> {
+function run(
+  args: string[],
+  cwd: string,
+  timeoutMs: number,
+  stdin?: string,
+): Promise<RunResult> {
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
@@ -74,12 +85,18 @@ function run(args: string[], cwd: string, timeoutMs: number): Promise<RunResult>
     try {
       child = spawn(COGITO_BIN, args, {
         cwd,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
         env: process.env,
       });
     } catch (error) {
       finish({ ok: false, stdout: "", stderr: String(error) });
       return;
+    }
+
+    if (stdin !== undefined && child.stdin) {
+      // The child may close stdin early; that is not a guardrail failure.
+      child.stdin.on("error", () => {});
+      child.stdin.end(stdin);
     }
 
     const timer = setTimeout(() => {
@@ -153,95 +170,46 @@ function loadCard(cwd: string): Promise<string | undefined> {
 }
 
 /**
- * Guardrails: the expensive ways to find your way around a project (reading a
- * whole large file, grepping for a name) get Cogito's answer instead, once.
+ * Ask `cogito guard` about one read or grep call.
  *
- * Each nudge fires at most once per call shape and session: repeating the
- * exact same call goes through. The agent is never blocked from doing what it
- * needs, it is only shown the cheap answer first.
+ * The decision (outline a first whole read, turn away an unchanged repeat,
+ * nudge a plain-name grep) lives in the guard, the same rule Claude Code and
+ * opencode use, so this extension keeps no copy of it and no state. Any
+ * failure — a missing binary, a non-zero exit, unparseable output — returns
+ * undefined, because a guardrail must never break a tool call.
  */
-const nudged = new Set<string>();
-
-/** Files longer than this are outlined before they are read whole. */
-const OUTLINE_MIN_LINES = 250;
-
-/** Extensions Cogito can outline (code declarations, Markdown sections). */
-const OUTLINED = new Set([
-  ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".rs", ".py", ".go",
-  ".java", ".kt", ".kts", ".cs", ".swift", ".php", ".rb", ".md", ".mdx", ".markdown",
-]);
-
-/** A grep or find pattern that is a plain name, not a regex over content. */
-function isPlainName(pattern: unknown): pattern is string {
-  return typeof pattern === "string" && /^[\w.\-/ ]{2,80}$/.test(pattern.trim());
-}
-
-/** Count lines without holding more than the file in memory. */
-function lineCount(file: string): number {
-  try {
-    const text = readFileSync(file, "utf8");
-    let lines = 1;
-    for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 10) lines++;
-    return lines;
-  } catch {
-    return 0;
-  }
-}
-
-/**
- * Cogito's answer to show instead of the call, or undefined to let the call
- * run untouched.
- */
-async function guardrail(toolName: string, input: any, cwd: string): Promise<string | undefined> {
+async function guardrail(
+  toolName: string,
+  input: any,
+  cwd: string,
+  session: string,
+): Promise<string | undefined> {
   if (!input || typeof input !== "object") return undefined;
-
-  if (toolName === "read") {
-    const wholeFile = input.offset === undefined && (input.limit === undefined || input.limit > 400);
-    if (!wholeFile || typeof input.path !== "string") return undefined;
-    const file = isAbsolute(input.path) ? input.path : join(cwd, input.path);
-    const rel = relative(cwd, file);
-    if (rel.startsWith("..") || !OUTLINED.has(extname(file).toLowerCase())) return undefined;
-    const key = `read:${rel}`;
-    if (nudged.has(key)) return undefined;
-    const lines = lineCount(file);
-    if (lines < OUTLINE_MIN_LINES) return undefined;
-    const result = await run(["outline", rel], cwd, QUERY_TIMEOUT_MS);
-    if (!result.ok || !result.stdout.trim()) return undefined;
-    nudged.add(key);
-    return (
-      `${rel} has ${lines} lines. Cogito's outline instead of the whole file:\n\n` +
-      `${result.stdout.trim()}\n\n` +
-      `Read the range you need with offset/limit. Reading the whole file again is allowed if you really need it.`
-    );
-  }
-
-  if (toolName === "grep" || toolName === "find") {
-    const pattern = input.pattern ?? input.name;
-    if (!isPlainName(pattern)) return undefined;
-    const key = `${toolName}:${pattern}:${input.path ?? ""}:${input.glob ?? ""}`;
-    if (nudged.has(key)) return undefined;
-    const result = await run(["search", pattern], cwd, QUERY_TIMEOUT_MS);
-    if (!result.ok || !result.stdout.trim() || result.stdout.startsWith("Nothing matches")) {
-      return undefined;
+  if (toolName !== "read" && toolName !== "grep") return undefined;
+  const call = JSON.stringify({ tool: toolName, input, cwd, session });
+  const result = await run(["guard"], cwd, QUERY_TIMEOUT_MS, call);
+  if (!result.ok) return undefined;
+  try {
+    const answer = JSON.parse(result.stdout);
+    if (answer?.block === true && typeof answer.reason === "string" && answer.reason) {
+      return answer.reason;
     }
-    nudged.add(key);
-    return (
-      `Cogito's index for "${pattern}" (symbols and doc sections with file:line, files, modules):\n\n` +
-      `${result.stdout.trim()}\n\n` +
-      `Use file_outline on a result and read only its range. If you need every textual match, ` +
-      `repeat the same ${toolName} call and it will run.`
-    );
+  } catch {
+    /* A guardrail must never break a tool call. */
   }
-
   return undefined;
 }
 
 export default function registerCogito(pi: ExtensionAPI) {
   pi.on("tool_call", async (event: any, raw: any) => {
-    const cwd = (raw as CogitoContext)?.cwd;
+    const ctx = raw as CogitoContext;
+    const cwd = ctx?.cwd;
     if (!cwd || !isProject(cwd) || event?.parentToolCallId) return;
+    // Pi's session id keys the guard's state. The process id is the fallback
+    // when an older host does not expose the session manager.
+    const session = ctx?.sessionManager?.getSessionId?.() ?? `pi-${process.pid}`;
     try {
-      const reason = await guardrail(String(event?.toolName ?? ""), event?.input, cwd);
+      const reason = await guardrail(String(event?.toolName ?? ""), event?.input, cwd, session);
       if (reason) return { block: true, reason };
     } catch {
       /* A guardrail must never break a tool call. */
@@ -282,9 +250,9 @@ export default function registerCogito(pi: ExtensionAPI) {
       return;
     }
 
-    // A new session starts from a fresh card and fresh nudges.
+    // A new session starts from a fresh card. The guard's per-session state
+    // lives under `.cogito/nudges/` and is keyed by the session id.
     cards.delete(cwd);
-    nudged.clear();
     void (async () => {
       const card = await loadCard(cwd);
       try {

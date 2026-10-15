@@ -182,7 +182,7 @@ pub enum ZoneFrequency { Hot, Warm, Cold, Frozen }
 
 Entrypoint: `main.rs` + `commands/mod.rs` (subcommands). `agents.rs` defines
 the agent registry and config shapes. `claude_hook.rs` implements the
-`PreToolUse` guardrail decision logic. `mcp.rs` exposes five tools over stdio.
+`PreToolUse` guardrail decision logic. `mcp.rs` exposes six tools over stdio.
 
 ### Command reference
 
@@ -212,8 +212,8 @@ Global flags: `--verbose`, `--quiet`, `--json`.
 
 **Location**: `crates/cogito-harness/src/mcp.rs`
 
-Transport: stdio subprocess. Five tools, each taking an explicit `path`
-(project root). All five open the SQLite index, run `sync_index` to bring it
+Transport: stdio subprocess. Six tools, each taking an explicit `path`
+(project root). All six open the SQLite index, run `sync_index` to bring it
 up to date with the working tree, then read rows.
 
 | Tool | Input | Output |
@@ -223,6 +223,7 @@ up to date with the working tree, then read rows.
 | `search_code` | `path`, `query` | Up to 12 FTS5 hits with bm25 score, file:line, kind |
 | `file_outline` | `path`, `file` | Declarations (code) or sections (Markdown) with line ranges |
 | `related_files` | `path`, `file` | Imports, importers, external packages for the given file |
+| `impact` | `path`, `base?` | The declarations the diff's hunks touch, the files that import the changed files and the files that use those names (TypeScript and Rust; other languages answer "not supported"), plus a risk level from the importer count |
 
 No resource URI scheme, no `add_tag`, no `compress_context`, no REST endpoints.
 

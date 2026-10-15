@@ -2,20 +2,17 @@
 //
 // Refreshes the project's stored fingerprint when a session starts, so it
 // matches the current code. Injects the project card into the system prompt
-// and intercepts the first whole-file Read and plain-name Grep calls,
-// returning Cogito's outline or search result instead.
+// and intercepts whole-file Read and plain-name Grep calls.
+//
+// The guardrail rule itself (outline a first whole read, turn away an
+// unchanged repeat, nudge a plain-name grep) lives in `cogito guard`, the same
+// entry point Claude Code and Pi use, so the three cannot drift apart. This
+// plugin only passes one call as JSON and throws the reason it gets back.
 //
 // The MCP tools come from the `mcp.cogito` entry in opencode.json; this
 // plugin handles session lifecycle and guardrails.
-//
-// Guardrail thresholds are shared with Claude Code:
-//   OUTLINE_MIN_LINES = 250  (files shorter are read whole)
-//   WHOLE_READ_LIMIT = 400   (reads with limit > 400 count as whole)
 
-const OUTLINE_MIN_LINES = 250;
-const WHOLE_READ_LIMIT = 400;
 const COGITO_CARD_MARKER = "<cogito_project>";
-const COGITO_NUDGE_DIR = ".cogito/nudges";
 
 export const CogitoPlugin = async ({ directory, $ }) => {
   const isProject = async () => {
@@ -63,6 +60,25 @@ export const CogitoPlugin = async ({ directory, $ }) => {
     }
   };
 
+  // --- Guardrail: let `cogito guard` decide ---
+
+  const guard = async (call) => {
+    try {
+      const payload = JSON.stringify(call);
+      const out = await $`printf '%s' ${payload} | cogito guard`
+        .cwd(directory)
+        .quiet()
+        .nothrow();
+      if (out.exitCode !== 0) return undefined;
+      const answer = JSON.parse(String(out.stdout || "").trim() || "{}");
+      if (answer && answer.block === true && answer.reason) return answer.reason;
+      return undefined;
+    } catch {
+      // A guard that fails must never cost the agent a tool call.
+      return undefined;
+    }
+  };
+
   // --- Guardrail: outline large reads ---
   //
   // opencode signature:
@@ -81,39 +97,13 @@ export const CogitoPlugin = async ({ directory, $ }) => {
     // Skip paths outside the project
     if (!file_path.startsWith(directory)) return;
 
-    const offset = args.offset;
-    const limit = args.limit;
-    // "whole" means no offset and no limit, or a limit above WHOLE_READ_LIMIT
-    const whole =
-      (offset === null || offset === undefined) &&
-      (limit === undefined || limit === null || limit > WHOLE_READ_LIMIT);
-    if (!whole) return;
-
-    try {
-      const content = (await $`cat "${file_path}"`.cwd(directory).quiet().nothrow()).stdout;
-      const lines = content.split("\n").length;
-      if (lines < OUTLINE_MIN_LINES) return;
-
-      const rel = file_path.slice(directory.length + 1);
-      const outline = (await $`cogito outline "${rel}"`
-        .cwd(directory)
-        .quiet()
-        .nothrow()).stdout.trim();
-
-      if (!outline) return;
-
-      const key = `read:${rel}`;
-      const nudged = await firstTime(key, input.sessionID);
-      if (!nudged) return;
-
-      const msg = `${rel} has ${lines} lines. Cogito's outline instead of the whole file:\n\n${outline}\nRead the range you need with offset/limit. Reading the whole file again is allowed if you really need it.`;
-      throw new Error(msg);
-    } catch (e) {
-      if (e.message && e.message.includes("Cogito's outline")) {
-        throw e; // re-throw the nudge
-      }
-      // Swallow: let the call through on any failure.
-    }
+    const reason = await guard({
+      tool: "read",
+      input: { path: file_path, offset: args.offset, limit: args.limit },
+      cwd: directory,
+      session: input.sessionID,
+    });
+    if (reason) throw new Error(reason);
   };
 
   // --- Guardrail: nudge plain-name greps ---
@@ -121,64 +111,16 @@ export const CogitoPlugin = async ({ directory, $ }) => {
   // opencode signature same as above.
   // `args.pattern` is the search pattern; `args.path` and `args.glob` scope it.
 
-  const isPlainName = (pattern) => {
-    const p = pattern.trim();
-    if (p.length < 2 || p.length > 80) return false;
-    return /^[\w.\-\/ ]+$/.test(p);
-  };
-
   const grepNudge = async (input, output) => {
     if (input.tool !== "grep") return;
 
-    const args = output.args || {};
-    const pattern = args.pattern;
-    if (!pattern || !isPlainName(pattern)) return;
-
-    try {
-      const result = (await $`cogito search "${pattern}"`
-        .cwd(directory)
-        .quiet()
-        .nothrow()).stdout.trim();
-
-      if (!result) return;
-
-      const key = `grep:${pattern}:${args.path || ""}:${args.glob || ""}`;
-      const nudged = await firstTime(key, input.sessionID);
-      if (!nudged) return;
-
-      const msg = `Cogito's index for "${pattern}" (symbols and doc sections with file:line, files, modules):\n\n${result}\nUse file_outline on a result and read only its range. If you need every textual match, repeat the same Grep call and it will run.`;
-      throw new Error(msg);
-    } catch (e) {
-      if (e.message && e.message.includes("Cogito's index")) {
-        throw e;
-      }
-      // Swallow: let the call through on any failure.
-    }
-  };
-
-  // --- Per-session bookkeeping: record key, return true only the first time ---
-
-  const firstTime = async (key, sessionId) => {
-    try {
-      const safeId = String(sessionId || "default")
-        .replace(/[^a-zA-Z0-9\-]/g, "")
-        .slice(0, 64);
-      const nudgeDir = `${directory}/${COGITO_NUDGE_DIR}`;
-      const nudgeFile = `${nudgeDir}/${safeId || "default"}`;
-
-      const seen = (await $`cat "${nudgeFile}" 2>/dev/null`.cwd(directory).quiet().nothrow()).stdout || "";
-      const lines = seen.split("\n");
-      if (lines.includes(key)) return false;
-
-      await $`mkdir -p "${nudgeDir}"`.cwd(directory).quiet().nothrow();
-      await $`cat >> "${nudgeFile}" << 'EOF'\n${key}\nEOF`
-        .cwd(directory)
-        .quiet()
-        .nothrow();
-      return true;
-    } catch {
-      return false;
-    }
+    const reason = await guard({
+      tool: "grep",
+      input: output.args || {},
+      cwd: directory,
+      session: input.sessionID,
+    });
+    if (reason) throw new Error(reason);
   };
 
   return {

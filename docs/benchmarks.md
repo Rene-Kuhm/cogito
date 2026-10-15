@@ -24,10 +24,14 @@ the code around it":
 
 ### What it does not measure
 
-- The quality of search results (relevance ranking)
+- Whether the answer is right. Recall is measured separately with the labelled
+  gold set, through `cogito bench --report`; a token reduction only counts when
+  the answer it reduces still meets the quality bar.
 - Round-trip latency to the LLM
 - Cost of thinking or planning before calling tools
 - Any costs after the first read (e.g., when the agent continues exploring)
+- The agent's own model tokens or tool calls. `cogito bench` counts the tool
+  calls each strategy makes, not what a model spends thinking between them.
 
 ## Token Counting
 
@@ -71,7 +75,58 @@ cogito bench --repo . --terms search_code --limit 3
 
 # Machine-readable JSON output
 cogito bench --repo . --terms search_code --json
+
+# The three-section report: quality, latency and cost, kept apart
+cogito bench --repo . --terms search_code --report
+
+# Repeat the measurement, and choose where the raw artifacts go
+cogito bench --repeat 3 --out-dir ~/.cache/cogito/bench-runs
 ```
+
+### Quality, latency and cost are reported separately
+
+A fast wrong answer and a slow right one are not the same thing, so
+`--report` prints three sections and never a combined score. Each section
+answers one question on its own:
+
+| Section | Question | Columns |
+|---------|----------|---------|
+| `QUALITY` | Did the pack return what a person needs? | `recall@budget` per task, per language and overall, over the labelled gold set |
+| `LATENCY` | How long does it take? | `index_sync_ms` per repository, `query_ms` per task or term |
+| `COST` | What does it spend? | `pack_tokens` (what the pack actually used) and `tool_calls`, against the calls plain exploration needs |
+
+The report also prints its own provenance, because a number without it cannot
+be reproduced: the exact commit SHA of every measured worktree, whether that
+worktree was `clean` or `dirty` (with the count of changed paths), how many
+repetitions were run, which tokenizer produced the counts, and the artifact
+directory the run was written to. A worktree where git could not be read is
+reported as `no-git`, never as clean.
+
+Recall is measured through the same `pack::build` and the same shared
+`cl100k_base` counter the `context_pack` tool uses, so it describes the tool an
+agent gets rather than a reimplementation of it. A repository that is not
+checked out is reported and skipped: it is never a miss and never a zero. A pack
+that failed to build is recorded with its reason and left out of the average,
+for the same reason.
+
+Repetitions keep every run. Quality and cost are deterministic, so repeats agree;
+latency is not, which is why `--repeat` exists and everything is kept.
+
+### Raw artifacts for every run
+
+Every run writes `<out-dir>/<timestamp>/` outside any measured worktree, and
+nothing is discarded: failures and zero-result terms are in the artifact.
+Writing them inside the tree being measured would dirty it between runs and
+change what the next run sees. The default root is
+`~/.cache/cogito/bench-runs`, overridable with `--out-dir` or
+`COGITO_BENCH_OUT_DIR`. The two files are:
+
+- `run.json` — the raw record: every repetition, every term and task, the
+  provenance, and the error when the run failed.
+- `report.txt` — exactly the text the run printed.
+
+Without `--report` the printed output is unchanged; the artifact path is
+announced on stderr so stdout keeps carrying only the table (or the JSON).
 
 ### Against the pinned manifest
 

@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use cogito_harness_core::{Cogito, Project};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::ProjectCommands;
 
@@ -963,15 +963,74 @@ fn load_or_create_project(cogito: &Cogito, cwd: &Path) -> Result<Project> {
 // Benchmark
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Run the token-savings benchmark.
-pub async fn bench(
-    repo: Option<PathBuf>,
-    terms: Vec<String>,
-    json: bool,
-    limit: usize,
-) -> Result<()> {
-    let opts = bench::BenchOptions { repo, terms, limit };
-    let result = bench::run_benchmark_async(opts).await?;
-    bench::print_results(&result, json)?;
-    Ok(())
+/// Run the token-savings benchmark and keep the raw artifact of every run.
+///
+/// The artifact is written before anything is printed, and a run that failed
+/// gets one too: a benchmark that only keeps its good runs reports only its
+/// good days.
+pub async fn bench(opts: bench::BenchOptions, json: bool) -> Result<()> {
+    let out_root = opts.out_dir.clone().unwrap_or_else(bench::default_out_dir);
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let repetitions = opts.repeat.max(1);
+
+    let mut runs = Vec::with_capacity(repetitions);
+    let mut error = None;
+    for _ in 0..repetitions {
+        match bench::run_benchmark_async(opts.clone()).await {
+            Ok(result) => runs.push(result),
+            Err(e) => {
+                error = Some(format!("{e:#}"));
+                break;
+            }
+        }
+    }
+
+    // The artifact directory is created first so the report can name it.
+    let dir = bench::create_run_dir(&out_root)?;
+
+    // With --report the three sections come first and the legacy table follows,
+    // so the token columns stay visible. With the flag off the output is exactly
+    // what it was before this flag existed.
+    let rendered = match runs.first() {
+        Some(first) if opts.report => {
+            let sections = first
+                .report
+                .as_ref()
+                .map(|report| report.render(&first.tokenizer, Some(&dir)))
+                .unwrap_or_default();
+            format!("{sections}\n{}\n", first.render_human())
+        }
+        Some(first) if json => format!("{}\n", first.render_json()?),
+        Some(first) => format!("{}\n", first.render_human()),
+        None => String::new(),
+    };
+
+    let artifact = bench::RunArtifact {
+        schema: "cogito.bench-run/v1".to_string(),
+        started_at,
+        repetitions,
+        runs,
+        error: error.clone(),
+    };
+    bench::write_artifact(&dir, &artifact, &rendered)?;
+
+    if json && opts.report {
+        // The report asked for the machine-readable form: the whole artifact.
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&artifact).context("artifact serialisation failed")?
+        );
+    } else if !rendered.is_empty() {
+        print!("{rendered}");
+    }
+    if !opts.report && !json {
+        // stdout is unchanged with the flag off, so the artifact location goes
+        // to stderr.
+        eprintln!("artifacts: {}", dir.display());
+    }
+
+    match error {
+        Some(e) => anyhow::bail!("{e}"),
+        None => Ok(()),
+    }
 }

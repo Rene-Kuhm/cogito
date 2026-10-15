@@ -11,11 +11,12 @@ Pi extension that wires [Cogito](https://github.com/Rene-Kuhm/cogito-harness) in
    as `<cogito_project>`. It is identical between turns, so the provider
    serves it from its prompt cache, and the model starts each answer knowing
    the layout without spending a tool call on orientation.
-2. **Guardrails.** The first time the agent reads a large file (250+ lines)
-   whole, it gets Cogito's outline instead; the first time it greps or finds a
-   plain name, it gets Cogito's search result. Repeating the exact same call
-   goes through, so the agent is never stuck; it is only shown the cheap
-   answer first. On a 708-line README, reading it whole ~11,100 tokens →
+2. **Guardrails.** Whole-file reads and plain-name greps are handed to
+   `cogito guard`, the same entry point Claude Code and opencode call, and its
+   answer is returned; the extension keeps no rule and no state of its own.
+   The guard outlines a first whole read, turns away an unchanged repeat a
+   bounded number of times, and nudges a plain-name grep with Cogito's search
+   result, and any error lets the call through. On a 708-line README, reading it whole ~11,100 tokens →
    outline ~530; `grep README **/*.md` ~4,600 → search ~400.
 3. **Shows status.** The status line reports whether Cogito is ready for the
    current project.
@@ -45,7 +46,7 @@ cogito setup gentle-shell
 ## MCP tools
 
 This package is the *session* adapter. The MCP tools
-(`project_map`, `search_code`, `file_outline`, `related_files`)
+(`project_map`, `search_code`, `file_outline`, `related_files`, `impact`)
 come from Pi's
 built-in MCP and are registered by `cogito setup`, which writes:
 

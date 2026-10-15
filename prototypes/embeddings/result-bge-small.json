@@ -1,0 +1,38 @@
+{
+  "model": "BAAI/bge-small-en-v1.5",
+  "size": {
+    "model": "BAAI/bge-small-en-v1.5",
+    "cache_subdir": "/home/tecnodespegue/.cache/cogito-embeddings-prototype/hub/models--Qdrant--bge-small-en-v1.5-onnx-Q",
+    "cache_subdir_name": "models--Qdrant--bge-small-en-v1.5-onnx-Q",
+    "size_bytes": 67895484,
+    "size_mb": 64.75
+  },
+  "load_seconds": 0.139,
+  "index": {
+    "files_indexed": 1000,
+    "files_skipped": 0,
+    "dim": 384,
+    "batch_size": 256,
+    "index_seconds": 92.461,
+    "files_per_second": 10.82,
+    "ms_per_file": 92.461
+  },
+  "query": {
+    "queries_run": 153,
+    "warmup_queries": 1,
+    "rounds": 3,
+    "min_ms": 2.795,
+    "p50_ms": 3.095,
+    "p95_ms": 3.451,
+    "p99_ms": 3.684,
+    "max_ms": 4.858,
+    "mean_ms": 3.116
+  },
+  "corpus_roots": [
+    "/home/tecnodespegue/.cargo/registry/src",
+    "/home/tecnodespegue/proyectos/cogito"
+  ],
+  "corpus_file_count_discovered": 10260,
+  "max_doc_bytes": 4000,
+  "batch_size": 256
+}

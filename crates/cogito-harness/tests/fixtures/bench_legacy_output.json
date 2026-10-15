@@ -1,0 +1,50 @@
+{
+  "manifest_version": null,
+  "repos": [
+    {
+      "repo": "<REPO>",
+      "commit": "<COMMIT>",
+      "terms": [
+        {
+          "term": "search_code",
+          "no_matches": false,
+          "baseline_finding_tokens": 19,
+          "baseline_finding_bytes": 58,
+          "baseline_reading_tokens": 37,
+          "baseline_reading_bytes": 170,
+          "baseline_total_tokens": 56,
+          "baseline_total_bytes": 228,
+          "cogito_finding_tokens": 120,
+          "cogito_finding_bytes": 538,
+          "cogito_reading_tokens": 62,
+          "cogito_reading_bytes": 232,
+          "cogito_total_tokens": 182,
+          "cogito_total_bytes": 770,
+          "savings_tokens": 0,
+          "savings_pct": 0.0,
+          "matched_files_count": 1
+        },
+        {
+          "term": "project_map",
+          "no_matches": false,
+          "baseline_finding_tokens": 19,
+          "baseline_finding_bytes": 58,
+          "baseline_reading_tokens": 37,
+          "baseline_reading_bytes": 170,
+          "baseline_total_tokens": 56,
+          "baseline_total_bytes": 228,
+          "cogito_finding_tokens": 120,
+          "cogito_finding_bytes": 538,
+          "cogito_reading_tokens": 68,
+          "cogito_reading_bytes": 257,
+          "cogito_total_tokens": 188,
+          "cogito_total_bytes": 795,
+          "savings_tokens": 0,
+          "savings_pct": 0.0,
+          "matched_files_count": 1
+        }
+      ]
+    }
+  ],
+  "tokenizer": "cl100k_base"
+}

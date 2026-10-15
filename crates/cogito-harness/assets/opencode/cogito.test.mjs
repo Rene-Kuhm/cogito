@@ -1,19 +1,16 @@
 // Executable test for the opencode Cogito plugin.
 // Run with: node crates/cogito-harness/assets/opencode/cogito.test.mjs
 //
-// Verifies:
+// The plugin delegates every guardrail decision to `cogito guard`, so these
+// tests cover the delegation contract:
 // - experimental.chat.system.transform pushes the card into output.system exactly once
-// - tool.execute.before with a whole-file read (> OUTLINE_MIN_LINES lines) throws with outline
-// - repeating that identical read passes without throwing
-// - a read with a small explicit limit passes without throwing
-// - tool.execute.before with a plain-name grep throws with search result
-// - repeating that grep passes; a regex-pattern grep passes
-// - no hook rejects when cogito is unavailable (non-zero exit, empty stdout)
+// - a block from `cogito guard` is transmitted with its reason
+// - a non-block answer lets the call through
+// - an error from `cogito` (non-zero exit, bad JSON, missing binary) lets the call through
+// - a read outside the project never reaches `cogito guard`
+// - reads and greps are forwarded with the fields the guard contract expects
 
 import { CogitoPlugin } from "./cogito.js";
-
-const OUTLINE_MIN_LINES = 250; // must match the plugin
-const WHOLE_READ_LIMIT = 400; // must match the plugin
 
 // ─── Fake `$` shell ────────────────────────────────────────────────────────
 
@@ -26,10 +23,6 @@ const WHOLE_READ_LIMIT = 400; // must match the plugin
  *
  * The plugin calls $ as a tagged template: $`cmd`.  In JavaScript a tagged
  * template `tag`literal`...`` calls `tag(["literal", ...], val, ...)`.
- * Because cogito commands never contain `${...}` substitutions, all
- * expressions resolve to empty strings and the full command is the sole
- * array element.  We expose `cmd` (singular) as the tagged-template entry
- * point so the plugin's $`...` calls work unchanged.
  */
 class FakeShell {
   constructor(entries = []) {
@@ -39,18 +32,10 @@ class FakeShell {
   /**
    * Tagged-template entry point: $`cmd`.
    *
-   * Bun's $ template tag does proper interpolation: `${expr}` is replaced by the
-   * string value of `expr`.  We replicate that by joining the strings array and
-   * substituting `${...}` placeholders with the corresponding values.
-   *
-   * The arguments are (strings: string[], ...values: any[]).
+   * Reconstructs the command exactly as Bun does by interleaving strings and
+   * interpolated values.
    */
   cmd(strings, ...values) {
-    // Reconstruct the command exactly as Bun does: interleave strings and values.
-    // Bun replaces ${expr} in the template with the value of expr.  When a
-    // tagged template has N ${...} substitutions, strings has N+1 elements and
-    // values has N elements.  The result is:
-    //   strings[0] + values[0] + strings[1] + values[1] + ... + strings[N]
     let cmd = strings[0] || "";
     for (let i = 0; i < values.length; i++) {
       cmd += String(values[i]);
@@ -140,21 +125,15 @@ const PROJECT_DIR = "/tmp/cogito-test-project";
 
 const CARD_OUTPUT = "<cogito_project>\ncode files · indexed at abc1234\nBusiest files: src/lib.rs · src/main.rs · src/handlers.rs\nTools: search_code · file_outline · read · grep · search\n</cogito_project>";
 
-const LARGE_FILE_LINES = new Array(OUTLINE_MIN_LINES + 50)
-  .fill(0)
-  .map((_, i) => "pub fn f" + i + "() {}")
-  .join("\n");
+const OUTLINE_REASON = "src/lib.rs has 300 lines. Cogito's outline instead of the whole file:\n\nsrc/lib.rs · 300 lines\n  1-10  fn main() {}";
+const SEARCH_REASON = "Cogito's index for \"handle_request\" (symbols and doc sections with file:line, files, modules):\n\nsrc/handlers.rs:10  async fn handle_request()";
 
-const OUTLINE_OUTPUT = "src/lib.rs · 300 lines · module crate\n  1-10  mod handlers  (src/handlers.rs)\n  11-20 mod utils     (src/utils.rs)\n  25-99 fn main() {}";
-
-const SEARCH_OUTPUT = "src/handlers.rs:10  async fn handle_request()\nsrc/handlers.rs:45  fn process_data()";
-
-function buildShell(isProject = true) {
+function buildShell() {
   const $ = new FakeShell();
 
   // project detection
-  $.mock("test -e .git", isProject ? "" : "", isProject ? 0 : 1);
-  $.mock("test -d .cogito", isProject ? "" : "", isProject ? 0 : 1);
+  $.mock("test -e .git", "", 0);
+  $.mock("test -d .cogito", "", 0);
 
   // scan
   $.mock("cogito scan --quiet", "", 0);
@@ -165,6 +144,11 @@ function buildShell(isProject = true) {
   return $;
 }
 
+/** The exact shell command the plugin uses to ask `cogito guard`. */
+function guardCommand(call) {
+  return `printf '%s' ${JSON.stringify(call)} | cogito guard`;
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 async function runTests() {
@@ -172,8 +156,6 @@ async function runTests() {
 
   {
     const $ = buildShell();
-    // JavaScript does not re-invoke getters during destructuring; pass $.$ so the
-    // plugin receives the bound tagged-template function, not the shell object.
     const plugin = await CogitoPlugin({ directory: PROJECT_DIR, $: $.$ });
     const hook = plugin["experimental.chat.system.transform"];
 
@@ -196,86 +178,73 @@ async function runTests() {
     );
   }
 
-  console.log("\n=== Test: tool.execute.before — whole-file read throws with outline ===");
+  console.log("\n=== Test: a block from cogito guard is transmitted with its reason ===");
 
   {
     const $ = buildShell();
-    const largeFilePath = PROJECT_DIR + "/src/lib.rs";
-    $.mock("cat \"" + largeFilePath + "\"", LARGE_FILE_LINES, 0);
-    $.mock("cogito outline \"src/lib.rs\"", OUTLINE_OUTPUT, 0);
-    // firstTime: mkdir succeeds, nudge file write succeeds
+    const filePath = PROJECT_DIR + "/src/lib.rs";
+    const call = {
+      tool: "read",
+      input: { path: filePath },
+      cwd: PROJECT_DIR,
+      session: "s2",
+    };
     $.mock(
-      "cat \"/tmp/cogito-test-project/.cogito/nudges/s2\" 2>/dev/null",
-      "",
-      1
-    );
-    $.mock("mkdir -p \"/tmp/cogito-test-project/.cogito/nudges\"", "", 0);
-    $.mock(
-      "cat >> \"/tmp/cogito-test-project/.cogito/nudges/s2\" << 'EOF'\nread:src/lib.rs\nEOF",
-      "",
+      guardCommand(call),
+      JSON.stringify({ block: true, reason: OUTLINE_REASON }),
       0
     );
 
     const plugin = await CogitoPlugin({ directory: PROJECT_DIR, $: $.$ });
     const hook = plugin["tool.execute.before"];
 
-    // Whole-file read (no offset, no limit)
     await assertThrows(
       () =>
         hook(
           { tool: "read", sessionID: "s2", callID: "c1" },
-          { args: { filePath: PROJECT_DIR + "/src/lib.rs" } }
+          { args: { filePath } }
         ),
       "Cogito's outline"
     );
-
-    // Nudge file now contains the key, so a repeat should pass
-    $.mock(
-      "cat \"/tmp/cogito-test-project/.cogito/nudges/s2\" 2>/dev/null",
-      "read:src/lib.rs\n",
-      0
-    );
-
-    await assertResolves(() =>
-      hook(
-        { tool: "read", sessionID: "s2", callID: "c2" },
-        { args: { filePath: PROJECT_DIR + "/src/lib.rs" } }
-      )
-    );
   }
 
-  console.log("\n=== Test: tool.execute.before — read with small explicit limit passes ===");
+  console.log("\n=== Test: block=false lets the whole-file read through ===");
 
   {
     const $ = buildShell();
-    // No need to mock cat — the guard should return early before reaching it
+    const filePath = PROJECT_DIR + "/src/lib.rs";
+    const call = {
+      tool: "read",
+      input: { path: filePath },
+      cwd: PROJECT_DIR,
+      session: "s3",
+    };
+    $.mock(guardCommand(call), JSON.stringify({ block: false }), 0);
+
     const plugin = await CogitoPlugin({ directory: PROJECT_DIR, $: $.$ });
     const hook = plugin["tool.execute.before"];
 
     await assertResolves(() =>
       hook(
         { tool: "read", sessionID: "s3", callID: "c1" },
-        { args: { filePath: PROJECT_DIR + "/src/lib.rs", offset: 10, limit: 20 } }
+        { args: { filePath } }
       )
     );
   }
 
-  console.log(
-    "\n=== Test: tool.execute.before — plain-name grep throws with search result ==="
-  );
+  console.log("\n=== Test: a plain-name grep block carries the search reason ===");
 
   {
     const $ = buildShell();
-    $.mock("cogito search \"handle_request\"", SEARCH_OUTPUT, 0);
+    const call = {
+      tool: "grep",
+      input: { pattern: "handle_request" },
+      cwd: PROJECT_DIR,
+      session: "s4",
+    };
     $.mock(
-      "cat \"/tmp/cogito-test-project/.cogito/nudges/s4\" 2>/dev/null",
-      "",
-      1
-    );
-    $.mock("mkdir -p \"/tmp/cogito-test-project/.cogito/nudges\"", "", 0);
-    $.mock(
-      "cat >> \"/tmp/cogito-test-project/.cogito/nudges/s4\" << 'EOF'\ngrep:handle_request::\nEOF",
-      "",
+      guardCommand(call),
+      JSON.stringify({ block: true, reason: SEARCH_REASON }),
       0
     );
 
@@ -290,42 +259,124 @@ async function runTests() {
         ),
       "Cogito's index"
     );
-
-    // Repeat: nudge file now has the key
-    $.mock(
-      "cat \"/tmp/cogito-test-project/.cogito/nudges/s4\" 2>/dev/null",
-      "grep:handle_request::\n",
-      0
-    );
-
-    await assertResolves(() =>
-      hook(
-        { tool: "grep", sessionID: "s4", callID: "c2" },
-        { args: { pattern: "handle_request" } }
-      )
-    );
   }
 
-  console.log(
-    "\n=== Test: tool.execute.before — regex-pattern grep passes without throwing ==="
-  );
+  console.log("\n=== Test: reads and greps forward offset/limit and path/glob ===");
 
   {
     const $ = buildShell();
+    const filePath = PROJECT_DIR + "/src/lib.rs";
+    const readCall = {
+      tool: "read",
+      input: { path: filePath, offset: 10, limit: 20 },
+      cwd: PROJECT_DIR,
+      session: "s5",
+    };
+    $.mock(guardCommand(readCall), JSON.stringify({ block: false }), 0);
+
+    const grepCall = {
+      tool: "grep",
+      input: { pattern: "handle_request", path: "src", glob: "*.rs" },
+      cwd: PROJECT_DIR,
+      session: "s5",
+    };
+    $.mock(guardCommand(grepCall), JSON.stringify({ block: false }), 0);
+
     const plugin = await CogitoPlugin({ directory: PROJECT_DIR, $: $.$ });
     const hook = plugin["tool.execute.before"];
 
     await assertResolves(() =>
       hook(
-        { tool: "grep", sessionID: "s5", callID: "c1" },
-        { args: { pattern: "fn\\s+\\w+" } }
+        { tool: "read", sessionID: "s5", callID: "c1" },
+        { args: { filePath, offset: 10, limit: 20 } }
+      )
+    );
+    await assertResolves(() =>
+      hook(
+        { tool: "grep", sessionID: "s5", callID: "c2" },
+        { args: { pattern: "handle_request", path: "src", glob: "*.rs" } }
       )
     );
   }
 
-  console.log(
-    "\n=== Test: hooks do not reject when cogito is unavailable ==="
-  );
+  console.log("\n=== Test: a cogito error lets the call through ===");
+
+  {
+    const $ = buildShell();
+    const filePath = PROJECT_DIR + "/src/lib.rs";
+    const call = {
+      tool: "read",
+      input: { path: filePath },
+      cwd: PROJECT_DIR,
+      session: "s6",
+    };
+    // Non-zero exit with empty stdout, as a missing/broken binary gives.
+    $.mock(guardCommand(call), "", 127);
+
+    const plugin = await CogitoPlugin({ directory: PROJECT_DIR, $: $.$ });
+    const hook = plugin["tool.execute.before"];
+
+    await assertResolves(() =>
+      hook(
+        { tool: "read", sessionID: "s6", callID: "c1" },
+        { args: { filePath } }
+      )
+    );
+  }
+
+  console.log("\n=== Test: unparseable cogito output lets the call through ===");
+
+  {
+    const $ = buildShell();
+    const filePath = PROJECT_DIR + "/src/lib.rs";
+    const call = {
+      tool: "read",
+      input: { path: filePath },
+      cwd: PROJECT_DIR,
+      session: "s7",
+    };
+    $.mock(guardCommand(call), "not json", 0);
+
+    const plugin = await CogitoPlugin({ directory: PROJECT_DIR, $: $.$ });
+    const hook = plugin["tool.execute.before"];
+
+    await assertResolves(() =>
+      hook(
+        { tool: "read", sessionID: "s7", callID: "c1" },
+        { args: { filePath } }
+      )
+    );
+  }
+
+  console.log("\n=== Test: a read outside the project never reaches cogito guard ===");
+
+  {
+    const $ = buildShell();
+    // If the plugin forwarded this, the answer would block it.
+    const outsideCall = {
+      tool: "read",
+      input: { path: "/tmp/elsewhere/lib.rs" },
+      cwd: PROJECT_DIR,
+      session: "s8",
+    };
+    $.mock(
+      guardCommand(outsideCall),
+      JSON.stringify({ block: true, reason: OUTLINE_REASON }),
+      0
+    );
+
+    const plugin = await CogitoPlugin({ directory: PROJECT_DIR, $: $.$ });
+    const hook = plugin["tool.execute.before"];
+
+    await assertResolves(() =>
+      hook(
+        { tool: "read", sessionID: "s8", callID: "c1" },
+        { args: { filePath: "/tmp/elsewhere/lib.rs" } }
+      )
+    );
+  }
+
+  console.log("\n=== Test: hooks do not reject when cogito is unavailable ===");
 
   {
     // $ that always returns non-zero and empty stdout
@@ -341,19 +392,19 @@ async function runTests() {
 
     // system transform
     const sysHook = plugin["experimental.chat.system.transform"];
-    await assertResolves(() => sysHook({ sessionID: "s6", model: {} }, { system: [] }));
+    await assertResolves(() => sysHook({ sessionID: "s9", model: {} }, { system: [] }));
 
     // tool.execute.before
     const toolHook = plugin["tool.execute.before"];
     await assertResolves(() =>
       toolHook(
-        { tool: "read", sessionID: "s6", callID: "c1" },
+        { tool: "read", sessionID: "s9", callID: "c1" },
         { args: { filePath: PROJECT_DIR + "/src/lib.rs" } }
       )
     );
     await assertResolves(() =>
       toolHook(
-        { tool: "grep", sessionID: "s6", callID: "c2" },
+        { tool: "grep", sessionID: "s9", callID: "c2" },
         { args: { pattern: "something" } }
       )
     );
