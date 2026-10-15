@@ -1,0 +1,38 @@
+{
+  "model": "jinaai/jina-embeddings-v2-base-code",
+  "size": {
+    "model": "jinaai/jina-embeddings-v2-base-code",
+    "cache_subdir": "/home/tecnodespegue/.cache/cogito-embeddings-prototype/hub/models--jinaai--jina-embeddings-v2-base-code",
+    "cache_subdir_name": "models--jinaai--jina-embeddings-v2-base-code",
+    "size_bytes": 646648113,
+    "size_mb": 616.69
+  },
+  "load_seconds": 0.572,
+  "index": {
+    "files_indexed": 1000,
+    "files_skipped": 0,
+    "dim": 768,
+    "batch_size": 4,
+    "index_seconds": 402.45,
+    "files_per_second": 2.48,
+    "ms_per_file": 402.45
+  },
+  "query": {
+    "queries_run": 153,
+    "warmup_queries": 1,
+    "rounds": 3,
+    "min_ms": 15.214,
+    "p50_ms": 15.698,
+    "p95_ms": 16.027,
+    "p99_ms": 16.682,
+    "max_ms": 17.277,
+    "mean_ms": 15.7
+  },
+  "corpus_roots": [
+    "/home/tecnodespegue/.cargo/registry/src",
+    "/home/tecnodespegue/proyectos/cogito"
+  ],
+  "corpus_file_count_discovered": 10260,
+  "max_doc_bytes": 4000,
+  "batch_size": 4
+}
