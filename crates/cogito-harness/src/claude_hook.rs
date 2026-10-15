@@ -76,6 +76,61 @@ pub async fn decide(event: &Value) -> anyhow::Result<Option<String>> {
     Ok(Some(message))
 }
 
+/// The agent-neutral entry point behind `cogito guard`. Reads one call from
+/// stdin as `{"tool": "read" | "grep", "input": {...}, "cwd": "...", "session": "..."}`
+/// and prints `{"block": bool, "reason": "..."}`. It always exits 0: a guard
+/// that fails must never cost the agent a tool call.
+pub async fn run_guard() -> ! {
+    let mut input = String::new();
+    let reason = match std::io::stdin().read_to_string(&mut input) {
+        Ok(_) => match serde_json::from_str::<Value>(&input) {
+            Ok(call) => guard_decision(&call).await.ok().flatten(),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    let answer = match reason {
+        Some(reason) => serde_json::json!({ "block": true, "reason": reason }),
+        None => serde_json::json!({ "block": false }),
+    };
+    println!("{answer}");
+    std::process::exit(0)
+}
+
+/// Map an agent-neutral call onto the Claude Code event `decide` reads.
+async fn guard_decision(call: &Value) -> anyhow::Result<Option<String>> {
+    let cwd = call["cwd"].as_str().unwrap_or_default();
+    let session = call["session"].as_str().unwrap_or("default");
+    let input = &call["input"];
+    let event = match call["tool"].as_str().unwrap_or_default() {
+        "read" => {
+            let Some(path) = input["path"].as_str().or(input["file_path"].as_str()) else {
+                return Ok(None);
+            };
+            // Relative paths are relative to the project, as the agent meant them.
+            let file = Path::new(cwd).join(path);
+            serde_json::json!({
+                "tool_name": "Read",
+                "session_id": session,
+                "cwd": cwd,
+                "tool_input": {
+                    "file_path": file.display().to_string(),
+                    "offset": input["offset"],
+                    "limit": input["limit"],
+                },
+            })
+        }
+        "grep" => serde_json::json!({
+            "tool_name": "Grep",
+            "session_id": session,
+            "cwd": cwd,
+            "tool_input": input,
+        }),
+        _ => return Ok(None),
+    };
+    decide(&event).await
+}
+
 /// The project the session runs in, if it looks like one.
 fn project_root(event: &Value) -> Option<PathBuf> {
     let dir = std::env::var_os("CLAUDE_PROJECT_DIR")
@@ -452,5 +507,68 @@ mod tests {
         let loaded = ReadState::load(dir.path(), "s1");
         assert_eq!(loaded.0, state.0);
         assert!(ReadState::load(dir.path(), "other").0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_guard_resolves_relative_paths_and_turns_repeats_away() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@t")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@t")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        let body: String = (0..300)
+            .map(|i| format!("export function fn{i}(x: number) {{ return x + {i}; }}\n"))
+            .collect();
+        std::fs::write(root.join("big.ts"), body).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let call = |tool: &str, input: Value| {
+            serde_json::json!({
+                "tool": tool,
+                "session": "guard-test",
+                "cwd": root.display().to_string(),
+                "input": input,
+            })
+        };
+        let read = call("read", serde_json::json!({ "path": "big.ts" }));
+        assert!(
+            guard_decision(&read).await.unwrap().is_some(),
+            "outline first"
+        );
+        assert!(
+            guard_decision(&read).await.unwrap().is_none(),
+            "full text delivered"
+        );
+        assert!(
+            guard_decision(&read).await.unwrap().is_some(),
+            "unchanged repeat"
+        );
+
+        let ranged = call(
+            "read",
+            serde_json::json!({ "path": "big.ts", "offset": 10, "limit": 20 }),
+        );
+        assert!(
+            guard_decision(&ranged).await.unwrap().is_none(),
+            "ranges pass"
+        );
+        let other = call("bash", serde_json::json!({ "command": "ls" }));
+        assert!(
+            guard_decision(&other).await.unwrap().is_none(),
+            "other tools pass"
+        );
     }
 }

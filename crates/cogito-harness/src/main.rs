@@ -104,6 +104,12 @@ enum Commands {
         name: String,
     },
 
+    /// Decide one tool call for any agent: a call as JSON on stdin, the decision
+    /// as JSON on stdout. Agents without Claude Code's hook protocol call this
+    /// from their own extension.
+    #[command(hide = true)]
+    Guard,
+
     /// Print the project map an agent gets from the `project_map` tool
     Map {
         /// Rescan even if the stored map is current
@@ -191,7 +197,11 @@ fn setup_logging(verbose: bool, quiet: bool) {
 async fn main() -> Result<()> {
     let args = Args::parse();
     // A hook's stderr is shown to the model, so hooks log nothing.
-    let quiet = args.quiet || matches!(args.command, Some(Commands::Hook { .. }));
+    let quiet = args.quiet
+        || matches!(
+            args.command,
+            Some(Commands::Hook { .. }) | Some(Commands::Guard)
+        );
     setup_logging(args.verbose, quiet);
 
     match args.command {
@@ -201,6 +211,7 @@ async fn main() -> Result<()> {
             // An unknown hook must never block the agent.
             _ => std::process::exit(0),
         },
+        Some(Commands::Guard) => claude_hook::run_guard().await,
         Some(Commands::Scan) => commands::scan().await?,
         Some(Commands::Fingerprint { verbose }) => commands::fingerprint(verbose).await?,
         Some(Commands::Project { subcommand }) => {
