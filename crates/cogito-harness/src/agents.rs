@@ -345,7 +345,9 @@ const CLAUDE_GUARD_SCRIPT: &str = r#"#!/bin/sh
 #
 # The first time Claude reads a large file whole, or greps for a plain name,
 # it gets Cogito's outline or search result instead (exit 2, message on
-# stderr). Repeating the exact same call goes through. Any problem exits 0, so
+# stderr). Repeating the exact same Grep goes through. A whole read of a file that
+# has not changed since it was read in full gets the outline again, twice, then
+# goes through. Any problem exits 0, so
 # a tool call is never blocked by accident.
 
 command -v cogito >/dev/null 2>&1 || exit 0
