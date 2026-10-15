@@ -1,0 +1,11 @@
+{
+  "manifest_version": "1.0",
+  "repos": [
+    {
+      "name": "ky",
+      "url": "https://github.com/sindresorhus/ky",
+      "commit": "3541888878c4d303a8bc2ad61815f4e048f55a5d",
+      "terms": ["retry", "hooks", "headers", "timeout"]
+    }
+  ]
+}
