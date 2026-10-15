@@ -61,6 +61,9 @@ pub async fn decide(event: &Value) -> anyhow::Result<Option<String>> {
     if tool == "Read" {
         return read_guard(&root, session, input).await;
     }
+    if tool == "Bash" {
+        return bash_read_guard(&root, session, input).await;
+    }
     let (key, message) = match tool {
         "Grep" => match grep_nudge(&root, input).await? {
             Some(found) => found,
@@ -126,6 +129,12 @@ async fn guard_decision(call: &Value) -> anyhow::Result<Option<String>> {
             "cwd": cwd,
             "tool_input": input,
         }),
+        "bash" => serde_json::json!({
+            "tool_name": "Bash",
+            "session_id": session,
+            "cwd": cwd,
+            "tool_input": input,
+        }),
         _ => return Ok(None),
     };
     decide(&event).await
@@ -151,7 +160,40 @@ async fn read_guard(root: &Path, session: &str, input: &Value) -> anyhow::Result
     if !whole {
         return Ok(None);
     }
-    let file = PathBuf::from(path);
+    whole_file_read_guard(root, session, Path::new(path)).await
+}
+
+/// What a whole-file Bash read gets: parse the command, apply the same rule as
+/// `Read`. Anything we are not sure about (pipes, redirects, multiple commands,
+/// unknown commands, etc.) returns `Ok(None)` so the call goes through.
+async fn bash_read_guard(
+    root: &Path,
+    session: &str,
+    input: &Value,
+) -> anyhow::Result<Option<String>> {
+    let Some(command) = input["command"].as_str() else {
+        return Ok(None);
+    };
+    let Some(path) = parse_bash_read(command) else {
+        return Ok(None);
+    };
+    whole_file_read_guard(root, session, &path).await
+}
+
+/// The rule that backs both `Read` and the `Bash` whole-file read detector.
+/// Given an absolute path, decide whether to show the outline, the unchanged
+/// message, or let the read through. Anything outside the project, unreadable,
+/// too small, or without declarations passes.
+async fn whole_file_read_guard(
+    root: &Path,
+    session: &str,
+    file: &Path,
+) -> anyhow::Result<Option<String>> {
+    let file = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        root.join(file)
+    };
     let Ok(rel) = file.strip_prefix(root).map(Path::to_path_buf) else {
         return Ok(None); // outside the project
     };
@@ -194,6 +236,139 @@ async fn read_guard(root: &Path, session: &str, input: &Value) -> anyhow::Result
             )))
         }
     }
+}
+
+/// Detect a single, simple Bash command that reads a file whole. Returns the
+/// file path when the command is `cat FILE`, `nl FILE`, `sed -n '1,$p' FILE`,
+/// `head -n N FILE` with N larger than `WHOLE_READ_LIMIT`, or the symmetric
+/// `tail`. Anything we are not sure about (pipes, redirects, multiple commands,
+/// a small `-n`, a ranged `sed`) returns `None` so the call goes through.
+fn parse_bash_read(command: &str) -> Option<PathBuf> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Reject anything that can change which bytes the agent sees: pipes,
+    // redirects, command substitution, chaining, newlines, escapes. Bare `$`
+    // (sed range end, positional args) is allowed; only the substitution
+    // forms `$(` and `${` are rejected. `str::contains(&[char])` matches the
+    // chars as a sequence, not a class, so check substring patterns instead.
+    const UNSAFE_PATTERNS: &[&str] = &["|", ">", "<", ";", "&", "`", "$(", "${", "\\", "\n", "\t"];
+    if UNSAFE_PATTERNS.iter().any(|p| trimmed.contains(p)) {
+        return None;
+    }
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    match tokens.first().copied()? {
+        "cat" => parse_simple_one_arg(&tokens, "cat"),
+        "nl" => parse_simple_one_arg(&tokens, "nl"),
+        "head" => parse_head_tail(&tokens, false),
+        "tail" => parse_head_tail(&tokens, true),
+        "sed" => parse_sed(&tokens),
+        _ => None,
+    }
+}
+
+/// `cat FILE` or `nl FILE`: a single positional argument that is a path. Any
+/// other shape (multiple files, flags) does not match, so the call passes.
+fn parse_simple_one_arg(tokens: &[&str], cmd: &str) -> Option<PathBuf> {
+    if tokens.len() != 2 {
+        return None;
+    }
+    // `cat` and `nl` accept no flags relevant to whole-file reading; an
+    // explicit flag means the caller wanted something we are not modelling.
+    if tokens[1].starts_with('-') {
+        return None;
+    }
+    if cmd == "nl" && tokens[1] == "--" {
+        return None;
+    }
+    Some(PathBuf::from(tokens[1]))
+}
+
+/// `head -n N FILE` (or `tail`): an explicit `-n` whose `N` is a small
+/// positive integer is always a range and passes; `N` larger than
+/// `WHOLE_READ_LIMIT` is treated as a whole-file read. No `-n` at all means
+/// the default of 10 lines, which is a small range. Anything else passes.
+fn parse_head_tail(tokens: &[&str], _is_tail: bool) -> Option<PathBuf> {
+    let mut i = 1;
+    let mut has_n_flag = false;
+    while i < tokens.len() {
+        let t = tokens[i];
+        if t == "--" {
+            i += 1;
+            break;
+        }
+        if t == "-n" {
+            let n = tokens.get(i + 1)?.parse::<u64>().ok()?;
+            if n <= WHOLE_READ_LIMIT {
+                return None;
+            }
+            has_n_flag = true;
+            i += 2;
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("-n") {
+            let n = rest.parse::<u64>().ok()?;
+            if n <= WHOLE_READ_LIMIT {
+                return None;
+            }
+            has_n_flag = true;
+            i += 1;
+            continue;
+        }
+        if t.starts_with('-') {
+            // Any other flag (`-c`, `--bytes`, `-q`, ...) is something we are
+            // not modelling; let the call run.
+            return None;
+        }
+        // First non-flag token is the file. Anything else means multiple paths
+        // or shell substitution we did not catch: pass.
+        let path = PathBuf::from(t);
+        if i + 1 != tokens.len() {
+            return None;
+        }
+        if !has_n_flag {
+            // No `-n` at all: `head FILE` / `tail FILE` default to 10 lines,
+            // which is a small range. Pass.
+            return None;
+        }
+        return Some(path);
+    }
+    if i == tokens.len() && has_n_flag {
+        // `head -n 5000` with no path: pass through.
+        return None;
+    }
+    None
+}
+
+/// `sed -n '1,$p' FILE` (or `1,$p` without quotes). The `1,$` range means
+/// "from the first to the last line", i.e. the whole file. Any other range
+/// (start after 1, end before `$`) passes. No `-n` means sed prints every
+/// line by default; we still only guard the explicit whole-file shape.
+fn parse_sed(tokens: &[&str]) -> Option<PathBuf> {
+    if tokens.get(1) != Some(&"-n") {
+        return None;
+    }
+    let range = tokens.get(2)?;
+    let stripped = range.trim_matches(|c| c == '\'' || c == '"').trim();
+    // `1,$p` or `1,$ p` (sed accepts the space). Strip trailing whitespace and
+    // an optional trailing `p` from a print command.
+    let range = stripped.split_whitespace().next()?.trim_end_matches('p');
+    let mut parts = range.split(',');
+    let start = parts.next()?;
+    let end = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if start != "1" || end != "$" {
+        return None;
+    }
+    let path = tokens.get(3)?;
+    if tokens.get(4).is_some() {
+        return None;
+    }
+    Some(PathBuf::from(*path))
 }
 
 /// The declaration outline of one project file, from the index when it has one.
@@ -570,5 +745,226 @@ mod tests {
             guard_decision(&other).await.unwrap().is_none(),
             "other tools pass"
         );
+    }
+
+    #[test]
+    fn test_parse_bash_read_detects_one_command_per_reader() {
+        assert_eq!(parse_bash_read("cat big.ts"), Some(PathBuf::from("big.ts")));
+        assert_eq!(parse_bash_read("nl big.ts"), Some(PathBuf::from("big.ts")));
+        assert_eq!(
+            parse_bash_read("head -n 500 big.ts"),
+            Some(PathBuf::from("big.ts"))
+        );
+        assert_eq!(
+            parse_bash_read("tail -n500 big.ts"),
+            Some(PathBuf::from("big.ts"))
+        );
+        assert_eq!(
+            parse_bash_read("sed -n '1,$p' big.ts"),
+            Some(PathBuf::from("big.ts"))
+        );
+        assert_eq!(
+            parse_bash_read("sed -n 1,$p big.ts"),
+            Some(PathBuf::from("big.ts"))
+        );
+    }
+
+    #[test]
+    fn test_parse_bash_read_lets_explicit_ranges_pass() {
+        // Head, tail with a small -n is a range; sed with anything other than
+        // 1,$ is a range.
+        assert_eq!(parse_bash_read("head -n 20 big.ts"), None);
+        assert_eq!(parse_bash_read("head -n20 big.ts"), None);
+        assert_eq!(parse_bash_read("tail -n 20 big.ts"), None);
+        assert_eq!(parse_bash_read("sed -n '10,30p' big.ts"), None);
+        assert_eq!(parse_bash_read("sed -n '2,$p' big.ts"), None);
+        assert_eq!(parse_bash_read("sed -n '1,30p' big.ts"), None);
+    }
+
+    #[test]
+    fn test_parse_bash_read_lets_non_read_commands_pass() {
+        assert_eq!(parse_bash_read("ls"), None);
+        assert_eq!(parse_bash_read("git status"), None);
+        assert_eq!(parse_bash_read("grep -r foo"), None);
+        assert_eq!(parse_bash_read("cargo test"), None);
+        assert_eq!(parse_bash_read("echo hello"), None);
+    }
+
+    #[test]
+    fn test_parse_bash_read_rejects_anything_that_can_change_the_bytes() {
+        // Pipes, redirects, command substitution, chaining, newlines.
+        assert_eq!(parse_bash_read("cat big.ts | head"), None);
+        assert_eq!(parse_bash_read("cat big.ts > out.txt"), None);
+        assert_eq!(parse_bash_read("cat big.ts < big.ts"), None);
+        assert_eq!(parse_bash_read("cat $(echo big.ts)"), None);
+        assert_eq!(parse_bash_read("cat `echo big.ts`"), None);
+        assert_eq!(parse_bash_read("rm big.ts; cat big.ts"), None);
+        assert_eq!(parse_bash_read("cat big.ts && echo done"), None);
+        assert_eq!(parse_bash_read("cat big.ts\nhead big.ts"), None);
+        assert_eq!(parse_bash_read("cat \\big.ts"), None);
+    }
+
+    #[test]
+    fn test_parse_bash_read_rejects_extra_arguments_and_flags() {
+        // Two files, or a flag we do not model, or a -n without a number.
+        assert_eq!(parse_bash_read("cat a.ts b.ts"), None);
+        assert_eq!(parse_bash_read("nl a.ts b.ts"), None);
+        assert_eq!(parse_bash_read("cat -n big.ts"), None);
+        assert_eq!(parse_bash_read("head -c 100 big.ts"), None);
+        assert_eq!(parse_bash_read("head -n big.ts"), None);
+        assert_eq!(parse_bash_read("sed -n '1,$p' big.ts extra"), None);
+        assert_eq!(parse_bash_read("sed -n '10,30p' big.ts"), None);
+    }
+
+    #[test]
+    fn test_parse_bash_read_keeps_quoted_paths() {
+        // Quotes are stripped only on the sed range; the path itself stays as
+        // written. The downstream code joins it with the project root.
+        assert_eq!(
+            parse_bash_read("cat 'src/big.ts'"),
+            Some(PathBuf::from("'src/big.ts'"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bash_read_guard_uses_the_same_outline_state_as_read() {
+        // A bash `cat` and a Read on the same file share the read state: the
+        // first call shows the outline, the second goes through, the third is
+        // the unchanged message. This is the rule the task asks for, exercised
+        // through Bash.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@t")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@t")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        let body: String = (0..300)
+            .map(|i| format!("export function fn{i}(x: number) {{ return x + {i}; }}\n"))
+            .collect();
+        std::fs::write(root.join("big.ts"), body).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let call = |tool: &str, input: Value| {
+            serde_json::json!({
+                "tool": tool,
+                "session": "guard-bash",
+                "cwd": root.display().to_string(),
+                "input": input,
+            })
+        };
+
+        let bash_cat = call("bash", serde_json::json!({ "command": "cat big.ts" }));
+        assert!(
+            guard_decision(&bash_cat).await.unwrap().is_some(),
+            "cat triggers outline first"
+        );
+        assert!(
+            guard_decision(&bash_cat).await.unwrap().is_none(),
+            "second cat goes through"
+        );
+        assert!(
+            guard_decision(&bash_cat).await.unwrap().is_some(),
+            "third cat shows unchanged"
+        );
+
+        let bash_head = call(
+            "bash",
+            serde_json::json!({ "command": "head -n 500 big.ts" }),
+        );
+        assert!(
+            guard_decision(&bash_head).await.unwrap().is_some(),
+            "head -n 500 sees the same unchanged message (state shared)"
+        );
+
+        let bash_nl = call("bash", serde_json::json!({ "command": "nl big.ts" }));
+        assert!(
+            guard_decision(&bash_nl).await.unwrap().is_none(),
+            "after MAX_UNCHANGED_BLOCKS the read goes through"
+        );
+
+        let bash_ranged = call(
+            "bash",
+            serde_json::json!({ "command": "head -n 20 big.ts" }),
+        );
+        assert!(
+            guard_decision(&bash_ranged).await.unwrap().is_none(),
+            "explicit small -n passes"
+        );
+        let bash_sed_ranged = call(
+            "bash",
+            serde_json::json!({ "command": "sed -n '10,30p' big.ts" }),
+        );
+        assert!(
+            guard_decision(&bash_sed_ranged).await.unwrap().is_none(),
+            "explicit sed range passes"
+        );
+        let bash_ls = call("bash", serde_json::json!({ "command": "ls" }));
+        assert!(
+            guard_decision(&bash_ls).await.unwrap().is_none(),
+            "non-read commands pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bash_read_guard_lets_small_and_out_of_project_files_pass() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@t")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@t")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("small.ts"), "export const x = 1;\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let call = |command: &str| {
+            serde_json::json!({
+                "tool": "bash",
+                "session": "guard-bash-small",
+                "cwd": root.display().to_string(),
+                "input": { "command": command },
+            })
+        };
+        assert!(
+            guard_decision(&call("cat small.ts"))
+                .await
+                .unwrap()
+                .is_none(),
+            "short file passes"
+        );
+
+        let outside = "/tmp/cogito-not-in-project.ts";
+        std::fs::write(outside, "export const x = 1;\n").unwrap();
+        assert!(
+            guard_decision(&call(&format!("cat {outside}")))
+                .await
+                .unwrap()
+                .is_none(),
+            "out-of-project file passes"
+        );
+        let _ = std::fs::remove_file(outside);
     }
 }

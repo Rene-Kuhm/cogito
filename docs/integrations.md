@@ -105,8 +105,14 @@ Four files:
   file is read in full. Ranged reads and regex greps are never touched, and any
   error lets the call through. The decision logic is in `cogito hook
   claude-pre-tool-use`; the script only hands it Claude Code's JSON.
+- Whole-file reads done through `Bash` (`cat FILE`, `nl FILE`,
+  `sed -n '1,$p' FILE`, `head -n N FILE` with `N` larger than the read limit)
+  go through the same guardrail as `Read` and share its per-session state: a
+  `cat` after a `Read` of the same file is not delivered again, and an explicit
+  range (`head -n 20`, `sed -n '10,30p'`) is never touched. Pipes, redirects,
+  multiple commands and other shells built-ins (`ls`, `git`, `grep`) pass.
 - `~/.claude/settings.json` gets a `SessionStart` entry for the card and a
-  `PreToolUse` entry (matcher `^(Read|Grep)$`) for the guardrail, both
+  `PreToolUse` entry (matcher `^(Read|Grep|Bash)$`) for the guardrail, both
   synchronous (an `async` hook's output never reaches the session; `cogito
   setup` repairs entries written that way by older versions).
 
