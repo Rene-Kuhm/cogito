@@ -1018,6 +1018,23 @@ pub fn imports(conn: &Connection, project_id: Uuid, path: &Path) -> Result<Vec<S
     Ok(set.into_iter().collect())
 }
 
+/// All files that declare a symbol with this exact name.
+///
+/// Names, not references: the index holds declarations and the import graph,
+/// so a caller asking "who uses this symbol" can only be told who declares the
+/// same name. Results are deduplicated and deterministically ordered.
+pub fn files_declaring(conn: &Connection, project_id: Uuid, name: &str) -> Result<Vec<PathBuf>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT DISTINCT path FROM indexed_symbols
+           WHERE project_id = ?1 AND name = ?2 ORDER BY path"#,
+    )?;
+    let rows = stmt.query_map(params![project_id.to_string(), name], |row| {
+        Ok(PathBuf::from(row.get::<_, String>(0)?))
+    })?;
+    let result: Result<Vec<_>, _> = rows.collect();
+    Ok(result?)
+}
+
 /// All files that import the given path (by resolved path or spec).
 /// Results are deduplicated and deterministically ordered.
 pub fn importers(conn: &Connection, project_id: Uuid, path: &Path) -> Result<Vec<PathBuf>> {

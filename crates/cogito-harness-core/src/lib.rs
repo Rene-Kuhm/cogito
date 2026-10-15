@@ -23,6 +23,7 @@
 //! ```
 
 pub mod fingerprint;
+pub mod impact;
 pub mod index;
 pub mod map;
 pub mod pack;

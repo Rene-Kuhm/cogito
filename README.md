@@ -2,7 +2,7 @@
 
 **Intelligent context harness for AI coding agents.**
 
-Cogito gives AI coding agents the project context they need — structure, symbols, references — without sending the entire codebase. It indexes files and declarations with tree-sitter, keeps an incremental SQLite/FTS5 store in sync with the working tree, and exposes five MCP tools (`context_pack`, `project_map`, `search_code`, `file_outline`, `related_files`) that agents can call on demand. Token savings on benchmark: 89.8% on ripgrep and bat — from 743,440 tokens to 75,961 over eight search terms.
+Cogito gives AI coding agents the project context they need — structure, symbols, references — without sending the entire codebase. It indexes files and declarations with tree-sitter, keeps an incremental SQLite/FTS5 store in sync with the working tree, and exposes six MCP tools (`context_pack`, `project_map`, `search_code`, `file_outline`, `related_files`, `impact`) that agents can call on demand. Token savings on benchmark: 89.8% on ripgrep and bat — from 743,440 tokens to 75,961 over eight search terms.
 
 **Storage**: SQLite with FTS5 full-text index over files and symbols. Incremental sync: a new uncommitted file is visible without a commit or a manual refresh.
 
@@ -215,8 +215,16 @@ On ripgrep and bat combined: 743,440 → 75,961 tokens (89.8% savings).
 cogito mcp
 ```
 
-Five tools: `context_pack`, `project_map`, `search_code`, `file_outline`,
-`related_files`. Each tool takes an explicit `path` to the project root.
+Six tools: `context_pack`, `project_map`, `search_code`, `file_outline`,
+`related_files`, `impact`. Each tool takes an explicit `path` to the project root.
+
+`impact` answers before a commit. It reads the diff — the uncommitted changes by
+default, or `base..HEAD` when given a revision — maps its hunks onto the
+outline's line ranges, and names the declarations they touch, the files that
+import the changed files and the files that declare those symbol names. Its
+risk level comes only from the importer count, and it says so: the answer is an
+overapproximation, because the import graph and the declaration names come from
+the index, which holds no calls or type references.
 
 `context_pack` is the one to start with when you know what you are about to do:
 give it the task in your own words and it returns the fragments that matter,

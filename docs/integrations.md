@@ -207,7 +207,7 @@ Any MCP-capable client works if you add the server yourself:
 }
 ```
 
-Cogito exposes five tools, each taking an explicit `path` to the project root:
+Cogito exposes six tools, each taking an explicit `path` to the project root:
 
 | Tool | Purpose |
 |---|---|
@@ -216,6 +216,7 @@ Cogito exposes five tools, each taking an explicit `path` to the project root:
 | `related_files` | What one file imports, what imports it, and its external packages |
 | `search_code` | Find code by words: symbols (functions, types, classes) with `file:line`, file paths, module names and doc sections |
 | `file_outline` | A file's declarations (code) or sections (Markdown) with line ranges, so only the needed range is read |
+| `impact` | What a diff reaches: the declarations its hunks touch, the files that import the changed files and the files that declare those symbol names, with a risk level from the importer count. An overapproximation by design |
 
 The map is stored after each scan and reused until `HEAD` moves, so these calls
 read no source files. Documentation is indexed too: `search_code` finds
