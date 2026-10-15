@@ -55,6 +55,9 @@ Two halves, both written by setup:
 1. **`npm:cogito-harness`** in `settings.json` — a Pi package. On
    `session_start` it scans the project in the background and sets a status
    line, and it adds `/cogito` with `status`, `map`, `scan`, `stats` and `doctor`.
+   It also guards whole-file reads and plain-name greps: it hands the call to
+   `cogito guard` and returns the block the guard answers with, so Pi and
+   Claude Code share one decision rule.
 
    ```
    /cogito status
@@ -276,7 +279,7 @@ Telescope over `cogito map --json`, or an MCP client such as
 
 | Editor / Agent | MCP | Session-start card | Read/grep guardrail | `AGENTS.md` block |
 |---|---|---|---|---|
-| Gentle Shell (pi) | ✅ direct | ✅ | — | — |
+| Gentle Shell (pi) | ✅ direct | ✅ | ✅ | — |
 | Claude Code | ✅ | ✅ | ✅ | — |
 | opencode | ✅ | ✅ | ✅ | ✅ |
 | Codex | ✅ | — | — | ✅ |
