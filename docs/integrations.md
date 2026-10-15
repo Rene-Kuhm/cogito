@@ -97,7 +97,9 @@ Four files:
   `Grep`. The first time Claude reads a file of 250+ lines whole, the call is
   blocked and Claude gets the file's outline instead; the first time it greps
   for a plain name, it gets Cogito's search result. Repeating the exact same
-  call runs normally, ranged reads and regex greps are never touched, and any
+  Grep runs normally. A whole read of a file that has not changed since its
+  full text was delivered gets the outline again, twice, then runs; a changed
+  file is read in full. Ranged reads and regex greps are never touched, and any
   error lets the call through. The decision logic is in `cogito hook
   claude-pre-tool-use`; the script only hands it Claude Code's JSON.
 - `~/.claude/settings.json` gets a `SessionStart` entry for the card and a
