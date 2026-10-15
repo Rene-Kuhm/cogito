@@ -88,7 +88,7 @@ fn default_pack_budget() -> usize {
 /// recall harness can measure alternatives through the real tool rather than
 /// through a reimplementation of it; unset or malformed means the default, so
 /// shipped behaviour only changes when someone deliberately asks.
-fn tier_weights() -> cogito_harness_core::pack::TierWeights {
+pub(crate) fn tier_weights() -> cogito_harness_core::pack::TierWeights {
     std::env::var("COGITO_PACK_TIERS")
         .ok()
         .and_then(|spec| cogito_harness_core::pack::TierWeights::parse(&spec))
