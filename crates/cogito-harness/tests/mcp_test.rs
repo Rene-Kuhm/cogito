@@ -539,7 +539,9 @@ fn git(dir: &std::path::Path, args: &[&str]) {
 /// declares the same symbol name without importing anything.
 ///
 /// `src/unrelated.ts` is the negative control: nothing links it to a change in
-/// `src/core.ts`, so it must never appear in the affected set.
+/// `src/core.ts`, so it must never appear in the affected set. So is
+/// `src/duplicate.ts`: declaring the same name is not a reference, and the
+/// reference edges only link a use reached through an import edge.
 fn impact_workspace() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();
@@ -561,7 +563,7 @@ fn impact_workspace() -> tempfile::TempDir {
         "src/other.ts",
         "import { computeValue } from './core';\n\nexport function otherValue(): number {\n  return computeValue(2);\n}\n",
     );
-    // Declares the same name, imports nothing: only the symbol lookup can see it.
+    // Declares the same name, imports nothing: a name match, never a reference.
     write(
         "src/duplicate.ts",
         "export function computeValue(): number {\n  return 0;\n}\n",
@@ -635,9 +637,26 @@ fn test_mcp_impact_reports_the_exact_affected_set() {
     );
     assert_eq!(
         affected_paths(&text),
-        ["src/consumer.ts", "src/duplicate.ts", "src/other.ts"],
-        "the affected set is exactly the two importers plus the file that \
-         declares the same symbol name; the negative control is absent:\n{text}"
+        ["src/consumer.ts", "src/other.ts"],
+        "the affected set is exactly the two importing users: the homonym \
+         declaration and the negative control are absent:\n{text}"
+    );
+    assert!(
+        text.contains("Reference edges (2):"),
+        "the reference edges are listed:\n{text}"
+    );
+    assert!(
+        text.contains("src/consumer.ts → src/core.ts: uses computeValue")
+            && text.contains("src/other.ts → src/core.ts: uses computeValue"),
+        "each edge names the user, the declaring file and the name:\n{text}"
+    );
+    assert!(
+        !text.contains("src/duplicate.ts"),
+        "declaring the same name is not a reference:\n{text}"
+    );
+    assert!(
+        !text.contains("not supported"),
+        "TypeScript is resolved, never excused:\n{text}"
     );
     assert!(
         text.contains("Risk: medium · 2 files import a changed file"),
@@ -662,8 +681,12 @@ fn test_mcp_impact_reports_the_exact_affected_set() {
     );
     assert_eq!(
         affected_paths(&text),
-        ["src/consumer.ts", "src/duplicate.ts", "src/other.ts"],
+        ["src/consumer.ts", "src/other.ts"],
         "the uncommitted diff reaches the same files:\n{text}"
+    );
+    assert!(
+        text.contains("Reference edges (2):"),
+        "and the same reference edges:\n{text}"
     );
     assert!(
         !text.contains("no declarations touched"),
@@ -721,7 +744,58 @@ fn test_mcp_impact_says_when_only_a_comment_changed() {
         "the importers of the changed file are still listed:\n{text}"
     );
     assert!(
+        text.contains("Reference edges: none."),
+        "no declaration is touched, so there is no reference to resolve:\n{text}"
+    );
+    assert!(
         text.contains("Risk: medium · 2 files import a changed file"),
         "the risk stays the importer count even with no declaration touched:\n{text}"
+    );
+}
+
+/// A project whose only changed file is Python, a language v1 does not resolve
+/// reference edges for.
+#[test]
+fn test_mcp_impact_says_not_supported_for_a_language_v1_does_not_resolve() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/helper.py"), "def thing():\n    return 1\n").unwrap();
+    std::fs::write(
+        root.join("src/app.py"),
+        "from helper import thing\n\ndef run():\n    return thing()\n",
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "initial"]);
+
+    std::fs::write(
+        root.join("src/app.py"),
+        "from helper import thing\n\ndef run():\n    return thing() + thing()\n",
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "change"]);
+
+    let path = root.display().to_string();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    let ready = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"impact","arguments":{{"path":"{path}","base":"HEAD~1"}}}}}}"#
+    );
+
+    let text = tool_text(&send_jsonrpc(vec![init, ready, &call]), 2);
+    assert!(
+        text.contains("Reference edges not supported for 1 changed file"),
+        "the tool answers not supported instead of guessing:\n{text}"
+    );
+    assert!(
+        text.contains("v1 resolves TypeScript and Rust only") && text.contains("src/app.py"),
+        "and names the file and the supported languages:\n{text}"
+    );
+    assert!(
+        !text.contains("uses thing"),
+        "no name-based edge is invented for Python:\n{text}"
     );
 }

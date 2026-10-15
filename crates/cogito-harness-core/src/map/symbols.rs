@@ -522,6 +522,61 @@ pub fn declarations(content: &str, extension: &str) -> Vec<Declaration> {
     ts_decls
 }
 
+/// Every identifier occurrence in `content`, in source order, repeated as often
+/// as it occurs.
+///
+/// Only leaf nodes whose kind carries `identifier` are kept, so the names
+/// inside Rust `a::b`, TypeScript `a.b` and destructuring all appear while the
+/// text of a comment, a string literal or a numeric literal does not. The name
+/// an import or a re-export introduces is a binding, not a mention of an
+/// existing one, so those are left out too. The count matters: a caller asking
+/// whether a file *uses* a name subtracts the occurrences that are its own
+/// declaration.
+///
+/// `None` when the extension has no grammar, the file is over the size cap, or
+/// the parse fails, so the caller can fall back to a lexical scan instead of
+/// silently reporting no references.
+pub(crate) fn identifiers(content: &str, extension: &str) -> Option<Vec<String>> {
+    if content.len() > SIZE_CAP {
+        return None;
+    }
+    let lang = language(&extension.to_lowercase())?;
+    let tree = parse_ts(content, lang)?;
+    let mut found = Vec::new();
+    collect_identifiers(&tree.root_node(), content, &mut found);
+    Some(found)
+}
+
+fn collect_identifiers(node: &Node, content: &str, found: &mut Vec<String>) {
+    if is_import_binding(node) {
+        return;
+    }
+    if node.child_count() == 0 {
+        if node.kind().contains("identifier")
+            && let Ok(text) = node.utf8_text(content.as_bytes())
+        {
+            found.push(text.to_string());
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_identifiers(&child, content, found);
+    }
+}
+
+/// Whether the whole subtree is a binding an import introduces rather than a
+/// use of a name: Rust's `use`, TypeScript's `import`, and a TypeScript
+/// re-export (`export … from`, which has a source). An `export function f` has
+/// no source and is a declaration, not a binding, so it stays.
+fn is_import_binding(node: &Node) -> bool {
+    match node.kind() {
+        "import_statement" | "use_declaration" => true,
+        "export_statement" => node.child_by_field_name("source").is_some(),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -850,5 +905,88 @@ func (s *Server) Start() error {
             decls.is_empty(),
             "unsupported ext should return empty: {decls:?}"
         );
+    }
+
+    #[test]
+    fn test_identifiers_are_the_leaf_names_in_source_order() {
+        let src = "pub fn compute(input: i32) -> i32 { input + 1 }\n";
+        // `i32` is a `primitive_type`, not an identifier, so it is absent: v1
+        // resolves names, and a primitive is not a name another file binds.
+        assert_eq!(
+            identifiers(src, "rs").unwrap(),
+            ["compute", "input", "input"],
+            "the declaration name counts too: the caller subtracts it"
+        );
+    }
+
+    #[test]
+    fn test_identifiers_skip_comments_and_strings() {
+        let src = "// compute is declared above\nexport const NOTE = 'compute';\nexport function twice(n: number) { return n; }\n";
+        let found = identifiers(src, "ts").unwrap();
+        assert!(
+            !found.iter().any(|name| name == "compute"),
+            "a name in a comment or a string is not an identifier: {found:?}"
+        );
+        assert!(
+            found.iter().any(|name| name == "twice"),
+            "real identifiers are still found: {found:?}"
+        );
+    }
+
+    #[test]
+    fn test_identifiers_repeat_and_cover_member_access() {
+        let src = "import * as math from './math';\nexport function run() { return math.compute(1) + math.compute(2); }\n";
+        let found = identifiers(src, "ts").unwrap();
+        assert_eq!(
+            found.iter().filter(|name| *name == "compute").count(),
+            2,
+            "every mention is kept, not just the distinct names: {found:?}"
+        );
+    }
+
+    #[test]
+    fn test_identifiers_skip_import_bindings() {
+        let rust = "use crate::math::compute;\n\npub fn nothing() -> i32 { 0 }\n";
+        assert!(
+            !identifiers(rust, "rs")
+                .unwrap()
+                .iter()
+                .any(|name| name == "compute"),
+            "the name a `use` introduces is a binding, not a use"
+        );
+
+        let ts = "import { computeValue } from './math';\nimport * as math from './math';\nexport function run() { return computeValue() + math.computeValue(); }\n";
+        assert_eq!(
+            identifiers(ts, "ts")
+                .unwrap()
+                .iter()
+                .filter(|name| *name == "computeValue")
+                .count(),
+            2,
+            "only the two real uses remain"
+        );
+
+        let reexport = "export { computeValue } from './math';\n";
+        assert!(
+            !identifiers(reexport, "ts")
+                .unwrap()
+                .iter()
+                .any(|name| name == "computeValue"),
+            "a re-export is a binding too"
+        );
+
+        let export_fn = "export function computeValue(): number {\n  return 0;\n}\n";
+        assert!(
+            identifiers(export_fn, "ts")
+                .unwrap()
+                .iter()
+                .any(|name| name == "computeValue"),
+            "an exported declaration is not an import binding"
+        );
+    }
+
+    #[test]
+    fn test_identifiers_have_no_grammar_for_an_unlisted_extension() {
+        assert!(identifiers("x = 1", "scala").is_none());
     }
 }

@@ -737,7 +737,7 @@ project card.
 - `search_code` — find symbols, files and modules by name (returns file:line)
 - `file_outline` — a file's declarations with line ranges
 - `related_files` — what a file imports and what imports it
-- `impact` — what a diff touches: the changed declarations and the files that import or name them
+- `impact` — what a diff touches: the changed declarations and the files that import or use them (TypeScript and Rust; other languages answer \"not supported\")
 
 **Guardrail:** Before reading a large file, call `file_outline` to get its
 declarations with line ranges, then read only the range you need. Reading the

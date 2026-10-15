@@ -223,7 +223,7 @@ up to date with the working tree, then read rows.
 | `search_code` | `path`, `query` | Up to 12 FTS5 hits with bm25 score, file:line, kind |
 | `file_outline` | `path`, `file` | Declarations (code) or sections (Markdown) with line ranges |
 | `related_files` | `path`, `file` | Imports, importers, external packages for the given file |
-| `impact` | `path`, `base?` | The declarations the diff's hunks touch, the files that import the changed files and the files that declare those symbol names, plus a risk level from the importer count |
+| `impact` | `path`, `base?` | The declarations the diff's hunks touch, the files that import the changed files and the files that use those names (TypeScript and Rust; other languages answer "not supported"), plus a risk level from the importer count |
 
 No resource URI scheme, no `add_tag`, no `compress_context`, no REST endpoints.
 

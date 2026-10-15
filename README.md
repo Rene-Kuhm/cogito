@@ -221,10 +221,13 @@ Six tools: `context_pack`, `project_map`, `search_code`, `file_outline`,
 `impact` answers before a commit. It reads the diff — the uncommitted changes by
 default, or `base..HEAD` when given a revision — maps its hunks onto the
 outline's line ranges, and names the declarations they touch, the files that
-import the changed files and the files that declare those symbol names. Its
-risk level comes only from the importer count, and it says so: the answer is an
-overapproximation, because the import graph and the declaration names come from
-the index, which holds no calls or type references.
+import the changed files and the files that use those names. A use counts only
+when the index already has an import edge to the declaring file, and only for
+TypeScript and Rust: every other language is named under an explicit "not
+supported" instead of being guessed at. Its risk level comes only from the
+importer count, and it says so: the answer is an overapproximation, because the
+import graph and the identifier names come from the index, which holds no calls
+or type resolution.
 
 `context_pack` is the one to start with when you know what you are about to do:
 give it the task in your own words and it returns the fragments that matter,
