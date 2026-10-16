@@ -2074,6 +2074,8 @@ mod tests {
 
     #[test]
     fn test_claude_gets_the_guardrail_hook_and_loses_both_on_uninstall() {
+        // install/status read COGITO_OUTPUT_TRIM; hold the lock so a parallel test cannot change it between calls.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = TempDir::new().unwrap();
         std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
         install(
@@ -2185,6 +2187,8 @@ mod tests {
 
     #[test]
     fn test_stale_hook_script_is_detected_and_rewritten() {
+        // install/status read COGITO_OUTPUT_TRIM; hold the lock so a parallel test cannot change it between calls.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = TempDir::new().unwrap();
         std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
         std::fs::create_dir_all(home.path().join(".claude/hooks")).unwrap();
