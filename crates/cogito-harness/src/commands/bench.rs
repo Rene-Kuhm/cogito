@@ -682,6 +682,19 @@ fn grep_sync(root: &Path, term: &str) -> Vec<String> {
 }
 
 /// Run `grep -rn <term>` in `root`. Returns stdout lines (file:line:content).
+/// Whether two report paths name the same checkout. The pinned manifest keeps
+/// `..` in its cache path while the gold set uses the canonical root, so the
+/// strings differ for one directory. Compare the directories when they exist.
+fn same_checkout(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
 async fn grep(root: &Path, term: &str) -> Vec<String> {
     // Use std::thread directly instead of spawn_blocking
     let root_str = root.to_path_buf();
@@ -1595,7 +1608,11 @@ pub async fn run_benchmark_async(opts: BenchOptions) -> Result<BenchmarkResult> 
     report.measurements.extend(quality);
     for repo in gold_repos {
         // A repository already reported by the token path keeps its first row.
-        if !report.repos.iter().any(|r| r.path == repo.path) {
+        if !report
+            .repos
+            .iter()
+            .any(|r| same_checkout(&r.path, &repo.path))
+        {
             report.repos.push(repo);
         }
     }

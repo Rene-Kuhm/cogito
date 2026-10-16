@@ -457,6 +457,82 @@ fn test_dirty_worktree_is_marked_in_the_report() {
     );
 }
 
+/// One report section: from its title to the blank line that ends it.
+fn report_section<'a>(stdout: &'a str, title: &str) -> &'a str {
+    let start = stdout
+        .find(title)
+        .unwrap_or_else(|| panic!("no {title} section:\n{stdout}"));
+    let rest = &stdout[start..];
+    let end = rest.find("\n\n").unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// The data rows of one table: everything after its header, blank lines out.
+fn data_rows<'a>(section: &'a str, header: &str) -> Vec<&'a str> {
+    section
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with(header))
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .collect()
+}
+
+/// One checkout named two ways is still one repository.
+///
+/// The pinned manifest clones into a cache path that keeps its `..`, while a
+/// gold-set root names the same directory canonically. Comparing the two path
+/// strings instead of the two checkouts makes the report list the repository
+/// twice, in PROVENANCE and in the LATENCY index-sync table.
+#[test]
+fn test_each_repository_is_listed_once_in_the_report() {
+    let (dir, repo) = setup_fixture();
+    let out = tempfile::TempDir::new().unwrap();
+    let gold = write_gold(out.path(), &repo);
+
+    // The same checkout, spelled with a `..` the way the bench cache does.
+    fs::create_dir_all(dir.path().join("alias")).unwrap();
+    let alias = dir.path().join("alias").join("..").join("bench-fixture");
+    assert_ne!(
+        alias.display().to_string(),
+        repo.display().to_string(),
+        "the test needs the two spellings to differ"
+    );
+
+    let output = bench(
+        &alias,
+        out.path(),
+        &[
+            "--terms",
+            "search_code",
+            "--report",
+            "--gold",
+            gold.to_str().unwrap(),
+        ],
+    );
+    assert!(output.status.success(), "bench failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let provenance = report_section(&stdout, "PROVENANCE");
+    let rows = data_rows(provenance, "repo");
+    assert_eq!(
+        rows.len(),
+        1,
+        "PROVENANCE must list each repository once: {rows:?}\n{stdout}"
+    );
+
+    let latency = report_section(&stdout, "LATENCY");
+    let index_sync = latency
+        .split("\nquery\n")
+        .next()
+        .expect("the index-sync table before the query table");
+    let rows = data_rows(index_sync, "repo");
+    assert_eq!(
+        rows.len(),
+        1,
+        "index sync must list each repository once: {rows:?}\n{stdout}"
+    );
+}
+
 /// Every run leaves an artifact outside the measured worktree, and a term that
 /// matched nothing is in it. A benchmark that drops its zero results reports
 /// only its good days.
