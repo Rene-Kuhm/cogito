@@ -1399,6 +1399,9 @@ mod tests {
 
     #[test]
     fn test_claude_install_and_uninstall() {
+        // `hooks()` reads COGITO_OUTPUT_TRIM; hold the lock so a test that sets it
+        // cannot change the entry between the two installs below.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = TempDir::new().unwrap();
         std::fs::write(
             home.path().join(".claude.json"),
