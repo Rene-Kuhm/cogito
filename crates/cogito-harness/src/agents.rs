@@ -354,6 +354,67 @@ command -v cogito >/dev/null 2>&1 || exit 0
 exec cogito hook claude-pre-tool-use
 "#;
 
+/// The Claude Code PostToolUse output trim. Opt-in: only registered when
+/// `COGITO_OUTPUT_TRIM=1|true|yes|on` is set at `cogito setup` time. The
+/// runtime decision lives in the binary (`cogito hook claude-post-tool-use`)
+/// so it is tested Rust, not shell. With the env var unset the hook prints
+/// nothing and exits 0, which keeps the model's view of the tool result
+/// unchanged — the registered-but-disabled hook is a no-op, not a silent
+/// strip.
+const CLAUDE_POST_TRIM_SCRIPT: &str = r#"#!/bin/sh
+# Cogito PostToolUse hook (Bash).
+#
+# Opt-in: trims Bash outputs above the threshold (8 KiB of stdout) to the
+# first 60 and last 20 lines, with a marker that tells the model how to
+# reach the rest (`git log -n`, `sed -n 'M,Np'`, `| tee`). The marker is
+# never silent, so the model can always tell when a tool result was
+# trimmed. The decision logic lives in `cogito hook claude-post-tool-use`
+# so it is tested Rust, not shell.
+#
+# Disabled by default. When `COGITO_OUTPUT_TRIM` is unset (or has any value
+# other than 1/true/yes/on) the binary prints nothing and exits 0: the
+# model sees the original tool result unchanged.
+
+command -v cogito >/dev/null 2>&1 || exit 0
+exec cogito hook claude-post-tool-use
+"#;
+
+/// Env var that turns PostToolUse trimming on at `cogito setup` time. With
+/// it unset, the script is neither installed nor registered. The runtime
+/// hook reads the same var so a setup-time enable matches what the hook
+/// does at call time.
+///
+/// `pub(crate)` so the runtime hook in `claude_post_tool_use` reads the same
+/// variable, and so tests in both modules share one [`ENV_LOCK`] when they
+/// need a deterministic view of the env.
+pub(crate) const COGITO_OUTPUT_TRIM: &str = "COGITO_OUTPUT_TRIM";
+
+/// Process-global lock used by tests to serialize env mutations against
+/// env reads from install/status/uninstall. `pub(crate)` so the runtime
+/// hook's test module can use the same lock — without it, an env-mutating
+/// test can race a status-checking test and produce a spurious Outdated
+/// verdict or a missed `is_enabled` assertion.
+///
+/// The lock is referenced only from `#[cfg(test)]` code; `dead_code` does
+/// not see cross-module reads through `pub(crate)` statics, so we silence
+/// the lint explicitly.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Has the user asked `cogito setup` to enable PostToolUse trimming? Reads
+/// the env at call time so tests can flip the switch freely.
+fn output_trim_enabled() -> bool {
+    std::env::var_os(COGITO_OUTPUT_TRIM)
+        .map(|v| {
+            matches!(
+                v.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// One hook Cogito registers in an agent's settings.
 #[derive(Debug, Clone)]
 pub struct HookSpec {
@@ -369,33 +430,55 @@ pub struct HookSpec {
 
 impl Agent {
     /// Hooks Cogito installs for this agent.
-    pub fn hooks(self, home: &Path) -> Vec<HookSpec> {
+    ///
+    /// `output_trim` decides whether the opt-in `PostToolUse` trim hook is
+    /// included. The install and uninstall paths call this with the value
+    /// they read from `COGITO_OUTPUT_TRIM` once, so the method does not
+    /// touch the env and is safe to call from any test (with or without the
+    /// env lock).
+    pub fn hooks(self, home: &Path, output_trim: bool) -> Vec<HookSpec> {
         match self {
-            Agent::ClaudeCode => vec![
-                HookSpec {
-                    event: "SessionStart",
-                    matcher: "^(startup|resume|clear|compact|fork)$",
-                    script: home.join(".claude/hooks/cogito-session-start.sh"),
-                    content: CLAUDE_HOOK_SCRIPT,
-                    timeout: HOOK_TIMEOUT_SECS,
-                },
-                HookSpec {
-                    event: "PreToolUse",
-                    matcher: "^(Read|Grep)$",
-                    script: home.join(".claude/hooks/cogito-pre-tool-use.sh"),
-                    content: CLAUDE_GUARD_SCRIPT,
-                    timeout: GUARD_TIMEOUT_SECS,
-                },
-            ],
+            Agent::ClaudeCode => {
+                let mut specs = vec![
+                    HookSpec {
+                        event: "SessionStart",
+                        matcher: "^(startup|resume|clear|compact|fork)$",
+                        script: home.join(".claude/hooks/cogito-session-start.sh"),
+                        content: CLAUDE_HOOK_SCRIPT,
+                        timeout: HOOK_TIMEOUT_SECS,
+                    },
+                    HookSpec {
+                        event: "PreToolUse",
+                        matcher: "^(Read|Grep)$",
+                        script: home.join(".claude/hooks/cogito-pre-tool-use.sh"),
+                        content: CLAUDE_GUARD_SCRIPT,
+                        timeout: GUARD_TIMEOUT_SECS,
+                    },
+                ];
+                if output_trim {
+                    specs.push(HookSpec {
+                        event: "PostToolUse",
+                        matcher: "^Bash$",
+                        script: home.join(".claude/hooks/cogito-post-tool-use.sh"),
+                        content: CLAUDE_POST_TRIM_SCRIPT,
+                        timeout: GUARD_TIMEOUT_SECS,
+                    });
+                }
+                specs
+            }
             _ => Vec::new(),
         }
     }
 
     /// Files Cogito writes besides the agent's main configuration file.
-    pub fn extra_files(self, home: &Path, _binary: &Path) -> Vec<ExtraFile> {
+    ///
+    /// `output_trim` is passed straight through to [`Agent::hooks`] so the
+    /// `.sh` shim is written only when the `PostToolUse` entry will be
+    /// registered.
+    pub fn extra_files(self, home: &Path, _binary: &Path, output_trim: bool) -> Vec<ExtraFile> {
         match self {
             Agent::ClaudeCode => self
-                .hooks(home)
+                .hooks(home, output_trim)
                 .into_iter()
                 .map(|hook| ExtraFile {
                     path: hook.script,
@@ -414,7 +497,7 @@ impl Agent {
 
     /// Whether this agent gets hooks in its config file.
     fn has_session_hook(self) -> bool {
-        !self.hooks(Path::new("")).is_empty()
+        !self.hooks(Path::new(""), false).is_empty()
     }
 
     /// Canonical path of this agent's session-start hook script.
@@ -423,7 +506,7 @@ impl Agent {
     /// removing the hook entry always agree on the same file.
     #[cfg(test)]
     pub fn hook_script_path(self, home: &Path) -> Option<PathBuf> {
-        self.hooks(home)
+        self.hooks(home, false)
             .into_iter()
             .find(|h| h.event == "SessionStart")
             .map(|h| h.script)
@@ -431,8 +514,13 @@ impl Agent {
 }
 
 /// Write (or refresh) every extra file for `agent`.
-fn write_extra_files(agent: Agent, home: &Path, binary: &Path) -> Result<()> {
-    for file in agent.extra_files(home, binary) {
+///
+/// `output_trim` decides whether the PostToolUse trim shim is created. The
+/// caller must read the env once (via `output_trim_enabled()`) so this
+/// helper does not touch the env and stays safe to call from tests that
+/// hold (or do not hold) the env lock.
+fn write_extra_files(agent: Agent, home: &Path, binary: &Path, output_trim: bool) -> Result<()> {
+    for file in agent.extra_files(home, binary, output_trim) {
         if let Some(parent) = file.path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
@@ -452,8 +540,10 @@ fn write_extra_files(agent: Agent, home: &Path, binary: &Path) -> Result<()> {
 }
 
 /// Remove every extra file belonging to `agent`.
-fn remove_extra_files(agent: Agent, home: &Path, binary: &Path) -> Result<()> {
-    for file in agent.extra_files(home, binary) {
+///
+/// `output_trim` follows the same pass-through rule as [`write_extra_files`].
+fn remove_extra_files(agent: Agent, home: &Path, binary: &Path, output_trim: bool) -> Result<()> {
+    for file in agent.extra_files(home, binary, output_trim) {
         if file.path.exists() {
             std::fs::remove_file(&file.path)
                 .with_context(|| format!("Failed to remove {}", file.path.display()))?;
@@ -610,17 +700,26 @@ fn normalize_toml(text: &str) -> String {
 }
 
 /// Whether every companion artifact exists with the expected content.
-fn extras_current(agent: Agent, home: &Path, binary: &Path) -> bool {
-    agent.extra_files(home, binary).iter().all(|file| {
-        std::fs::read_to_string(&file.path)
-            .map(|existing| existing == file.content)
-            .unwrap_or(false)
-    })
+///
+/// `output_trim` follows the same pass-through rule as [`write_extra_files`].
+fn extras_current(agent: Agent, home: &Path, binary: &Path, output_trim: bool) -> bool {
+    agent
+        .extra_files(home, binary, output_trim)
+        .iter()
+        .all(|file| {
+            std::fs::read_to_string(&file.path)
+                .map(|existing| existing == file.content)
+                .unwrap_or(false)
+        })
 }
 
 /// Whether the agent's settings still reference Cogito's session hook. The
 /// script existing on disk is not enough: without the entry it never runs.
-fn hook_registered(agent: Agent, home: &Path) -> Result<bool> {
+///
+/// `output_trim` matches the flag the caller used when installing; if it
+/// does not match (the user changed `COGITO_OUTPUT_TRIM` since the last
+/// install), the function reports Outdated so a repair is triggered.
+fn hook_registered(agent: Agent, home: &Path, output_trim: bool) -> Result<bool> {
     if !agent.has_session_hook() {
         return Ok(true);
     }
@@ -633,7 +732,7 @@ fn hook_registered(agent: Agent, home: &Path) -> Result<bool> {
     let settings = read_json(&hook_path)?;
     // Every hook registered and synchronous: an `async` hook's output never
     // reaches the session, so an entry from an earlier version is outdated.
-    Ok(agent.hooks(home).iter().all(|spec| {
+    Ok(agent.hooks(home, output_trim).iter().all(|spec| {
         settings
             .get("hooks")
             .and_then(|h| h.get(spec.event))
@@ -663,6 +762,7 @@ pub fn status(agent: Agent, home: &Path, binary: &Path) -> Result<Status> {
         return Ok(Status::NotConfigured);
     }
 
+    let output_trim = output_trim_enabled();
     let bin = binary.display().to_string();
     let want = desired_server_entry(agent, &bin);
 
@@ -681,7 +781,7 @@ pub fn status(agent: Agent, home: &Path, binary: &Path) -> Result<Status> {
         let Some(entry) = mcp.get("mcpServers").and_then(|m| m.get(SERVER_KEY)) else {
             return Ok(Status::NotConfigured);
         };
-        if !entry_current(entry, &want) || !extras_current(agent, home, binary) {
+        if !entry_current(entry, &want) || !extras_current(agent, home, binary, output_trim) {
             return Ok(Status::Outdated);
         }
         return Ok(Status::Configured);
@@ -710,8 +810,8 @@ pub fn status(agent: Agent, home: &Path, binary: &Path) -> Result<Status> {
     };
 
     if !entry_current(entry, &want)
-        || !extras_current(agent, home, binary)
-        || !hook_registered(agent, home)?
+        || !extras_current(agent, home, binary, output_trim)
+        || !hook_registered(agent, home, output_trim)?
     {
         return Ok(Status::Outdated);
     }
@@ -936,6 +1036,7 @@ pub fn install(
         return Ok(Change::AlreadyCorrect);
     }
 
+    let output_trim = output_trim_enabled();
     let path = agent.config_path(home);
     let backup = backup_file(&path)?;
     let bin = binary.display().to_string();
@@ -1037,14 +1138,14 @@ pub fn install(
     // Companion artifacts: hook scripts and plugins that run without the model
     // asking. Written once the MCP entry is in place so a failure here leaves a
     // working (if less automatic) setup.
-    write_extra_files(agent, home, binary)?;
+    write_extra_files(agent, home, binary, output_trim)?;
 
     if agent.has_session_hook()
         && let Some(hook_path) = hook_config_path(agent, home)
     {
         let _ = backup_file(&hook_path)?;
         let mut settings = read_json_or_default(&hook_path);
-        for spec in agent.hooks(home) {
+        for spec in agent.hooks(home, output_trim) {
             upsert_hook(&mut settings, &spec)?;
         }
         write_json(&hook_path, &settings)?;
@@ -1055,6 +1156,7 @@ pub fn install(
 
 /// Remove Cogito's configuration from `agent`.
 pub fn uninstall(agent: Agent, home: &Path) -> Result<Change> {
+    let output_trim = output_trim_enabled();
     let path = agent.config_path(home);
     if !path.exists() {
         return Ok(Change::AlreadyCorrect);
@@ -1109,13 +1211,13 @@ pub fn uninstall(agent: Agent, home: &Path) -> Result<Change> {
     {
         let _ = backup_file(&hook_path)?;
         let mut settings = read_json(&hook_path)?;
-        for spec in agent.hooks(home) {
+        for spec in agent.hooks(home, output_trim) {
             remove_hook(&mut settings, &spec);
         }
         write_json(&hook_path, &settings)?;
     }
 
-    remove_extra_files(agent, home, &PathBuf::from("cogito"))?;
+    remove_extra_files(agent, home, &PathBuf::from("cogito"), output_trim)?;
     Ok(Change::Written { backup })
 }
 
@@ -1297,6 +1399,9 @@ mod tests {
 
     #[test]
     fn test_claude_install_and_uninstall() {
+        // `hooks()` reads COGITO_OUTPUT_TRIM; hold the lock so a test that sets it
+        // cannot change the entry between the two installs below.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = TempDir::new().unwrap();
         std::fs::write(
             home.path().join(".claude.json"),
@@ -1880,6 +1985,14 @@ mod tests {
 
     #[test]
     fn test_missing_claude_hook_entry_is_outdated_and_restored() {
+        // Hold the env lock for the duration of this test, with
+        // `COGITO_OUTPUT_TRIM` explicitly unset, so a parallel
+        // `with_output_trim` run cannot drag the agent's status to Outdated
+        // by reading env=1 mid-install.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(COGITO_OUTPUT_TRIM);
+        }
         let home = TempDir::new().unwrap();
         std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
         install(
@@ -2536,6 +2649,175 @@ mod tests {
         assert!(!reads_agents_md(Agent::GentleShell));
         assert!(!reads_agents_md(Agent::Gemini));
         assert!(!reads_agents_md(Agent::Crush));
+    }
+
+    /// Set COGITO_OUTPUT_TRIM inside the closure, run `f`, and always restore
+    /// the env on the way out (success or panic). The lock keeps parallel
+    /// tests from racing each other's view of the env; the unsafe blocks are
+    /// the Rust 2024 acknowledgement that env mutation is not thread-safe
+    /// (the lock is what makes it safe in practice).
+    fn with_output_trim<F: FnOnce()>(value: Option<&str>, f: F) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os(COGITO_OUTPUT_TRIM);
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(COGITO_OUTPUT_TRIM, v),
+                None => std::env::remove_var(COGITO_OUTPUT_TRIM),
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            match saved {
+                Some(prev) => std::env::set_var(COGITO_OUTPUT_TRIM, prev),
+                None => std::env::remove_var(COGITO_OUTPUT_TRIM),
+            }
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    fn test_output_trim_env_parser_accepts_truthy_values() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            for ok in ["1", "true", "yes", "on", "  TRUE ", "Yes"] {
+                std::env::set_var(COGITO_OUTPUT_TRIM, ok);
+                assert!(output_trim_enabled(), "{ok:?} should enable");
+            }
+            for off in ["", "0", "false", "no", "off", "nope"] {
+                std::env::set_var(COGITO_OUTPUT_TRIM, off);
+                assert!(!output_trim_enabled(), "{off:?} should not enable");
+            }
+            std::env::remove_var(COGITO_OUTPUT_TRIM);
+        }
+        assert!(!output_trim_enabled());
+    }
+
+    #[test]
+    fn test_post_tool_use_hook_is_absent_when_flag_unset() {
+        with_output_trim(None, || {
+            let home = TempDir::new().unwrap();
+            std::fs::write(
+                home.path().join(".claude.json"),
+                r#"{"numStartups":1,"mcpServers":{}}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+            std::fs::write(
+                home.path().join(".claude/settings.json"),
+                r#"{"model":"opus"}"#,
+            )
+            .unwrap();
+
+            install(
+                Agent::ClaudeCode,
+                home.path(),
+                &bin(),
+                PiPackageAction::Leave,
+            )
+            .unwrap();
+
+            // The trim shim is not present
+            let shim = home.path().join(".claude/hooks/cogito-post-tool-use.sh");
+            assert!(
+                !shim.exists(),
+                "no shim should be written with the flag off"
+            );
+
+            // And settings.json has no PostToolUse entry
+            let settings = read_json(&home.path().join(".claude/settings.json")).unwrap();
+            let post_hooks = settings
+                .get("hooks")
+                .and_then(|h| h.get("PostToolUse"))
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                post_hooks.is_empty(),
+                "PostToolUse entry should be empty when the flag is off, got: {post_hooks:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_post_tool_use_hook_is_registered_when_flag_set() {
+        with_output_trim(Some("1"), || {
+            let home = TempDir::new().unwrap();
+            std::fs::write(
+                home.path().join(".claude.json"),
+                r#"{"numStartups":1,"mcpServers":{}}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+            std::fs::write(
+                home.path().join(".claude/settings.json"),
+                r#"{"model":"opus"}"#,
+            )
+            .unwrap();
+
+            install(
+                Agent::ClaudeCode,
+                home.path(),
+                &bin(),
+                PiPackageAction::Leave,
+            )
+            .unwrap();
+
+            // 1. The shim is written and points to the right binary
+            let shim = home.path().join(".claude/hooks/cogito-post-tool-use.sh");
+            assert!(shim.exists(), "shim should be written with the flag on");
+            let body = std::fs::read_to_string(&shim).unwrap();
+            assert!(body.contains("cogito hook claude-post-tool-use"));
+
+            // 2. settings.json gets a PostToolUse entry with the Bash matcher
+            //    pointing at the shim
+            let settings = read_json(&home.path().join(".claude/settings.json")).unwrap();
+            let post = &settings["hooks"]["PostToolUse"];
+            assert!(post.is_array());
+            assert_eq!(post[0]["matcher"], "^Bash$");
+            let cmd = post[0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(
+                cmd.contains("cogito-post-tool-use.sh"),
+                "command should reference the shim: {cmd}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_post_tool_use_hook_round_trips_through_setup_then_uninstall() {
+        with_output_trim(Some("yes"), || {
+            let home = TempDir::new().unwrap();
+            std::fs::write(
+                home.path().join(".claude.json"),
+                r#"{"numStartups":1,"mcpServers":{}}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+            std::fs::write(home.path().join(".claude/settings.json"), r#"{}"#).unwrap();
+
+            install(
+                Agent::ClaudeCode,
+                home.path(),
+                &bin(),
+                PiPackageAction::Leave,
+            )
+            .unwrap();
+            uninstall(Agent::ClaudeCode, home.path()).unwrap();
+
+            // Both the script and the entry should be gone with the flag still
+            // on (uninstall walks the same hooks list the installer did)
+            let shim = home.path().join(".claude/hooks/cogito-post-tool-use.sh");
+            assert!(!shim.exists());
+            let settings = read_json(&home.path().join(".claude/settings.json")).unwrap();
+            let post = settings
+                .get("hooks")
+                .and_then(|h| h.get("PostToolUse"))
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default();
+            assert!(post.is_empty(), "{post:?}");
+        });
     }
 }
 

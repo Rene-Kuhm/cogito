@@ -4,6 +4,7 @@
 
 mod agents;
 mod claude_hook;
+mod claude_post_tool_use;
 mod commands;
 mod mcp;
 mod tokenizer;
@@ -100,7 +101,7 @@ enum Commands {
     /// Run an agent hook (called by the agent, not by hand)
     #[command(hide = true)]
     Hook {
-        /// Which hook: `claude-pre-tool-use`
+        /// Which hook: `claude-pre-tool-use` or `claude-post-tool-use`
         name: String,
     },
 
@@ -225,6 +226,7 @@ async fn main() -> Result<()> {
         Some(Commands::Init) => commands::init().await?,
         Some(Commands::Hook { name }) => match name.as_str() {
             "claude-pre-tool-use" => claude_hook::run().await,
+            "claude-post-tool-use" => claude_post_tool_use::run().await,
             // An unknown hook must never block the agent.
             _ => std::process::exit(0),
         },
