@@ -126,6 +126,45 @@ running.
 Claude Code keeps MCP servers and settings in separate files, which is why it
 is the only agent that touches two config files.
 
+#### Opt-in: trimming long Bash outputs (PostToolUse)
+
+A Bash command whose stdout runs past 8 KiB is replaced for the model with
+the first 60 lines, the last 20, and a marker that names the omitted count
+and how to reach the rest. The replacement uses Claude Code's
+`hookSpecificOutput.updatedToolOutput`, which is the documented way for a
+PostToolUse hook to rewrite a tool's result before Claude sees it.
+
+- **Off by default.** `cogito setup` only writes the script and registers the
+  hook when `COGITO_OUTPUT_TRIM` is set to `1`, `true`, `yes` or `on` at the
+  time `setup` runs. With the var unset the hook is not installed, and the
+  agent's `settings.json` has no `PostToolUse` entry.
+- **A registered hook with the var unset is a no-op.** It prints nothing and
+  exits 0, so the model sees the original tool result unchanged. You can flip
+  the var back on later without re-running `setup`.
+- **Never silent.** The replacement always starts with
+  `[cogito trimmed N lines; re-run with a narrower command, e.g. git log -n,
+  sed -n, or | tee to a file]` followed by `N` lines of head and tail. The
+  middle of the output is gone; the marker names it.
+- **Test runs are exempted by their tail.** When the last 200 lines contain
+  `test result`, ` passed`, ` failed` or `FAILED` (cargo / pytest / go test
+  / vitest are the common cases), the tail is kept whole up to 200 lines and
+  the summary the model needs survives.
+- **Interrupts pass through.** A `tool_response.interrupted = true` is left
+  alone — the partial output is what the user is looking at.
+- **Errors are safe by construction.** Claude Code only fires PostToolUse on
+  a successful tool call; failures reach `PostToolUseFailure`, which this
+  hook does not handle.
+
+Enable it for the next `setup` run:
+
+```sh
+COGITO_OUTPUT_TRIM=1 cogito setup claude
+```
+
+The decision logic lives in `cogito hook claude-post-tool-use` (tested
+Rust); the `.sh` shim only forwards Claude Code's JSON on stdin.
+
+
 ### Codex
 
 `~/.codex/config.toml` gains:
