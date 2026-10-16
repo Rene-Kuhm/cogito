@@ -2648,6 +2648,174 @@ mod tests {
         assert!(!reads_agents_md(Agent::Crush));
     }
 
+    /// Set COGITO_OUTPUT_TRIM inside the closure, run `f`, and always restore
+    /// the env on the way out (success or panic). The lock keeps parallel
+    /// tests from racing each other's view of the env; the unsafe blocks are
+    /// the Rust 2024 acknowledgement that env mutation is not thread-safe
+    /// (the lock is what makes it safe in practice).
+    fn with_output_trim<F: FnOnce()>(value: Option<&str>, f: F) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os(COGITO_OUTPUT_TRIM);
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(COGITO_OUTPUT_TRIM, v),
+                None => std::env::remove_var(COGITO_OUTPUT_TRIM),
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            match saved {
+                Some(prev) => std::env::set_var(COGITO_OUTPUT_TRIM, prev),
+                None => std::env::remove_var(COGITO_OUTPUT_TRIM),
+            }
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    fn test_output_trim_env_parser_accepts_truthy_values() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            for ok in ["1", "true", "yes", "on", "  TRUE ", "Yes"] {
+                std::env::set_var(COGITO_OUTPUT_TRIM, ok);
+                assert!(output_trim_enabled(), "{ok:?} should enable");
+            }
+            for off in ["", "0", "false", "no", "off", "nope"] {
+                std::env::set_var(COGITO_OUTPUT_TRIM, off);
+                assert!(!output_trim_enabled(), "{off:?} should not enable");
+            }
+            std::env::remove_var(COGITO_OUTPUT_TRIM);
+        }
+        assert!(!output_trim_enabled());
+    }
+
+    #[test]
+    fn test_post_tool_use_hook_is_absent_when_flag_unset() {
+        with_output_trim(None, || {
+            let home = TempDir::new().unwrap();
+            std::fs::write(
+                home.path().join(".claude.json"),
+                r#"{"numStartups":1,"mcpServers":{}}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+            std::fs::write(
+                home.path().join(".claude/settings.json"),
+                r#"{"model":"opus"}"#,
+            )
+            .unwrap();
+
+            install(
+                Agent::ClaudeCode,
+                home.path(),
+                &bin(),
+                PiPackageAction::Leave,
+            )
+            .unwrap();
+
+            // The trim shim is not present
+            let shim = home.path().join(".claude/hooks/cogito-post-tool-use.sh");
+            assert!(
+                !shim.exists(),
+                "no shim should be written with the flag off"
+            );
+
+            // And settings.json has no PostToolUse entry
+            let settings = read_json(&home.path().join(".claude/settings.json")).unwrap();
+            let post_hooks = settings
+                .get("hooks")
+                .and_then(|h| h.get("PostToolUse"))
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                post_hooks.is_empty(),
+                "PostToolUse entry should be empty when the flag is off, got: {post_hooks:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_post_tool_use_hook_is_registered_when_flag_set() {
+        with_output_trim(Some("1"), || {
+            let home = TempDir::new().unwrap();
+            std::fs::write(
+                home.path().join(".claude.json"),
+                r#"{"numStartups":1,"mcpServers":{}}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+            std::fs::write(
+                home.path().join(".claude/settings.json"),
+                r#"{"model":"opus"}"#,
+            )
+            .unwrap();
+
+            install(
+                Agent::ClaudeCode,
+                home.path(),
+                &bin(),
+                PiPackageAction::Leave,
+            )
+            .unwrap();
+
+            // 1. The shim is written and points to the right binary
+            let shim = home.path().join(".claude/hooks/cogito-post-tool-use.sh");
+            assert!(shim.exists(), "shim should be written with the flag on");
+            let body = std::fs::read_to_string(&shim).unwrap();
+            assert!(body.contains("cogito hook claude-post-tool-use"));
+
+            // 2. settings.json gets a PostToolUse entry with the Bash matcher
+            //    pointing at the shim
+            let settings = read_json(&home.path().join(".claude/settings.json")).unwrap();
+            let post = &settings["hooks"]["PostToolUse"];
+            assert!(post.is_array());
+            assert_eq!(post[0]["matcher"], "^Bash$");
+            let cmd = post[0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(
+                cmd.contains("cogito-post-tool-use.sh"),
+                "command should reference the shim: {cmd}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_post_tool_use_hook_round_trips_through_setup_then_uninstall() {
+        with_output_trim(Some("yes"), || {
+            let home = TempDir::new().unwrap();
+            std::fs::write(
+                home.path().join(".claude.json"),
+                r#"{"numStartups":1,"mcpServers":{}}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+            std::fs::write(home.path().join(".claude/settings.json"), r#"{}"#).unwrap();
+
+            install(
+                Agent::ClaudeCode,
+                home.path(),
+                &bin(),
+                PiPackageAction::Leave,
+            )
+            .unwrap();
+            uninstall(Agent::ClaudeCode, home.path()).unwrap();
+
+            // Both the script and the entry should be gone with the flag still
+            // on (uninstall walks the same hooks list the installer did)
+            let shim = home.path().join(".claude/hooks/cogito-post-tool-use.sh");
+            assert!(!shim.exists());
+            let settings = read_json(&home.path().join(".claude/settings.json")).unwrap();
+            let post = settings
+                .get("hooks")
+                .and_then(|h| h.get("PostToolUse"))
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default();
+            assert!(post.is_empty(), "{post:?}");
+        });
+    }
 }
 
 #[cfg(test)]

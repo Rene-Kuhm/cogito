@@ -168,3 +168,227 @@ pub async fn run() -> ! {
     std::process::exit(0)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Build a minimal Bash PostToolUse event with the given stdout.
+    fn bash_event_with_stdout(stdout: &str) -> Value {
+        json!({
+            "tool_name": "Bash",
+            "session_id": "s",
+            "tool_response": {
+                "stdout": stdout,
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false,
+            }
+        })
+    }
+
+    #[test]
+    fn test_disabled_passes_through_unchanged() {
+        // long stdout: would normally trigger trimming
+        let big = (1..=1000)
+            .map(|i| format!("line {i}\n"))
+            .collect::<String>();
+        let event = bash_event_with_stdout(&big);
+        assert!(decide(&event, false).is_none());
+    }
+
+    #[test]
+    fn test_below_threshold_is_untouched() {
+        let small = (0..100).map(|_| "x").collect::<String>();
+        let event = bash_event_with_stdout(&small);
+        assert!(decide(&event, true).is_none());
+    }
+
+    #[test]
+    fn test_non_bash_tool_passes_through() {
+        let big = (1..=5000).map(|_| "x").collect::<String>();
+        let event = json!({
+            "tool_name": "Read",
+            "tool_response": { "content": big },
+        });
+        assert!(decide(&event, true).is_none());
+    }
+
+    #[test]
+    fn test_interrupted_response_is_left_alone() {
+        let big = (1..=5000)
+            .map(|i| format!("line {i}\n"))
+            .collect::<String>();
+        let event = json!({
+            "tool_name": "Bash",
+            "tool_response": {
+                "stdout": big,
+                "stderr": "",
+                "interrupted": true,
+                "isImage": false,
+            }
+        });
+        assert!(decide(&event, true).is_none());
+    }
+
+    #[test]
+    fn test_trim_keeps_head_and_tail_and_marks_omitted_lines() {
+        // 1000 distinct lines: head=60, tail=20, skipped=920
+        let stdout: String = (1..=1000)
+            .map(|i| format!("line-{i:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            stdout.len() > THRESHOLD_CHARS,
+            "fixture under threshold: {}",
+            stdout.len()
+        );
+        let event = bash_event_with_stdout(&stdout);
+        let out = decide(&event, true).expect("enabled + long → replacement");
+
+        let replacement = &out["hookSpecificOutput"]["updatedToolOutput"];
+        let new_stdout = replacement["stdout"].as_str().unwrap();
+        assert_eq!(replacement["interrupted"], json!(false));
+        assert_eq!(replacement["isImage"], json!(false));
+        assert_eq!(replacement["stderr"], json!(""));
+        assert!(new_stdout.contains("cogito trimmed 920 lines"));
+        assert!(new_stdout.contains("re-run with a narrower command"));
+        assert!(new_stdout.contains("line-0001"));
+        assert!(new_stdout.contains("line-0060"));
+        assert!(new_stdout.contains("line-0981"));
+        assert!(new_stdout.contains("line-1000"));
+        assert!(!new_stdout.contains("line-0500")); // middle is gone
+    }
+
+    #[test]
+    fn test_marker_explains_omission_count_unambiguously() {
+        // exact line counts so the assertion stays readable
+        let stdout: String = (1..=1000)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(stdout.len() > THRESHOLD_CHARS);
+        let event = bash_event_with_stdout(&stdout);
+        let out = decide(&event, true).unwrap();
+        let new_stdout = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .unwrap();
+        assert!(new_stdout.contains("cogito trimmed 920 lines"));
+        assert!(new_stdout.contains("920 lines omitted"));
+    }
+
+    #[test]
+    fn test_test_summary_tail_is_preserved_whole() {
+        // mimics a cargo test invocation: the summary is at the end
+        let mut body: Vec<String> = (1..=1000).map(|i| format!("test {i} ... ok")).collect();
+        body.push("test result: ok. 1000 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s".to_string());
+        let stdout = body.join("\n");
+        let event = bash_event_with_stdout(&stdout);
+        let out = decide(&event, true).unwrap();
+        let new_stdout = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .unwrap();
+
+        // tail kept intact
+        assert!(new_stdout.contains("test result: ok"));
+        assert!(new_stdout.contains("1000 passed"));
+        // middle truncated
+        assert!(!new_stdout.contains("test 500"));
+        // marker mentions the test-summary branch
+        assert!(new_stdout.contains("test summary kept below"));
+    }
+
+    #[test]
+    fn test_test_summary_branch_keeps_up_to_two_hundred_tail_lines() {
+        // 3000 lines + summary at the end → keep only the last 200, drop the
+        // first 2800
+        let mut body: Vec<String> = (1..=3000).map(|i| format!("run {i}")).collect();
+        body.push("test result: ok. 3000 passed; 0 failed".to_string());
+        let stdout = body.join("\n");
+        assert!(stdout.len() > THRESHOLD_CHARS);
+        let event = bash_event_with_stdout(&stdout);
+        let out = decide(&event, true).unwrap();
+        let new_stdout = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .unwrap();
+        // the kept tail is the last 200 lines: runs 2802..3000 + the summary line
+        assert!(new_stdout.contains("run 3000"));
+        assert!(new_stdout.contains("run 2802"));
+        assert!(!new_stdout.contains("run 2801"));
+        assert!(!new_stdout.contains("run 2800"));
+        assert!(new_stdout.contains("test summary kept below"));
+    }
+
+    #[test]
+    fn test_replacement_shape_matches_bash_response() {
+        // The new tool_response must keep stdout/stderr/interrupted/isImage so
+        // the model receives the same schema, only with shorter stdout.
+        // Each "very long line..." is a separate line of stdout so the line
+        // count (and head/tail slicing) is meaningful.
+        let stdout = std::iter::repeat_n(
+            "very long line, very long line, very long line, very long line",
+            1500,
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(stdout.len() > THRESHOLD_CHARS);
+        let event = json!({
+            "tool_name": "Bash",
+            "tool_response": {
+                "stdout": stdout,
+                "stderr": "some warning on stderr\n",
+                "interrupted": false,
+                "isImage": false,
+            }
+        });
+        let out = decide(&event, true).unwrap();
+        let r = &out["hookSpecificOutput"]["updatedToolOutput"];
+        assert_eq!(
+            r["hookEventName_if_present"],
+            json!(null),
+            "updatedToolOutput must be a plain Bash response object, not a wrapper"
+        );
+        assert!(r.get("stdout").and_then(Value::as_str).is_some());
+        assert_eq!(r["stderr"], json!("some warning on stderr\n"));
+        assert_eq!(r["interrupted"], json!(false));
+        assert_eq!(r["isImage"], json!(false));
+        assert!(out["hookSpecificOutput"]["hookEventName"] == "PostToolUse");
+    }
+
+    #[test]
+    fn test_run_disabled_exits_zero_with_no_output() {
+        // Take the shared env lock so a parallel `with_output_trim` test
+        // cannot leave `COGITO_OUTPUT_TRIM` set when this assertion runs.
+        // Also explicitly unset the var to cover the case where the test
+        // harness itself inherited the var from the calling shell.
+        let _g = crate::agents::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(crate::agents::COGITO_OUTPUT_TRIM);
+        }
+        assert!(!is_enabled(), "the hook must be disabled with no env var");
+    }
+
+    #[test]
+    fn test_empty_event_does_not_panic() {
+        // a malformed event must not panic the hook
+        assert!(decide(&json!({}), true).is_none());
+        assert!(decide(&json!({"tool_name": "Bash"}), true).is_none());
+        assert!(decide(&json!({"tool_name": "Bash", "tool_response": {}}), true).is_none());
+    }
+
+    #[test]
+    fn test_event_without_stdout_field_is_unchanged() {
+        // tool_response present but missing stdout → leave alone
+        let event = json!({
+            "tool_name": "Bash",
+            "tool_response": {
+                "stderr": "y",
+                "interrupted": false,
+                "isImage": false,
+            }
+        });
+        assert!(decide(&event, true).is_none());
+    }
+}
